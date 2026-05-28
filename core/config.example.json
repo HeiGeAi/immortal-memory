@@ -1,0 +1,43 @@
+{
+  "automation": {
+    "daily_launch_agent_label": "",
+    "daily_schedule": [
+      {
+        "hour": 9,
+        "minute": 7
+      },
+      {
+        "hour": 13,
+        "minute": 23
+      },
+      {
+        "hour": 20,
+        "minute": 17
+      },
+      {
+        "hour": 3,
+        "minute": 3
+      }
+    ]
+  },
+  "extra_sources": [],
+  "feishu": {
+    "daily_sources": "contacts,chats,members,messages,message-search,tasks,calendar,vc,minutes,docs,doc-contents",
+    "expected_user_name": "Your Feishu Name",
+    "expected_user_open_id": "",
+    "reject_user_names": []
+  },
+  "owner_aliases": [
+    "Your Alias"
+  ],
+  "owner_display_name": "Your Name",
+  "owner_name": "",
+  "primary_account": "Main Account",
+  "role_defaults": {
+    "goal": "写稿审稿流程",
+    "mode": "auto",
+    "slug_prefix": "user"
+  },
+  "vault_dir": "~/.immortal",
+  "version": 1
+}

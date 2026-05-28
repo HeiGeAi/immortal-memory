@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Scan for private data
+        run: python3 scripts/private_scan.py .
+      - name: Compile Python sources
+        run: python3 -m py_compile install.py $(find core scripts -name '*.py')
+      - name: Run smoke test
+        run: bash scripts/smoke_test.sh

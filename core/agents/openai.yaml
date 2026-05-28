@@ -1,0 +1,7 @@
+interface:
+  display_name: "Immortal"
+  short_description: "Preserve and use your personal AI memory vault"
+  brand_color: "#1F6FEB"
+  default_prompt: "Use $immortal to check my memory vault and recall the relevant history for this task."
+policy:
+  allow_implicit_invocation: true

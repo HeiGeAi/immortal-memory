@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "immortal-memory": {
+      "args": [
+        "agent-mcp"
+      ],
+      "command": "immortal-memory"
+    }
+  }
+}
