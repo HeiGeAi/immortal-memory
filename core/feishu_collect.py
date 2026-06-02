@@ -324,6 +324,15 @@ def current_auth_status() -> tuple[bool, dict[str, Any], str]:
     return run_lark(["auth", "status", "--verify"], timeout=30)
 
 
+def auth_user_identity(body: dict[str, Any]) -> tuple[str, str]:
+    user = body.get("identities", {}).get("user", {}) if isinstance(body.get("identities"), dict) else {}
+    if not isinstance(user, dict):
+        user = {}
+    user_name = str(body.get("userName") or user.get("userName") or "")
+    user_open_id = str(body.get("userOpenId") or body.get("openId") or user.get("userOpenId") or user.get("openId") or "")
+    return user_name, user_open_id
+
+
 def data_part(body: dict[str, Any]) -> dict[str, Any]:
     data = body.get("data", body)
     return data if isinstance(data, dict) else {"items": data}
@@ -440,8 +449,7 @@ class Collector:
         ok, body, err = current_auth_status()
         if not ok:
             raise RuntimeError(f"cannot verify lark-cli auth status: {err}")
-        user_name = str(body.get("userName") or "")
-        user_open_id = str(body.get("userOpenId") or "")
+        user_name, user_open_id = auth_user_identity(body)
         expected_name = self.args.expected_user_name
         expected_open_id = self.args.expected_user_open_id
         if not expected_name and not expected_open_id and not self.args.allow_current_account:

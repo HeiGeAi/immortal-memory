@@ -563,13 +563,23 @@ def command_health(args) -> int:
         getnote_latest = read_json(GETNOTE_LATEST_JSON, {})
         getnote_results = getnote_latest.get("results") if isinstance(getnote_latest, dict) else []
         latest_note = ""
+        latest_date = str(getnote_latest.get("latest_date") or "") if isinstance(getnote_latest, dict) else ""
         if isinstance(getnote_results, list) and getnote_results:
             latest_note = str(getnote_results[-1].get("note_id") or "")
+            latest_date = str(getnote_results[-1].get("date") or latest_date)
         getnote_status = str(getnote_latest.get("status") or "missing") if isinstance(getnote_latest, dict) else "missing"
+        if getnote_status == "skip" and not latest_note:
+            state_note = str(state.get("last_getnote_diary_note_id") or "")
+            state_date = str(state.get("last_getnote_diary_date") or "")
+            state_status = str(state.get("last_getnote_diary_status") or "")
+            if state_status == "ok" and state_note and state_date:
+                getnote_status = "ok"
+                latest_note = state_note
+                latest_date = state_date
         checks.append((
             "Get 笔记同步结果",
             getnote_status == "ok",
-            f"{getnote_status} · date {getnote_latest.get('latest_date', '') if isinstance(getnote_latest, dict) else ''} · note {latest_note or 'missing'}",
+            f"{getnote_status} · date {latest_date} · note {latest_note or 'missing'}",
         ))
 
     print("Immortal Daily Health")

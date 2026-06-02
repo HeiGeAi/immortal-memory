@@ -920,7 +920,9 @@ def command_sync(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     if not dates:
         payload = {"status": "skip", "reason": "no dates", "generated_at": now_local().isoformat(timespec="seconds")}
-        write_json(LATEST_JSON, payload)
+        existing_latest = read_json(LATEST_JSON, {})
+        if not isinstance(existing_latest.get("results"), list) or not existing_latest.get("results"):
+            write_json(LATEST_JSON, payload)
         print("getnote_diary_sync=skip reason=no_dates")
         return 0
     client = None

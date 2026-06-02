@@ -121,6 +121,15 @@ def extract_json(text: str) -> dict[str, Any]:
     raise json.JSONDecodeError("no JSON object found", text, 0)
 
 
+def auth_user_identity(body: dict[str, Any]) -> tuple[str, str]:
+    user = body.get("identities", {}).get("user", {}) if isinstance(body.get("identities"), dict) else {}
+    if not isinstance(user, dict):
+        user = {}
+    user_name = str(body.get("userName") or user.get("userName") or "")
+    user_open_id = str(body.get("userOpenId") or body.get("openId") or user.get("userOpenId") or user.get("openId") or "")
+    return user_name, user_open_id
+
+
 class MirrorDB:
     def __init__(self, path: Path):
         self.conn = sqlite3.connect(path)
@@ -301,8 +310,7 @@ class FeishuMirror:
         if result.returncode != 0:
             raise RuntimeError(f"cannot verify lark-cli auth status: {text.strip()[:1000]}")
         body = extract_json(text)
-        user_name = str(body.get("userName") or "")
-        user_open_id = str(body.get("userOpenId") or "")
+        user_name, user_open_id = auth_user_identity(body)
         expected_name = self.args.expected_user_name
         expected_open_id = self.args.expected_user_open_id
         reject_name = self.args.reject_user_name
