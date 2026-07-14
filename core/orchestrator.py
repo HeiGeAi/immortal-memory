@@ -227,7 +227,7 @@ def collect_feishu():
     log("=== 阶段 F1: 飞书增量采集 ===")
     args = feishu_daily_args()
     if not args:
-        log("飞书采集跳过: 未配置 expected_user_name/open_id；先运行 immortal.py init 绑定账号")
+        log("飞书采集跳过: 未配置 expected_user_name/open_id；先运行 immortal-memory init 绑定账号")
         return True, {"total_new": 0}
     ok, out = run_script("feishu_collect.py", *args, timeout=1800)
     if ok:

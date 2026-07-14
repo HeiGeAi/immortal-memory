@@ -343,7 +343,7 @@ def build_attention(
             last_collect = last_collect.replace(tzinfo=timezone.utc)
         age_hours = (datetime.now(timezone.utc) - last_collect.astimezone(timezone.utc)).total_seconds() / 3600
         if age_hours > 30:
-            items.append(f"最近采集已超过 {age_hours:.1f} 小时，检查 cron 或手动运行 immortal.py run。")
+            items.append(f"最近采集已超过 {age_hours:.1f} 小时，检查 cron 或手动运行 immortal-memory run。")
     else:
         items.append("还没有成功采集时间，先检查 collect/orchestrator 链路。")
 
@@ -380,7 +380,7 @@ def build_attention(
         elif quality_status == "warn":
             items.append("记忆质量层输入不完整，先补齐 people/evidence network 后再判断。")
     else:
-        items.append("记忆质量报告缺失，运行 immortal.py quality。")
+        items.append("记忆质量报告缺失，运行 immortal-memory quality。")
 
     recent_warnings = log_info.get("recent_warnings") or []
     if recent_warnings and not errors:

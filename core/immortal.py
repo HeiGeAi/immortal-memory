@@ -36,6 +36,7 @@ from config import (
     save_config,
     slug_prefix,
 )
+from command_hints import cli_command
 from export_restore import create_export, get_backup_status, restore_check
 
 
@@ -702,7 +703,7 @@ def command_context(args) -> int:
         for line in text.splitlines()[:80]:
             print(line)
     else:
-        print("Profile and digital soul are missing. Run immortal.py profile after capture is healthy.")
+        print(f"Profile and digital soul are missing. Run `{cli_command('profile')}` after capture is healthy.")
     print()
     print("Runtime state:")
     print(f"- Last collect: {local_time(state.get('last_collect'))}")
@@ -733,7 +734,7 @@ def command_context(args) -> int:
         run_script("search.py", [args.query, "--since", args.since])
     else:
         print("Relevant recall: skipped for speed. Run with --with-recall, or use:")
-        print(f"python3 {SKILL_DIR / 'immortal.py'} recall {json.dumps(args.query, ensure_ascii=False)} --since {args.since}")
+        print(cli_command("recall", args.query, "--since", args.since))
     return 0
 
 
@@ -1000,8 +1001,8 @@ def command_init(args) -> int:
     print(f"Feishu guard: {'configured' if guards else 'not configured'}")
     print()
     print("Next:")
-    print("  python3 ~/.codex/skills/immortal/immortal.py train --smoke")
-    print("  python3 ~/.codex/skills/immortal/immortal.py agent-factory")
+    print(f"  {cli_command('train', '--smoke')}")
+    print(f"  {cli_command('agent-factory')}")
     return 0
 
 
@@ -1069,7 +1070,7 @@ def command_train(args) -> int:
     if args.with_feishu:
         guard = feishu_guard_args(config)
         if not guard and not args.allow_current_feishu_account:
-            print("Feishu collection skipped: configure expected user in `immortal.py init` or pass --allow-current-feishu-account.")
+            print(f"Feishu collection skipped: configure expected user in `{cli_command('init')}` or pass --allow-current-feishu-account.")
         else:
             feishu_args = guard or ["--allow-current-account"]
             feishu_args.extend(["--days", str(args.feishu_days), "--max-chats", str(args.feishu_max_chats), "--max-messages", str(args.feishu_max_messages)])
@@ -1147,10 +1148,6 @@ def command_train(args) -> int:
         return 2
     print("Training completed")
     return 0
-
-
-def command_package(args) -> int:
-    return run_script("package_tool.py", args.package_args)
 
 
 def command_profile_merge(args) -> int:
@@ -1404,7 +1401,8 @@ def command_export(args) -> int:
     if len(warnings) > 12:
         print(f"  - ... {len(warnings) - 12} more")
     print()
-    print("Next: run `python3 ~/.codex/skills/immortal/immortal.py restore-check \"<export-path>\"` before trusting a restore.")
+    restore_command = cli_command("restore-check", "<export-path>")
+    print(f"Next: run `{restore_command}` before trusting a restore.")
     return 0
 
 
@@ -1440,19 +1438,21 @@ def command_restore_guide(args) -> int:
     print("1. Copy or mount the export directory on the new machine.")
     print(f"   Latest known export: {export_dir}")
     print()
-    print("2. Install the Immortal Codex skill.")
-    print("   python3 install.py --owner-display-name \"Your Name\" --alias \"Your Alias\"")
+    print("2. Install Immortal Memory from a repository checkout or wheel, then initialize it.")
+    print('   python3 -m pip install "/path/to/immortal-memory"')
+    init_command = cli_command("init", "--owner-display-name", "Your Name", "--alias", "Your Alias")
+    print(f"   {init_command}")
     print()
     print("3. Verify the export before trusting it.")
-    print(f"   python3 ~/.codex/skills/immortal/immortal.py restore-check {json.dumps(str(export_dir), ensure_ascii=False)}")
+    print(f"   {cli_command('restore-check', str(export_dir))}")
     print()
     print("4. Restore the vault files to ~/.immortal, then rebuild derived views.")
-    print("   python3 ~/.codex/skills/immortal/immortal.py train")
-    print("   python3 ~/.codex/skills/immortal/immortal.py health")
+    print(f"   {cli_command('train')}")
+    print(f"   {cli_command('health')}")
     print()
     print("5. Reinstall local automation on the new machine.")
-    print("   python3 ~/.codex/skills/immortal/immortal.py daily-install")
-    print("   python3 ~/.codex/skills/immortal/immortal.py daily-status")
+    print(f"   {cli_command('daily-install')}")
+    print(f"   {cli_command('daily-status')}")
     return 0
 
 
@@ -1590,10 +1590,6 @@ def build_parser() -> argparse.ArgumentParser:
     cc_worker = sub.add_parser("cc-worker", help="Run bounded low-cost Claude Code worker tasks")
     cc_worker.add_argument("cc_worker_args", nargs=argparse.REMAINDER)
     cc_worker.set_defaults(func=command_cc_worker)
-
-    package = sub.add_parser("package", help="Build a sanitized installable zip for another Codex user")
-    package.add_argument("package_args", nargs=argparse.REMAINDER)
-    package.set_defaults(func=command_package)
 
     profile_merge = sub.add_parser("profile-merge", help="Merge checked profile candidates into reviewed long-term memory")
     profile_merge.add_argument("profile_merge_args", nargs=argparse.REMAINDER)
@@ -1772,8 +1768,6 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("feishu_mirror_worker.py", argv[1:])
     if argv and argv[0] == "cc-worker":
         return run_script("cc_worker.py", argv[1:])
-    if argv and argv[0] == "package":
-        return run_script("package_tool.py", argv[1:])
     if argv and argv[0] == "profile-merge":
         return run_script("profile_merge.py", argv[1:])
     if argv and argv[0] == "profile-auto-review":

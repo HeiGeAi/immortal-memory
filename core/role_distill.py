@@ -25,6 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config import load_config, owner_aliases, owner_display_name, slug_prefix
+from command_hints import cli_command
 
 
 HOME = Path.home()
@@ -914,8 +915,8 @@ def build_role_package(args: argparse.Namespace) -> dict[str, Any]:
         "retrieval": {
             "terms": terms,
             "recommended_runtime_commands": [
-                f"python3 {SKILL_DIR / 'immortal.py'} context \"{goal}\"",
-                f"python3 {SKILL_DIR / 'immortal.py'} recall \"{goal}\"",
+                cli_command("context", goal),
+                cli_command("recall", goal),
             ],
         },
         "evidence": selected,
@@ -1042,8 +1043,8 @@ def render_skill(package: dict[str, Any]) -> str:
         "",
         "## Runtime Rule",
         "",
-        f"- Before major output, run: `python3 {SKILL_DIR / 'immortal.py'} context \"{package['goal']}\"` if live memory context is needed.",
-        f"- For focused evidence, run: `python3 {SKILL_DIR / 'immortal.py'} recall \"<task topic>\"`.",
+        f"- Before major output, run: `{cli_command('context', package['goal'])}` if live memory context is needed.",
+        f"- For focused evidence, run: `{cli_command('recall', '<task topic>')}`.",
         "- Summarize sensitive evidence; do not paste private raw records or credentials.",
         f"- Do not claim to fully replace {target}. This role can draft, pre-judge, review, and organize context.",
         "",
