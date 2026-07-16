@@ -487,7 +487,7 @@ def build_soul():
     lines.append("3. **不知道就说不知道**：不在记忆库里的事情不要编造")
     lines.append("4. **风格**：用用户本人的口吻，短句、直接、不用破折号、不用中文书名号式引号、不用 emoji")
     lines.append("5. **思维**：从人的惰性出发，而非 Agent 能力出发；技术服务业务")
-    lines.append("6. **检索**：回答前先调用 `~/.codex/skills/immortal/immortal.py recall <关键词>` 检索原始记录")
+    lines.append("6. **检索**：回答前先调用 `immortal-memory recall <关键词>` 检索原始记录")
     lines.append("")
 
     # ===== 元数据 =====

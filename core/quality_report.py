@@ -645,7 +645,7 @@ def check_inputs(people_index: dict[str, Any], relationship_index: dict[str, Any
             severity="high",
             title="人物索引缺失",
             detail="质量层需要 people_index.json 才能判断身份合并质量。",
-            suggested_action="先运行 immortal.py people。",
+            suggested_action="先运行 immortal-memory people。",
         )
     if not RELATIONSHIP_INDEX_FILE.exists() or not relationship_index.get("edges"):
         make_issue(
@@ -655,7 +655,7 @@ def check_inputs(people_index: dict[str, Any], relationship_index: dict[str, Any
             severity="high",
             title="关系索引缺失",
             detail="质量层需要 relationship_index.json 才能判断图谱噪音。",
-            suggested_action="先运行 immortal.py relationships。",
+            suggested_action="先运行 immortal-memory relationships。",
         )
     for origin, source in sources.items():
         if not source.get("exists"):

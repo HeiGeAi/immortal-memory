@@ -27,6 +27,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+from command_hints import cli_command
+
 
 HOME = Path.home()
 SKILL_DIR = Path(__file__).resolve().parent
@@ -428,10 +430,13 @@ class FactoryStore:
             "roles": roles,
             "jobs": jobs[:JOB_HISTORY_LIMIT],
             "commands": {
-                "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
-                "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
-                "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
-                "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
+                "collect": cli_command("run"),
+                "clean": " && ".join(
+                    cli_command(command)
+                    for command in ("feishu-clean", "feishu-distill", "profile-auto-review")
+                ),
+                "role": cli_command("task-compile", "目标", "--mode", "auto"),
+                "health": cli_command("health", "--max-age-hours", "30"),
             },
         }
 

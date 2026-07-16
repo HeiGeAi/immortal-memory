@@ -10,6 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config import configured_vault_dir, load_config, owner_display_name
+from command_hints import cli_command
 
 
 IMMORTAL_DIR = configured_vault_dir()
@@ -148,22 +149,20 @@ def build_goal() -> dict[str, Any]:
             "daily_sources": (config.get("feishu") or {}).get("daily_sources", ""),
         },
         "stable_entrypoints": {
-            "health": "python3 ~/.codex/skills/immortal/immortal.py health",
-            "daily_run": "python3 ~/.codex/skills/immortal/immortal.py run",
-            "agent_entry": "python3 ~/.codex/skills/immortal/immortal.py agent-entry",
+            "health": cli_command("health"),
+            "daily_run": cli_command("run"),
+            "agent_entry": cli_command("agent-entry"),
             "agent_entry_url": "http://127.0.0.1:8765/agent-entry",
-            "agent_context": "python3 ~/.codex/skills/immortal/immortal.py agent-context \"当前任务\" --print",
-            "task_compile": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"当前任务\" --mode auto",
-            "context_pack": "python3 ~/.codex/skills/immortal/immortal.py context \"当前任务\"",
+            "agent_context": cli_command("agent-context", "当前任务", "--print"),
+            "task_compile": cli_command("task-compile", "当前任务", "--mode", "auto"),
+            "context_pack": cli_command("context", "当前任务"),
             "task_compiler": "http://127.0.0.1:8765/agent-factory",
-            "agent_factory_command": "python3 ~/.codex/skills/immortal/immortal.py agent-factory",
-            "daily_automation": "python3 ~/.codex/skills/immortal/immortal.py daily-status",
+            "agent_factory_command": cli_command("agent-factory"),
+            "daily_automation": cli_command("daily-status"),
             "dashboard": str(PATHS["dashboard"]),
             "timeline": str(PATHS["timeline"]),
-            "package": "python3 ~/.codex/skills/immortal/immortal.py package",
-            "oss_export": "python3 ~/.codex/skills/immortal/oss_export.py --output ~/Desktop/immortal-memory-open-source --force",
             "oss_repo": str(Path.home() / "Desktop" / "immortal-memory-open-source"),
-            "restore_guide": "python3 ~/.codex/skills/immortal/immortal.py restore-guide",
+            "restore_guide": cli_command("restore-guide"),
         },
         "product_decisions": [
             "产品不再定义为单一 Codex skill，而是独立本地产品；skill 只是 Codex 适配器。",

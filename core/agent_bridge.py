@@ -13,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config import configured_vault_dir, owner_display_name
+from command_hints import cli_command
 
 
 SKILL_DIR = Path(__file__).resolve().parent
@@ -85,10 +86,10 @@ def bridge_metadata() -> dict[str, Any]:
             "product_goal": str(IMMORTAL_DIR / "product" / "goal.md"),
         },
         "commands": {
-            "health": f"python3 {SKILL_DIR / 'immortal.py'} health --max-age-hours 72",
-            "agent_context": f"python3 {SKILL_DIR / 'immortal.py'} agent-context \"<当前任务>\" --print",
-            "recall": f"python3 {SKILL_DIR / 'immortal.py'} recall \"<主题>\"",
-            "context": f"python3 {SKILL_DIR / 'immortal.py'} context \"<当前任务>\"",
+            "health": cli_command("health", "--max-age-hours", "72"),
+            "agent_context": cli_command("agent-context", "<当前任务>", "--print"),
+            "recall": cli_command("recall", "<主题>"),
+            "context": cli_command("context", "<当前任务>"),
         },
         "local_urls": {
             "dashboard": "http://127.0.0.1:8765/",
@@ -103,12 +104,13 @@ def render_entry(meta: dict[str, Any]) -> str:
     command = meta["commands"]["agent_context"]
     one_sentence = (
         f"请先读取 {ENTRY_MD}，然后针对当前任务运行 "
-        f"`python3 {SKILL_DIR / 'immortal.py'} agent-context \"<当前任务>\" --print`，"
+        f"`{command}`，"
         f"把返回内容作为理解{owner}的长期上下文。"
     )
+    current_task_command = cli_command("agent-context", "本次任务", "--print")
     claude_prompt = (
         f"你现在可以调用{owner}的永生知识库。开始任务前先运行："
-        f"`python3 {SKILL_DIR / 'immortal.py'} agent-context \"本次任务\" --print`，"
+        f"`{current_task_command}`，"
         "再基于返回的画像、偏好、近期状态和证据继续工作。"
     )
     lines = [
@@ -157,9 +159,10 @@ def command_entry(_args: argparse.Namespace) -> int:
     AGENT_DIR.mkdir(parents=True, exist_ok=True)
     ENTRY_MD.write_text(render_entry(meta), encoding="utf-8")
     write_json(ENTRY_JSON, meta)
+    current_task_command = cli_command("agent-context", "本次任务", "--print")
     claude_prompt = (
         f"你现在可以调用{meta.get('owner')}的永生知识库。"
-        f"开始任务前运行：python3 {SKILL_DIR / 'immortal.py'} agent-context \"本次任务\" --print"
+        f"开始任务前运行：{current_task_command}"
     )
     CLAUDE_PROMPT.write_text(claude_prompt + "\n", encoding="utf-8")
     print(f"entry_md={ENTRY_MD}")

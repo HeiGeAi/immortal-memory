@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,3 +23,5 @@ jobs:
         run: python3 -m py_compile install.py $(find core scripts -name '*.py')
       - name: Run smoke test
         run: bash scripts/smoke_test.sh
+      - name: Build wheel and test installed CLI
+        run: python3 -m unittest tests/test_packaging.py -v
