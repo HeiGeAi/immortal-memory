@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from config import configured_vault_dir, owner_display_name
 from command_hints import cli_command
+from preflight import STATUS_DEGRADED, STATUS_UNAVAILABLE, gather_preflight, render_summary
 
 
 SKILL_DIR = Path(__file__).resolve().parent
@@ -66,9 +67,14 @@ def bridge_metadata() -> dict[str, Any]:
     state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
     quality = read_json(IMMORTAL_DIR / "quality" / "latest.json", {})
     product = read_json(IMMORTAL_DIR / "product" / "goal.json", {})
+    preflight = gather_preflight()
     return {
         "generated_at": now_local(),
         "owner": owner_display_name(),
+        "vault_status": preflight["vault_status"],
+        "context_status": preflight["context_status"],
+        "loss_protection": preflight["loss_protection"],
+        "real_record_count": preflight["real_record_count"],
         "total_records": state.get("total_records"),
         "last_collect": state.get("last_collect"),
         "last_feishu_collect": state.get("last_feishu_collect"),
@@ -126,6 +132,11 @@ def render_entry(meta: dict[str, Any]) -> str:
         claude_prompt,
         "",
         "## 当前可信状态",
+        f"- vault_status: {meta.get('vault_status')}"
+        + ("　⚠️ DEMO ONLY：尚未接入真实数据，未受记忆保护" if meta.get("vault_status") == "smoke_only" else ""),
+        f"- context_status: {meta.get('context_status')}",
+        f"- loss_protection: {meta.get('loss_protection')}",
+        f"- real_record_count: {meta.get('real_record_count')}",
         f"- total_records: {meta.get('total_records')}",
         f"- quality: {meta.get('quality_status')} / {meta.get('quality_score')} / issues={meta.get('quality_issues')}",
         f"- last_collect: {meta.get('last_collect')}",
@@ -174,6 +185,25 @@ def command_entry(_args: argparse.Namespace) -> int:
 
 def command_context(args: argparse.Namespace) -> int:
     query = (args.query or "当前任务").strip()
+
+    preflight = gather_preflight(query=query, since=args.since)
+    if preflight["context_status"] == STATUS_UNAVAILABLE and not args.force:
+        AGENT_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_at": now_local(),
+            "query": query,
+            "context_status": STATUS_UNAVAILABLE,
+            "context_md": None,
+            "preflight": preflight,
+        }
+        write_json(LATEST_CONTEXT_JSON, payload)
+        print(render_summary(preflight))
+        print()
+        print(f"context_status={STATUS_UNAVAILABLE}")
+        print(f"context_json={LATEST_CONTEXT_JSON}")
+        print("Refusing to generate a context pack from an empty or demo-only vault. Use --force to override for debugging.")
+        return 3
+
     cmd = [sys.executable, str(SKILL_DIR / "immortal.py"), "context", query, "--since", args.since]
     if args.with_recall:
         cmd.append("--with-recall")
@@ -182,18 +212,37 @@ def command_context(args: argparse.Namespace) -> int:
     if result.stderr.strip():
         body = body + "\n\nSTDERR:\n" + result.stderr.strip()
     AGENT_DIR.mkdir(parents=True, exist_ok=True)
+    context_status = preflight["context_status"]
     header = [
         "# Immortal Task Context",
         "",
         f"Generated: {now_local()}",
         f"Query: {query}",
         f"Exit code: {result.returncode}",
+        f"Context status: {context_status}",
         "",
         "Use this as task-local context. Do not paste raw vault data.",
-        "",
-        "---",
-        "",
     ]
+    if context_status != "ready":
+        header.extend(
+            [
+                "",
+                f"## ⚠️ CONTEXT STATUS: {context_status.upper()}",
+                "",
+                f"- vault_status: {preflight['vault_status']}",
+                f"- last_real_collect_at: {preflight['last_real_collect_at'] or 'never'}",
+                f"- query_coverage: {preflight['query_coverage']}"
+                + (
+                    f" (gap {preflight['coverage_gap_hours']:.0f}h)"
+                    if preflight.get("coverage_gap_hours")
+                    else ""
+                ),
+                f"- reasons: {'; '.join(preflight['reasons']) or 'none'}",
+                "",
+                "长期记忆覆盖不完整。引用其中的历史结论前，先向用户说明这一缺口。",
+            ]
+        )
+    header.extend(["", "---", ""])
     content = "\n".join(header) + body + "\n"
     output = Path(args.output).expanduser() if args.output else LATEST_CONTEXT_MD
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -202,8 +251,10 @@ def command_context(args: argparse.Namespace) -> int:
         "generated_at": now_local(),
         "query": query,
         "exit_code": result.returncode,
+        "context_status": context_status,
         "context_md": str(output),
         "entry_md": str(ENTRY_MD),
+        "preflight": preflight,
         "files": {
             "context": file_info(output),
             "entry": file_info(ENTRY_MD),
@@ -212,6 +263,9 @@ def command_context(args: argparse.Namespace) -> int:
     write_json(LATEST_CONTEXT_JSON, payload)
     print(f"context_md={output}")
     print(f"context_json={LATEST_CONTEXT_JSON}")
+    print(f"context_status={context_status}")
+    if context_status == STATUS_DEGRADED:
+        print("WARNING: context is degraded; see the CONTEXT STATUS block inside the pack.")
     if args.print:
         print()
         print(content)
@@ -230,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--output", default="")
     context.add_argument("--timeout", type=int, default=240)
     context.add_argument("--print", action="store_true", help="Also print the generated context to stdout")
+    context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     context.set_defaults(func=command_context)
     return parser
 

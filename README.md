@@ -88,24 +88,40 @@ Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也
 
 它不包含任何人的私人记忆库、聊天记录、文档、生成的画像、角色证据、日志或密钥。这些东西属于你本地的 `~/.immortal/`，永远不进仓库。
 
-## 快速开始
+## 快速开始（DEMO 冒烟，尚未接入真实数据）
+
+下面这条路径只验证程序能跑。**跑完它你还没有受到任何真实记忆保护**，界面和 CLI 会一直显示 DEMO ONLY，直到你完成后面的生产就绪三步。
 
 ```bash
 git clone https://github.com/HeiGeAi/immortal-memory.git
 cd immortal-memory
 
-# 安装，并装上 Codex 适配器
-python3 install.py --owner-display-name "Your Name" --alias "Your Alias" --install-codex-adapter
+# 安装，并装上 Codex 适配器（安装器会要求你明确选择是否启用每日自动采集）
+python3 install.py --owner-display-name "Your Name" --alias "Your Alias" --install-codex-adapter --install-daily
 
-# 跑一遍冒烟训练，顺手编译一个写稿审稿角色
-immortal-memory train --smoke --build-role --goal "writing review" --mode writer
+# 跑一遍冒烟训练（只写入一条测试记录，属于 DEMO）
+immortal-memory train --smoke
 
-# 看看给 agent 的入口长什么样
-immortal-memory agent-entry
-
-# 针对一个具体任务，生成贴身的上下文包
-immortal-memory agent-context "help me review this product idea" --print
+# 随时查看自己是否真正受到保护
+immortal-memory preflight
 ```
+
+## 生产就绪三步（真正开始保护你的数据）
+
+冒烟通过只代表程序能跑。让系统真正进入生产态需要三步：
+
+```bash
+# 1. 接入真实来源并完成一次真实采集
+immortal-memory run
+
+# 2. 启用每日自动采集（安装时没启用的话）
+immortal-memory daily-install
+
+# 3. 备份到外部介质并自动校验（不要落在同一块磁盘上）
+immortal-memory backup --output-dir /Volumes/你的外置盘/immortal-backups
+```
+
+三步完成后，`immortal-memory preflight` 会显示 `loss_protection: protected`。在那之前，agent 侧调用 `agent-context` 会被门禁拦下（`context_status: unavailable`），不会用一个空库假装有记忆。
 
 打开本地控制台：
 
@@ -115,13 +131,24 @@ immortal-memory agent-factory
 
 然后访问 http://127.0.0.1:8765/
 
+## 产品边界（它替代不了什么）
+
+Immortal Memory 保护的是**记忆层**：AI 对话痕迹、画像、人物关系和判断沉淀。它不替代：
+
+- **Time Machine / 整机备份**：工作区、应用、登录态不在它的保护范围
+- **Git**：代码和版本历史请交给版本控制
+- **异地备份**：默认导出在本机；防盘毁需要你把 `backup --output-dir` 指向外置盘或同步目录
+
+恢复出这个 Git 仓库不等于恢复了产品：core 安装（`~/.local/share/immortal-memory/`）和私有 vault（`~/.immortal/`）是两个独立的东西，`preflight` 会明确区分这三种状态。
+
 ## 让任何 agent 用上它
 
 给本地 agent 一段这样的交接说明就行：
 
 ```text
-先读 ~/.immortal/agent/ENTRY.md。然后运行：
-immortal-memory agent-context "<当前任务>" --print
+先运行只读预检：immortal-memory preflight --json
+context_status 是 unavailable 就如实告诉用户"长期记忆当前不可用"，禁止自动初始化或重建。
+预检通过后运行：immortal-memory agent-context "<当前任务>" --print
 把返回的内容当作任务级记忆来用，默认不要直接去读原始库。
 ```
 

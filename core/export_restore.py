@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,6 +172,26 @@ def new_export_dir(base_output: Path) -> Path:
     raise FileExistsError(f"unable to allocate unique export directory under {base_output}")
 
 
+def classify_storage_location(target: Path, vault: Path) -> str:
+    """Classify an export target relative to the vault's disaster domain."""
+    try:
+        resolved_target = target.resolve()
+        resolved_vault = vault.resolve()
+    except OSError:
+        return "unknown"
+    if resolved_vault == resolved_target or resolved_vault in resolved_target.parents:
+        return "internal_vault"
+    probe = resolved_target
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        if vault.exists() and probe.exists() and os.stat(probe).st_dev == os.stat(resolved_vault).st_dev:
+            return "same_disk"
+    except OSError:
+        return "unknown"
+    return "external_disk"
+
+
 def create_export(
     vault_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
@@ -181,6 +202,16 @@ def create_export(
     base_output = Path(output_dir).expanduser() if output_dir else vault / EXPORTS_DIRNAME
     export_dir = new_export_dir(base_output)
     warnings: list[str] = []
+
+    location = classify_storage_location(base_output, vault)
+    if location == "internal_vault":
+        warnings.append(
+            "export_inside_vault: 导出目录位于 vault 内部，vault 被误删时备份会一起消失；请用 --output-dir 指向外置盘或同步目录"
+        )
+    elif location == "same_disk":
+        warnings.append(
+            "export_same_disk: 导出目录与 vault 在同一块磁盘上，无法抵御磁盘损坏；建议改用外置盘或同步目录"
+        )
 
     if not vault.exists():
         warnings.append(f"vault_missing: {vault}")
@@ -202,6 +233,7 @@ def create_export(
         "generated_at": iso_utc(),
         "vault_dir": str(vault),
         "export_dir": str(export_dir),
+        "storage_location": location,
         "include_raw": bool(include_raw),
         "items": items,
         "totals": {

@@ -294,6 +294,13 @@ def command_status(_args) -> int:
         relationship_summary = {}
     print("Immortal Skill status")
     print()
+    from preflight import gather_preflight
+
+    preflight = gather_preflight()
+    readiness = f"{preflight['vault_status']} / context {preflight['context_status']} / {preflight['loss_protection']}"
+    if preflight["vault_status"] == "smoke_only":
+        readiness += "　⚠️ DEMO ONLY：尚未接入真实数据"
+    print(f"Readiness: {readiness}")
     print(f"Storage: {IMMORTAL_DIR}")
     print(f"Index: {fmt_size(INDEX_FILE)}")
     print(f"Digital soul: {fmt_size(SOUL_FILE)}")
@@ -1144,10 +1151,30 @@ def command_train(args) -> int:
         print(f"Training completed with attention: {', '.join(attention)}")
         if args.smoke:
             print("Smoke mode treats attention as expected because the vault has almost no real user data yet.")
+            print_demo_banner()
             return 0
         return 2
     print("Training completed")
+    if args.smoke:
+        print_demo_banner()
     return 0
+
+
+def print_demo_banner() -> None:
+    print()
+    print("=" * 56)
+    print("  ⚠️  DEMO ONLY — 尚未受到真实记忆保护")
+    print("=" * 56)
+    print("冒烟训练只写入了一条测试记录，没有接入任何真实来源。")
+    print("此时生成的画像、Entry 和看板都只是演示，不代表系统已在工作。")
+    print()
+    print("生产就绪三步：")
+    print(f"  1. 接入真实来源并完成一次真实采集：{cli_command('run')}")
+    print(f"  2. 启用每日自动采集：{cli_command('daily-install')}")
+    print(f"  3. 备份到外部介质并校验：{cli_command('backup', '--output-dir', '<外置盘或同步目录>')}")
+    print()
+    print(f"随时用 `{cli_command('preflight')}` 查看是否已真正受到保护。")
+    print("=" * 56)
 
 
 def command_profile_merge(args) -> int:
@@ -1212,7 +1239,23 @@ def command_agent_context(args) -> int:
         bridge_args.extend(["--output", args.output])
     if args.print:
         bridge_args.append("--print")
+    if args.force:
+        bridge_args.append("--force")
     return run_script("agent_bridge.py", bridge_args)
+
+
+def command_preflight(args) -> int:
+    preflight_args = []
+    if args.query:
+        preflight_args.append(args.query)
+    if args.since:
+        preflight_args.extend(["--since", args.since])
+    preflight_args.extend(["--max-age-hours", str(args.max_age_hours)])
+    if args.vault_dir:
+        preflight_args.extend(["--vault-dir", args.vault_dir])
+    if args.json:
+        preflight_args.append("--json")
+    return run_script("preflight.py", preflight_args)
 
 
 def command_agent_http(args) -> int:
@@ -1388,8 +1431,21 @@ def command_export(args) -> int:
     write_state_key("last_portable_export_dir", manifest.get("export_dir"))
     write_state_key("last_portable_export_files", totals.get("files"))
     write_state_key("last_portable_export_bytes", totals.get("bytes"))
+    write_state_key("last_portable_export_location", manifest.get("storage_location"))
     print("Immortal portable export")
     print()
+    location = manifest.get("storage_location")
+    if location in {"internal_vault", "same_disk"}:
+        print("!" * 56)
+        print("  WARNING: 此导出不具备灾难恢复能力")
+        if location == "internal_vault":
+            print("  导出落在 vault 内部，vault 被误删时备份会一起消失。")
+        else:
+            print("  导出与 vault 在同一块磁盘上，无法抵御磁盘损坏。")
+        print("  真正的防丢备份请用 --output-dir 指向外置盘或同步目录。")
+        print("!" * 56)
+        print()
+    print(f"Storage location: {location}")
     print(f"Export: {manifest.get('export_dir')}")
     print(f"Manifest: {Path(str(manifest.get('export_dir'))) / 'manifest.json'}")
     print(f"Files: {int(totals.get('files') or 0):,}")
@@ -1404,6 +1460,26 @@ def command_export(args) -> int:
     restore_command = cli_command("restore-check", "<export-path>")
     print(f"Next: run `{restore_command}` before trusting a restore.")
     return 0
+
+
+def command_backup(args) -> int:
+    """Real backup: export, then verify the export before calling it done."""
+    export_code = command_export(args)
+    if export_code != 0:
+        return export_code
+    state = read_json(STATE_FILE, {})
+    export_dir = state.get("last_portable_export_dir")
+    if not export_dir:
+        print("Backup created an export but could not locate it in state; run restore-check manually.")
+        return 1
+    print()
+
+    class _RestoreArgs:
+        export_path = export_dir
+        strict = False
+        json = False
+
+    return command_restore_check(_RestoreArgs())
 
 
 def command_backup_status(args) -> int:
@@ -1458,6 +1534,11 @@ def command_restore_guide(args) -> int:
 
 def command_restore_check(args) -> int:
     result = restore_check(args.export_path, strict=bool(args.strict))
+    if result.get("ok"):
+        write_state_key("last_portable_restore_check", datetime.now(timezone.utc).isoformat())
+    write_state_key("last_portable_restore_check_dir", result.get("export_dir"))
+    write_state_key("last_portable_restore_check_files", result.get("checked_files", 0))
+    write_state_key("last_portable_restore_check_status", "ok" if result.get("ok") else "failed")
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result.get("ok") else 1
@@ -1527,7 +1608,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="Run capture, summary, dashboard, distill, and cleanup orchestration").set_defaults(
         func=lambda args: run_script("orchestrator.py")
     )
-    sub.add_parser("backup", help="Alias for run").set_defaults(func=lambda args: run_script("orchestrator.py"))
+    backup = sub.add_parser("backup", help="Create a portable export and verify it immediately (real backup; no longer an alias for run)")
+    backup.add_argument("--vault-dir", default=None)
+    backup.add_argument("--output-dir", default=None, help="Export target; use an external disk or synced folder for real loss protection")
+    backup.add_argument("--include-raw", action="store_true")
+    backup.set_defaults(func=command_backup)
     sub.add_parser("distill", help="Regenerate digital soul").set_defaults(func=lambda args: run_script("distill.py"))
     sub.add_parser("profile", help="Build structured owner profile from distilled memories and raw evidence").set_defaults(
         func=lambda args: run_script("profile.py")
@@ -1663,7 +1748,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_context.add_argument("--output", default="")
     agent_context.add_argument("--timeout", type=int, default=240)
     agent_context.add_argument("--print", action="store_true")
+    agent_context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     agent_context.set_defaults(func=command_agent_context)
+
+    preflight = sub.add_parser("preflight", help="Read-only readiness check: is the memory actually usable, protected, and current?")
+    preflight.add_argument("query", nargs="?", default="")
+    preflight.add_argument("--since", default=None)
+    preflight.add_argument("--max-age-hours", type=float, default=72)
+    preflight.add_argument("--vault-dir", default=None)
+    preflight.add_argument("--json", action="store_true")
+    preflight.set_defaults(func=command_preflight)
 
     agent_http = sub.add_parser("agent-http", help="Start the local HTTP Agent Bridge")
     agent_http.add_argument("--host", default="127.0.0.1")

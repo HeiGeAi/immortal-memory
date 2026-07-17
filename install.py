@@ -27,8 +27,12 @@ def main() -> int:
     parser.add_argument("--primary-account", default="")
     parser.add_argument("--install-codex-adapter", action="store_true")
     parser.add_argument("--install-claude-adapter", action="store_true")
-    parser.add_argument("--install-daily", action="store_true")
+    parser.add_argument("--install-daily", action="store_true", help="Enable the daily automated capture loop (recommended)")
+    parser.add_argument("--no-daily", action="store_true", help="Explicitly skip daily automation; you will NOT be continuously protected")
     args = parser.parse_args()
+
+    if args.install_daily and args.no_daily:
+        parser.error("--install-daily and --no-daily are mutually exclusive")
 
     prefix = Path(args.prefix).expanduser()
     core_target = prefix / "core"
@@ -53,8 +57,25 @@ def main() -> int:
         init_cmd.extend(["--primary-account", args.primary_account])
     subprocess.check_call(init_cmd)
 
-    if args.install_daily:
+    install_daily = args.install_daily
+    if not install_daily and not args.no_daily:
+        if sys.stdin.isatty():
+            answer = input("启用每日自动采集？没有它你不会受到持续保护。 [Y/n] ").strip().lower()
+            install_daily = answer in {"", "y", "yes"}
+        else:
+            print()
+            print("!" * 56)
+            print("  WARNING: 未选择每日自动采集（--install-daily / --no-daily）。")
+            print("  当前安装是一次性的：数据不会持续沉淀，你不受持续保护。")
+            print("  启用方式：immortal-memory daily-install")
+            print("!" * 56)
+            print()
+
+    if install_daily:
         subprocess.check_call([sys.executable, str(core_target / "immortal.py"), "daily-install"])
+    elif args.no_daily:
+        print("已按 --no-daily 跳过每日自动采集：数据不会持续沉淀，你不受持续保护。")
+        print("之后可用 `immortal-memory daily-install` 启用。")
 
     if args.install_codex_adapter:
         copytree_replace(ROOT / "adapters" / "codex" / "skills" / "immortal-memory", Path.home() / ".codex" / "skills" / "immortal-memory")
@@ -64,10 +85,13 @@ def main() -> int:
 
     print(f"Installed core: {core_target}")
     print(f"Command: {wrapper}")
-    print("Next:")
-    print("  immortal-memory train --smoke --build-role --goal 'writing review' --mode writer")
-    print("  immortal-memory agent-entry")
-    print("  immortal-memory agent-context 'current task' --print")
+    print("Next (DEMO，验证程序能跑，不代表已受保护):")
+    print("  immortal-memory train --smoke")
+    print("Production readiness (真正开始保护你的数据):")
+    print("  immortal-memory run                                  # 接入真实来源并完成一次真实采集")
+    print("  immortal-memory daily-install                        # 启用每日自动采集（如尚未启用）")
+    print("  immortal-memory backup --output-dir <外置盘或同步目录>  # 外部备份并自动校验")
+    print("  immortal-memory preflight                            # 确认 loss_protection: protected")
     return 0
 
 
