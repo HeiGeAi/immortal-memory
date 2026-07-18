@@ -62,6 +62,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 output=str(output),
                 print=False,
                 json=False,
+                force=True,
             )
             timeout = subprocess.TimeoutExpired(
                 cmd=["python3", "immortal.py"],
