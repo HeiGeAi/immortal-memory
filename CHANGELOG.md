@@ -7,6 +7,7 @@
 - Keep unknown, stale, partial, and same-disk backup states distinct from healthy.
 - Add allowlisted controls for a full run, health check, backup verification, and profile refresh.
 - Refine the Control Center with a Nocturne Teal interface, accessible action states, reduced-motion support, and overflow-safe mobile and print layouts.
+- Replace generic action buttons with instrument-switch controls that preserve their status lamp and command metadata through loading, success, and failure states.
 - Preserve the legacy generated snapshot at `/snapshot`.
 
 ## 0.8.0

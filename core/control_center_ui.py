@@ -103,7 +103,7 @@ a, button { color: inherit; }
     box-shadow .22s ease,
     transform .12s ease;
 }
-.link::after, .button::after {
+.link::after {
   content: "";
   position: absolute;
   inset: 0;
@@ -118,7 +118,7 @@ a, button { color: inherit; }
   color: var(--paper);
   box-shadow: inset 0 1px rgba(255,255,255,.035), 0 8px 24px rgba(0,0,0,.22);
 }
-.link:hover::after, .button:hover::after { transform: translateX(130%); }
+.link:hover::after { transform: translateX(130%); }
 .link:active, .button:active { transform: translateY(1px) scale(.985); }
 .link:focus-visible, .button:focus-visible {
   outline: 2px solid var(--cyan-glow);
@@ -138,22 +138,149 @@ a, button { color: inherit; }
   box-shadow: inset 0 1px rgba(255,255,255,.35), 0 10px 30px rgba(45,212,191,.19);
 }
 .button:disabled { cursor: not-allowed; opacity: .42; transform: none; box-shadow: none; }
-.button:disabled::after { display: none; }
 .button.is-loading { border-color: rgba(95,240,220,.72); color: var(--paper); }
-.button.is-loading::before {
-  content: "";
-  width: 12px;
-  height: 12px;
-  display: inline-block;
-  margin-right: 8px;
-  vertical-align: -2px;
-  border: 1px solid currentColor;
-  border-right-color: transparent;
-  border-radius: 50%;
-  animation: spin .8s linear infinite;
-}
 .button.is-success { border-color: rgba(120,219,169,.7); color: var(--lime); }
 .button.is-error { border-color: rgba(255,113,104,.72); color: var(--red); }
+.instrument {
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 50px;
+  padding: 7px 14px 7px 52px;
+  border-color: #35414d;
+  border-radius: 0;
+  background: linear-gradient(180deg, #10151b, #090c10);
+  color: var(--paper);
+  clip-path: polygon(0 0, calc(100% - 9px) 0, 100% 9px, 100% 100%, 9px 100%, 0 calc(100% - 9px));
+  text-align: left;
+  box-shadow: inset 0 1px rgba(255,255,255,.025);
+}
+.instrument::before {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 37px;
+  border-right: 1px solid #35414d;
+  background:
+    linear-gradient(135deg, rgba(255,255,255,.035), transparent 45%),
+    linear-gradient(180deg, #151b23, #0b0f14);
+  transition: border-color .22s var(--ease-out), background-color .22s var(--ease-out);
+}
+.instrument::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 7px;
+  height: 1px;
+  background: #45515d;
+  opacity: .7;
+}
+.instrument-light {
+  position: absolute;
+  z-index: 1;
+  top: 50%;
+  left: 14px;
+  width: 9px;
+  height: 9px;
+  border: 1px solid #596574;
+  background: #111820;
+  box-shadow: inset 0 0 0 2px #090c10;
+  transform: translateY(-50%);
+  transition: opacity .22s ease, transform .22s ease, background-color .22s ease, border-color .22s ease;
+}
+.instrument-copy { display: grid; gap: 2px; min-width: 0; }
+.instrument-copy strong {
+  overflow-wrap: anywhere;
+  color: inherit;
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.2;
+  letter-spacing: .025em;
+}
+.instrument-copy small {
+  overflow: hidden;
+  color: #667280;
+  font: 8px/1.25 "JetBrains Mono", "SFMono-Regular", monospace;
+  letter-spacing: .12em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.instrument:hover {
+  border-color: rgba(95,240,220,.7);
+  background: linear-gradient(180deg, #151d23, #0b1015);
+  box-shadow: inset 0 1px rgba(255,255,255,.04);
+}
+.instrument:hover::before { border-color: rgba(95,240,220,.4); }
+.instrument:hover .instrument-light {
+  border-color: var(--cyan-glow);
+  background: var(--cyan-glow);
+  box-shadow: inset 0 0 0 2px #07100f, 0 0 10px rgba(95,240,220,.4);
+}
+.instrument:active { transform: translateY(1px); }
+.instrument:focus-visible {
+  outline: 2px solid var(--cyan-glow);
+  outline-offset: -4px;
+  box-shadow: inset 0 0 0 4px rgba(8,9,13,.86);
+}
+.instrument.primary {
+  border-color: rgba(45,212,191,.62);
+  background: linear-gradient(90deg, rgba(45,212,191,.13), #0b1015 48%);
+  color: var(--paper);
+  box-shadow: inset 0 1px rgba(255,255,255,.035);
+}
+.instrument.primary::before {
+  border-color: rgba(45,212,191,.42);
+  background: linear-gradient(180deg, rgba(45,212,191,.13), #0b1115);
+}
+.instrument.primary .instrument-light {
+  border-color: var(--cyan-glow);
+  background: var(--cyan);
+  box-shadow: inset 0 0 0 2px #07100f, 0 0 11px rgba(95,240,220,.32);
+}
+.instrument.primary:hover {
+  border-color: var(--cyan-glow);
+  background: linear-gradient(90deg, rgba(45,212,191,.18), #0d151a 52%);
+  color: var(--paper);
+  box-shadow: inset 0 1px rgba(255,255,255,.05);
+}
+.instrument.compact {
+  min-height: 42px;
+  padding-left: 45px;
+  padding-right: 12px;
+}
+.instrument.compact::before { width: 32px; }
+.instrument.compact .instrument-light { left: 11px; width: 8px; height: 8px; }
+.instrument.compact .instrument-copy strong { font-size: 11px; }
+.instrument.compact .instrument-copy small { font-size: 7px; }
+.instrument.is-loading .instrument-light {
+  border-color: var(--cyan-glow);
+  background: var(--cyan);
+  animation: instrument-pulse .7s steps(2, end) infinite;
+}
+.instrument.is-success { border-color: rgba(120,219,169,.7); color: var(--lime); }
+.instrument.is-success .instrument-light {
+  border-color: var(--lime);
+  background: var(--lime);
+  box-shadow: inset 0 0 0 2px #08110d, 0 0 9px rgba(120,219,169,.28);
+}
+.instrument.is-error { border-color: rgba(255,113,104,.72); color: var(--red); }
+.instrument.is-error .instrument-light {
+  border-color: var(--red);
+  background: var(--red);
+  box-shadow: inset 0 0 0 2px #130807, 0 0 9px rgba(255,113,104,.25);
+}
+.instrument:disabled { color: var(--faint); }
+.instrument:disabled .instrument-light {
+  border-color: #39434e;
+  background: #11161c;
+  box-shadow: none;
+  animation: none;
+}
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(330px, .55fr);
@@ -352,6 +479,10 @@ a, button { color: inherit; }
 .footer { display: flex; justify-content: space-between; gap: 16px; border-top: 1px solid var(--line); margin-top: 30px; padding: 16px 0; color: var(--faint); font-size: 11px; }
 body.is-running .state-dot.running { animation: beacon 2.4s ease-in-out infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes instrument-pulse {
+  0%, 100% { opacity: 1; transform: translateY(-50%) scale(1); }
+  50% { opacity: .28; transform: translateY(-50%) scale(.86); }
+}
 @keyframes beacon {
   0%, 100% { box-shadow: 0 0 0 5px rgba(45,212,191,.07), 0 0 12px rgba(95,240,220,.14); }
   50% { box-shadow: 0 0 0 8px rgba(45,212,191,.025), 0 0 28px rgba(95,240,220,.34); }
@@ -428,8 +559,14 @@ body.is-running .state-dot.running { animation: beacon 2.4s ease-in-out infinite
       <a class="link" href="/snapshot">Legacy Snapshot</a>
     </div>
     <div class="nav-tools">
-      <button class="button" id="printBtn">打印</button>
-      <button class="button" id="refreshBtn">立即刷新</button>
+      <button class="button instrument compact" id="printBtn" data-label="打印" data-meta="PRINT">
+        <span class="instrument-light" aria-hidden="true"></span>
+        <span class="instrument-copy"><strong>打印</strong><small>PRINT</small></span>
+      </button>
+      <button class="button instrument compact" id="refreshBtn" data-label="立即刷新" data-meta="SYNC" aria-busy="false">
+        <span class="instrument-light" aria-hidden="true"></span>
+        <span class="instrument-copy"><strong>立即刷新</strong><small>SYNC</small></span>
+      </button>
     </div>
   </nav>
 
@@ -486,10 +623,22 @@ body.is-running .state-dot.running { animation: beacon 2.4s ease-in-out infinite
       <div class="panel control-panel">
         <p class="control-copy">启动前会再次确认。全流程运行期间会禁止重复启动，日志最多保留最近内容。</p>
         <div class="control-actions">
-          <button class="button primary action" data-action="run" data-label="立即运行全流程" aria-busy="false">立即运行全流程</button>
-          <button class="button action" data-action="health" data-label="运行健康检查" aria-busy="false">运行健康检查</button>
-          <button class="button action" data-action="backup_verify" data-label="校验最新备份" aria-busy="false">校验最新备份</button>
-          <button class="button action" data-action="profile_refresh" data-label="刷新画像" aria-busy="false">刷新画像</button>
+          <button class="button instrument primary action" data-action="run" data-label="立即运行全流程" data-meta="RUN · 7 STAGES" aria-busy="false">
+            <span class="instrument-light" aria-hidden="true"></span>
+            <span class="instrument-copy"><strong>立即运行全流程</strong><small>RUN · 7 STAGES</small></span>
+          </button>
+          <button class="button instrument action" data-action="health" data-label="运行健康检查" data-meta="VERIFY · HEALTH" aria-busy="false">
+            <span class="instrument-light" aria-hidden="true"></span>
+            <span class="instrument-copy"><strong>运行健康检查</strong><small>VERIFY · HEALTH</small></span>
+          </button>
+          <button class="button instrument action" data-action="backup_verify" data-label="校验最新备份" data-meta="VERIFY · BACKUP" aria-busy="false">
+            <span class="instrument-light" aria-hidden="true"></span>
+            <span class="instrument-copy"><strong>校验最新备份</strong><small>VERIFY · BACKUP</small></span>
+          </button>
+          <button class="button instrument action" data-action="profile_refresh" data-label="刷新画像" data-meta="REFRESH · PROFILE" aria-busy="false">
+            <span class="instrument-light" aria-hidden="true"></span>
+            <span class="instrument-copy"><strong>刷新画像</strong><small>REFRESH · PROFILE</small></span>
+          </button>
         </div>
         <div class="action-status" id="actionStatus" role="status" aria-live="polite">等待操作。</div>
         <div class="job-list" id="jobs"></div>
@@ -523,11 +672,14 @@ const duration = (seconds) => {
   return h ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
 };
 
-function setButtonState(button, state = '', label = '') {
+function setButtonState(button, state = '', label = '', meta = '') {
   button.classList.remove('is-loading', 'is-success', 'is-error');
   if (state) button.classList.add(`is-${state}`);
   button.setAttribute('aria-busy', state === 'loading' ? 'true' : 'false');
-  button.textContent = label || button.dataset.label || button.textContent;
+  const strong = button.querySelector('.instrument-copy strong');
+  const small = button.querySelector('.instrument-copy small');
+  if (strong) strong.textContent = label || button.dataset.label || '';
+  if (small) small.textContent = meta || button.dataset.meta || '';
 }
 
 function setActionStatus(message, status = '') {
@@ -650,7 +802,7 @@ function render(data) {
 async function refresh({manual = false} = {}) {
   const button = $('refreshBtn');
   if (manual) {
-    setButtonState(button, 'loading', '刷新中');
+    setButtonState(button, 'loading', '刷新中', 'SYNCING');
     button.disabled = true;
     setActionStatus('正在重新读取本机证据。', 'running');
   }
@@ -659,7 +811,7 @@ async function refresh({manual = false} = {}) {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     render(await response.json());
     if (manual) {
-      setButtonState(button, 'success', '已刷新');
+      setButtonState(button, 'success', '已刷新', 'SYNC · COMPLETE');
       setActionStatus('状态和证据已刷新。', 'success');
       resetButtonSoon(button);
     }
@@ -668,7 +820,7 @@ async function refresh({manual = false} = {}) {
     $('heroCopy').textContent = `无法读取本地状态接口：${error.message}`;
     $('stateDot').className = 'state-dot failed';
     if (manual) {
-      setButtonState(button, 'error', '刷新失败');
+      setButtonState(button, 'error', '刷新失败', 'SYNC · FAILED');
       setActionStatus(`刷新失败：${error.message}`, 'failed');
       resetButtonSoon(button);
     }
@@ -681,7 +833,7 @@ async function runAction(action, button) {
   const labels = {run:'立即运行全流程',health:'运行健康检查',backup_verify:'校验最新备份',profile_refresh:'刷新画像'};
   if (!window.confirm(`确认${labels[action] || action}？\\n只会执行本机白名单命令。`)) return;
   document.querySelectorAll('.action').forEach(item => item.disabled = true);
-  setButtonState(button, 'loading', '正在启动…');
+  setButtonState(button, 'loading', '正在启动…', 'EXECUTING');
   setActionStatus(`正在提交「${labels[action] || action}」。`, 'running');
   try {
     const response = await fetch(API_ACTIONS, {
@@ -692,11 +844,11 @@ async function runAction(action, button) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     await refresh();
-    setButtonState(button, 'success', '已启动');
+    setButtonState(button, 'success', '已启动', 'COMMAND · ACCEPTED');
     setActionStatus(`「${labels[action] || action}」已进入本机任务队列。`, 'success');
     resetButtonSoon(button);
   } catch (error) {
-    setButtonState(button, 'error', '启动失败');
+    setButtonState(button, 'error', '启动失败', 'COMMAND · FAILED');
     setActionStatus(`操作未启动：${error.message}`, 'failed');
     resetButtonSoon(button);
   } finally {
@@ -705,7 +857,6 @@ async function runAction(action, button) {
   }
 }
 
-$('refreshBtn').dataset.label = '立即刷新';
 $('refreshBtn').setAttribute('aria-busy', 'false');
 $('refreshBtn').addEventListener('click', () => refresh({manual:true}));
 $('printBtn').addEventListener('click', () => window.print());

@@ -44,6 +44,36 @@ def test_print_view_removes_navigation_and_controls():
     assert ".nav, .control-panel { display: none; }" in page
 
 
+def test_control_buttons_use_instrument_switch_structure():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert 'class="button instrument primary action"' in page
+    assert 'class="instrument-light"' in page
+    assert 'class="instrument-copy"' in page
+    assert "<small>RUN · 7 STAGES</small>" in page
+    assert 'class="link"' in page
+    assert 'class="link instrument"' not in page
+
+
+def test_instrument_buttons_define_visual_and_accessible_states():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert ".instrument-light" in page
+    assert "clip-path: polygon" in page
+    assert ".instrument.is-loading .instrument-light" in page
+    assert ".instrument.is-success .instrument-light" in page
+    assert ".instrument.is-error .instrument-light" in page
+    assert ".instrument:disabled .instrument-light" in page
+
+
+def test_button_state_updates_labels_without_replacing_instrument_dom():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert "button.querySelector('.instrument-copy strong')" in page
+    assert "button.querySelector('.instrument-copy small')" in page
+    assert "button.textContent = label" not in page
+
+
 def test_page_has_safe_control_labels_and_navigation():
     page = control_center_page_html("Immortal Control Center")
 
