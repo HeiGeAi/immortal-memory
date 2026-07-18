@@ -2,7 +2,7 @@
 """Build a Nuwa-style thinking profile from the Immortal profile layer.
 
 This is a derived, reviewable layer. It does not edit digital-soul.md. The goal
-is to turn Configured User's preserved traces into a compact operating model: mental
+is to turn Owner's preserved traces into a compact operating model: mental
 models, decision heuristics, expression DNA, anti-patterns, and honest
 boundaries.
 """
@@ -109,7 +109,7 @@ MENTAL_MODEL_SPECS = [
         "title": "先跑通 MVP，再扩团队和包装",
         "summary": "先找到真实客户、痛点、可行原型和付费信号，再谈组织、规模化和更大的叙事。",
         "keywords": ["MVP", "先做", "跑起来", "第一个付费客户", "客户痛点", "技术可行性", "市场教育", "成交", "验证"],
-        "application": "项目A客户交付、AI 店铺运营、中台产品、内容业务商业化。",
+        "application": "业务项目A客户交付、AI 店铺运营、中台产品、内容业务商业化。",
         "limitation": "MVP 不能变成低价劳务；验证的是高价值路径，不是无限让利。",
     },
     {
@@ -123,8 +123,8 @@ MENTAL_MODEL_SPECS = [
     {
         "id": "persona_boundaries",
         "title": "账号和人设边界要硬隔离",
-        "summary": "主账号、账号边界A、协作账号、外部参考账号等上下文不能混用；方法可以借，身份不能串。",
-        "keywords": ["账号边界", "人设", "主账号", "账号边界A", "外部参考账号", "分开", "不能套", "作者身份", "协作账号", "协作账号"],
+        "summary": "内容账号B、技术账号A、内容账号A、卡兹克等上下文不能混用；方法可以借，身份不能串。",
+        "keywords": ["账号边界", "人设", "内容账号B", "技术账号A", "卡兹克", "分开", "不能套", "作者身份", "内容创作者A", "内容账号A"],
         "application": "写作、账号运营、人物记忆、风格迁移和对外表达。",
         "limitation": "边界隔离不代表资料不互相启发；要标清来源和用途。",
     },
@@ -151,7 +151,7 @@ HEURISTIC_SPECS = [
     ("自动审阅优先，人只处理例外", ["自动审阅", "不用审阅", "全自动", "profile-auto-review"], "常规候选记忆由规则和证据门槛处理，用户只看结果。"),
     ("先预判，再看 AI 输出", ["预判", "独立判断", "复核", "不能完全依赖"], "研究、审稿和选型前先写下自己的判断点。"),
     ("报价讲总价值，不讲工时", ["报总价", "咨询的价格", "劳务的价格", "报价"], "客户沟通中先锚定业务收益和总方案。"),
-    ("账号上下文硬隔离", ["主账号", "账号边界A", "外部参考账号", "人设", "账号边界"], "写作和记忆调用前先确认使用哪个账号视角。"),
+    ("账号上下文硬隔离", ["内容账号B", "技术账号A", "卡兹克", "人设", "账号边界"], "写作和记忆调用前先确认使用哪个账号视角。"),
     ("先跑一个能用的版本", ["MVP", "先做", "跑起来", "第一个付费客户"], "项目早期先打通核心路径，再做扩展和美化。"),
     ("敏感内容先脱敏", ["脱敏", "灰色", "安全", "隐私", "代号"], "客户、平台、灰色语义和凭证默认不进入公开输出。"),
     ("把流程变成工具资产", ["Skill", "工作流", "封装", "复用", "钩子"], "重复三次以上的流程优先沉淀为 skill、脚本或模板。"),
@@ -170,8 +170,8 @@ EXPRESSION_FEATURES = [
     },
     {
         "name": "内容上强调普通人利益和商业判断",
-        "keywords": ["普通人", "商业判断", "主账号", "翻译复杂事件", "利益"],
-        "fallback": "主账号 内容要把复杂事件翻译成普通读者能感知的利益和风险。",
+        "keywords": ["普通人", "商业判断", "内容账号B", "翻译复杂事件", "利益"],
+        "fallback": "内容账号B 内容要把复杂事件翻译成普通读者能感知的利益和风险。",
     },
     {
         "name": "排版偏短段落、加粗判断、清晰小标题",
@@ -188,7 +188,7 @@ EXPRESSION_FEATURES = [
 ANTI_PATTERNS = [
     ("让用户反复手动审阅", ["不用审阅", "全自动", "自动审阅", "自己做清洗"]),
     ("把看板当成产品本体", ["不是 dashboard", "看板", "产品原点", "Skill first"]),
-    ("混淆用户本人、协作账号、账号边界A和外部参考账号", ["人设", "主账号", "账号边界A", "外部参考账号", "协作账号"]),
+    ("混淆用户本人、内容账号A、技术账号A和卡兹克", ["人设", "内容账号B", "技术账号A", "卡兹克", "内容创作者A"]),
     ("拿 AI 输出替代自己的判断", ["独立判断", "不能完全依赖", "预判", "AI 打分"]),
     ("按工时报价，把咨询价值降成劳务", ["劳务的价格", "报总价", "咨询的价格"]),
     ("高噪声数据直接写入 digital-soul.md", ["digital-soul", "review layer", "飞书", "噪声"]),
@@ -693,7 +693,7 @@ def summarize(report: dict[str, Any]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build a Nuwa-style thinking profile for Configured User")
+    parser = argparse.ArgumentParser(description="Build a Nuwa-style thinking profile for Owner")
     parser.add_argument("--show", action="store_true", help="Print generated Markdown")
     parser.add_argument("--json", action="store_true", help="Print generated JSON")
     parser.add_argument("--output-json", type=Path, default=OUTPUT_JSON)

@@ -7,6 +7,17 @@ import argparse
 import json
 import re
 import shutil
+import sys
+
+# 归因熔断阈值：records 是判定 self_direct 的唯一证据源。若 records 覆盖率过低
+# （文件缺失/轮转/换机器/传错路径）且隔离比例异常高，说明隔离决策不可信，
+# --apply 拒绝写回，避免用掏空的 reviewed 层重建画像。
+CIRCUIT_MIN_RECORDS_COVERAGE = 0.5
+CIRCUIT_MAX_QUARANTINE_RATE = 0.5
+
+
+def should_circuit_break(records_coverage: float, quarantine_rate: float) -> bool:
+    return records_coverage < CIRCUIT_MIN_RECORDS_COVERAGE and quarantine_rate > CIRCUIT_MAX_QUARANTINE_RATE
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -25,17 +36,17 @@ DEFAULT_DISTILLED = IMMORTAL_DIR / "feishu" / "distilled" / "profile_memories.js
 DEFAULT_RECORDS = IMMORTAL_DIR / "feishu" / "clean" / "records.jsonl"
 DEFAULT_REPORT_DIR = IMMORTAL_DIR / "quality"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
-OWNER_MARKERS = ("用户本人", "用户本人", "Configured User", "用户本人")
+OWNER_MARKERS = ("用户本人", "用户本人", "Owner", "用户本人")
 FIRST_PERSON_RE = re.compile(r"(^|[。！？\n])\s*(我|我们|咱们)")
 OTHER_SUBJECT_RE = re.compile(
-    r"(^|\n|\s)(协作者A|协作账号|协作者L|协作者L|郭协作者H|协作者H|协作者I|候选人)"
+    r"(^|\n|\s)(协作者己|内容创作者A|董协作者戊|协作者戊|郭协作者壬|协作者壬|协作者癸|候选人)"
     r"(认为|指出|提出|表示|反馈|负责|用|的|在|将|需|需要|奖金|签字)"
 )
 ORG_FACT_RE = re.compile(
     r"^(参赛要求|工程质量|一等奖|AI 产品提成|热点 skill 开发|问题表现|解决方案|稀缺内容考量|offer 合同)"
 )
 BRAND_OR_THIRD_CONTEXT_RE = re.compile(
-    r"(协作账号账号|协作账号账号|公众号矩阵|第三方观点|候选人|简历|面试|录用决定|送别视频|口播脚本|游戏通关视频)"
+    r"(内容账号A账号|内容创作者A账号|公众号矩阵|第三方观点|候选人|简历|面试|录用决定|送别视频|口播脚本|游戏通关视频)"
 )
 
 
@@ -153,7 +164,7 @@ def self_profile_contamination_reason(row: dict[str, Any]) -> str:
         return "self_profile_other_person_subject"
     if ORG_FACT_RE.search(statement):
         return "self_profile_org_or_event_fact"
-    if ("partner_brand" in projects or BRAND_OR_THIRD_CONTEXT_RE.search(text)) and not has_owner_marker:
+    if ("xiaoshengbibi" in projects or BRAND_OR_THIRD_CONTEXT_RE.search(text)) and not has_owner_marker:
         return "self_profile_brand_or_third_party_context_without_owner"
     return ""
 
@@ -284,6 +295,19 @@ def main(argv: list[str] | None = None) -> int:
     for item in report["reviewed"]["examples"]:
         md_lines.append(f"- `{item['memory_id']}` {item['reason']} :: {item['statement']}")
     report_md.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
+
+    records_coverage = (len(records) / len(clean_ids)) if clean_ids else 1.0
+    quarantine_rate = (len(quarantined) / len(enriched_reviewed)) if enriched_reviewed else 0.0
+    if args.apply and should_circuit_break(records_coverage, quarantine_rate):
+        print(
+            f"CIRCUIT BREAKER: records_coverage={records_coverage:.2f} "
+            f"quarantine_rate={quarantine_rate:.2f} — 归因证据严重缺失，拒绝写回以防掏空画像。"
+            f"检查 --records 路径（{args.records}）是否存在且未轮转。",
+            file=sys.stderr,
+        )
+        print(f"records_loaded={len(records)}")
+        print(f"reviewed_quarantined={len(quarantined)}")
+        return 3
 
     if args.apply:
         if args.reviewed.exists():

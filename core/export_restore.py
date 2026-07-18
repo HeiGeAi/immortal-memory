@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,9 +47,8 @@ REQUIRED_PATHS = [
     "people",
     "quality",
     "relationships",
-    "timeline.html",
-    "dashboard.html",
-    "brief",
+    # timeline.html / dashboard.html / brief 已于 2026-06-14 停用并删除；
+    # 留在白名单里会让每个新导出都带 missing 警告，strict 校验对完好数据永久 FAIL
     "digests",
     "summaries",
 ]
@@ -192,10 +192,15 @@ def classify_storage_location(target: Path, vault: Path) -> str:
     return "external_disk"
 
 
+class SecretShapesFound(RuntimeError):
+    """出口扫描发现未脱敏凭证形态且调用方要求 fail-closed。"""
+
+
 def create_export(
     vault_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
     include_raw: bool = False,
+    fail_on_secrets: bool = False,
 ) -> dict[str, Any]:
     """Create a portable export directory and return its manifest payload."""
     vault = vault_path(vault_dir)
@@ -229,11 +234,35 @@ def create_export(
         items.append(item)
         total_bytes += item["size"]
 
+    # 出口敏感形态扫描（hash-only，绝不写入原文）。index 清洗完成前默认只告警不阻断，
+    # 避免自动导出断流；清洗后调用方应传 fail_on_secrets=True 转为硬门禁。
+    secret_summary: dict[str, Any] = {}
+    exported_index = export_dir / "index.jsonl"
+    if exported_index.is_file():
+        import secret_scan
+
+        report = secret_scan.scan_file(exported_index)
+        secret_summary = {
+            "scanned_file": "index.jsonl",
+            "unique_candidates": report["unique_candidates"],
+            "unique_by_pattern": report["unique_by_pattern"],
+        }
+        if report["unique_candidates"] > 0:
+            warnings.append(
+                f"secret_shapes_present: index.jsonl 含 {report['unique_candidates']} 个未脱敏凭证形态候选"
+            )
+            if fail_on_secrets:
+                shutil.rmtree(export_dir, ignore_errors=True)
+                raise SecretShapesFound(
+                    f"export aborted: {report['unique_candidates']} unique secret-shape candidates in index.jsonl"
+                )
+
     manifest = {
         "generated_at": iso_utc(),
         "vault_dir": str(vault),
         "export_dir": str(export_dir),
         "storage_location": location,
+        "secret_scan": secret_summary,
         "include_raw": bool(include_raw),
         "items": items,
         "totals": {
@@ -308,8 +337,13 @@ def get_backup_status(vault_dir: str | Path | None = None, verify: bool = False)
             "mismatched": [],
             "warnings": [] if manifest_ok else ["manifest_missing_or_invalid"],
         }
+    if verify:
+        trust_level = "verified" if check.get("ok") else "failed"
+    else:
+        trust_level = "manifest_only"
     return {
         "ok": bool(check.get("ok")),
+        "trust_level": trust_level,
         "vault_dir": latest["vault_dir"],
         "exports_dir": latest["exports_dir"],
         "latest_export": latest,
@@ -362,6 +396,10 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
             "warnings": ["manifest_missing_or_invalid"],
         }
 
+    # manifest 自带的生成期 warning 必须进入校验结果：它们代表导出当时就已知的缺口
+    for manifest_warning in manifest.get("warnings") or []:
+        warnings.append(f"manifest_warning: {manifest_warning}")
+
     items = manifest.get("items")
     if not isinstance(items, list):
         items = []
@@ -410,8 +448,11 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
         if extra:
             warnings.append(f"extra_files: {len(extra)}")
 
+    # strict 模式 fail-closed：任何 warning（unsafe/duplicate/invalid/extra/manifest 自带）都不允许成功，
+    # 且必须逐一校验过 manifest 声明的每个安全条目
+    strict_ok = not warnings and checked_files == len(seen)
     return {
-        "ok": not missing and not mismatched and (not strict or not any(w.startswith("extra_files:") for w in warnings)),
+        "ok": not missing and not mismatched and (not strict or strict_ok),
         "export_dir": str(export_dir),
         "manifest_path": str(manifest_path),
         "generated_at": manifest.get("generated_at", ""),
@@ -435,6 +476,7 @@ def main() -> int:
     p_export.add_argument("--vault-dir")
     p_export.add_argument("--output-dir")
     p_export.add_argument("--include-raw", action="store_true")
+    p_export.add_argument("--fail-on-secrets", action="store_true", help="Abort export when unredacted secret shapes are detected in index.jsonl")
 
     p_latest = sub.add_parser("latest")
     p_latest.add_argument("--vault-dir")
@@ -449,14 +491,19 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "create-export":
-        print_json(create_export(args.vault_dir, args.output_dir, args.include_raw))
+        try:
+            print_json(create_export(args.vault_dir, args.output_dir, args.include_raw, fail_on_secrets=args.fail_on_secrets))
+        except SecretShapesFound as exc:
+            print(f"FAILED: {exc}", file=sys.stderr)
+            return 1
         return 0
     if args.command == "latest":
         print_json(find_latest_export(args.vault_dir))
         return 0
     if args.command == "status":
-        print_json(get_backup_status(args.vault_dir, verify=args.verify))
-        return 0
+        status = get_backup_status(args.vault_dir, verify=args.verify)
+        print_json(status)
+        return 0 if status.get("ok") else 1
     if args.command == "restore-check":
         result = restore_check(args.export_path, args.strict)
         print_json(result)

@@ -38,9 +38,11 @@ from config import (
 )
 from command_hints import cli_command
 from export_restore import create_export, get_backup_status, restore_check
+from state_store import mutate_state_atomic, update_state_atomic
 
 
 SKILL_DIR = Path(__file__).resolve().parent
+VERSION = (SKILL_DIR / "VERSION").read_text(encoding="utf-8").strip()
 IMMORTAL_DIR = configured_vault_dir()
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DAILY_DIR = IMMORTAL_DIR / "daily"
@@ -173,10 +175,16 @@ def portable_backup_detail(status: dict, *, max_age_hours: float | None = None) 
 
 
 def write_state_key(key: str, value) -> None:
-    state = read_json(STATE_FILE, {})
-    state[key] = value
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    update_state_atomic(STATE_FILE, {key: value})
+
+
+def clear_state_error(message: str) -> None:
+    def clear(state):
+        errors = state.get("errors") if isinstance(state.get("errors"), list) else []
+        state["errors"] = [item for item in errors if str(item) != message]
+        return state
+
+    mutate_state_atomic(STATE_FILE, clear)
 
 
 def getnote_credentials_present() -> bool:
@@ -200,7 +208,7 @@ def run_script(script: str, args: list[str] | None = None) -> int:
 def iter_daily_files(days: int = 2) -> Iterable[Path]:
     if not DAILY_DIR.exists():
         return []
-    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days - 1)
+    cutoff = datetime.now().astimezone().date() - timedelta(days=days - 1)
     files = []
     for path in DAILY_DIR.glob("*.jsonl*"):
         date_part = path.name.split(".jsonl")[0]
@@ -221,7 +229,7 @@ def open_text(path: Path):
 
 def iter_recent_records(days: int = 2, limit: int = 3000) -> Iterable[dict]:
     count = 0
-    for path in iter_daily_files(days):
+    for path in reversed(list(iter_daily_files(days))):
         with open_text(path) as f:
             for line in f:
                 if count >= limit:
@@ -868,7 +876,21 @@ def command_feishu_mirror(args) -> int:
     has_guard = any(part in guard_flags or any(part.startswith(flag + "=") for flag in guard_flags) for part in forwarded)
     if not has_guard:
         forwarded = [*feishu_guard_args(load_config()), *forwarded]
-    return run_script("feishu_drive_mirror.py", forwarded)
+    code = run_script("feishu_drive_mirror.py", forwarded)
+    if code == 0:
+        mode = ""
+        for index, item in enumerate(forwarded):
+            if item == "--mode" and index + 1 < len(forwarded):
+                mode = forwarded[index + 1]
+            elif item.startswith("--mode="):
+                mode = item.split("=", 1)[1]
+        if mode == "inventory":
+            write_state_key("last_feishu_mirror_inventory", datetime.now(timezone.utc).isoformat())
+            clear_state_error("feishu mirror inventory failed")
+        elif mode == "download":
+            write_state_key("last_feishu_mirror_download", datetime.now(timezone.utc).isoformat())
+            clear_state_error("feishu mirror download failed")
+    return code
 
 
 def command_feishu_mirror_status(args) -> int:
@@ -1140,9 +1162,7 @@ def command_train(args) -> int:
         attention.append(name)
 
     print()
-    state["errors"] = failures[-10:]
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    update_state_atomic(STATE_FILE, {"errors": failures[-10:]})
 
     if failures:
         print(f"Training failed at: {', '.join(failures)}")
@@ -1188,30 +1208,21 @@ def command_profile_auto_review(args) -> int:
 def command_profile_nuwa(args) -> int:
     code = run_script("profile_nuwa.py", args.profile_nuwa_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_profile_nuwa"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_profile_nuwa", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_role_distill(args) -> int:
     code = run_script("role_distill.py", args.role_distill_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_role_distill"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_role_distill", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_task_compile(args) -> int:
     code = run_script("task_compile.py", args.task_compile_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_task_compile"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_task_compile", datetime.now(timezone.utc).isoformat())
     return code
 
 
@@ -1288,20 +1299,14 @@ def command_people(args) -> int:
 def command_relationships(args) -> int:
     code = run_script("relationship_index.py", args.relationship_args)
     if code == 0:
-        state = read_json(STATE_FILE, {})
-        state["last_relationship_index"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_relationship_index", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_quality(args) -> int:
     code = run_script("quality_report.py", args.quality_args)
     if code == 0:
-        state = read_json(STATE_FILE, {})
-        state["last_quality"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_quality", datetime.now(timezone.utc).isoformat())
     return code
 
 
@@ -1350,16 +1355,16 @@ def command_getnote_diary(args) -> int:
     code = run_script("getnote_sync.py", sync_args)
     if code == 0:
         latest = read_json(GETNOTE_LATEST_JSON, {})
-        state = read_json(STATE_FILE, {})
         now_iso = datetime.now(timezone.utc).isoformat()
-        state["last_getnote_diary_sync"] = latest.get("generated_at") or now_iso
-        state["last_getnote_diary_status"] = latest.get("status") or "ok"
-        state["last_getnote_diary_date"] = latest.get("latest_date") or ""
+        updates = {
+            "last_getnote_diary_sync": latest.get("generated_at") or now_iso,
+            "last_getnote_diary_status": latest.get("status") or "ok",
+            "last_getnote_diary_date": latest.get("latest_date") or "",
+        }
         results = latest.get("results") if isinstance(latest.get("results"), list) else []
         if results:
-            state["last_getnote_diary_note_id"] = results[-1].get("note_id") or ""
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            updates["last_getnote_diary_note_id"] = results[-1].get("note_id") or ""
+        update_state_atomic(STATE_FILE, updates)
     return code
 
 
@@ -1565,6 +1570,7 @@ def command_restore_check(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="immortal", description="Codex entry for the Immortal Skill")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show current memory library state").set_defaults(func=command_status)
@@ -1855,7 +1861,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "feishu-distill":
         return run_script("feishu_distill.py", argv[1:])
     if argv and argv[0] == "feishu-mirror":
-        return run_script("feishu_drive_mirror.py", argv[1:])
+        return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[1:]))
     if argv and argv[0] == "feishu-mirror-status":
         return command_feishu_mirror_status(argparse.Namespace(json="--json" in argv[1:]))
     if argv and argv[0] == "feishu-mirror-worker":
@@ -1887,7 +1893,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "distill":
         return run_script("feishu_distill.py", argv[2:])
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror":
-        return run_script("feishu_drive_mirror.py", argv[2:])
+        return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[2:]))
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror-status":
         return command_feishu_mirror_status(argparse.Namespace(json="--json" in argv[2:]))
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror-worker":

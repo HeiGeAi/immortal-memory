@@ -8,7 +8,7 @@ from __future__ import annotations
   3. 文件历史快照 (~/.claude/file-history/)
   4. 粘贴缓存 (~/.claude/paste-cache/)
   5. Skill 定义与资源 (~/.claude/skills/*/)
-  6. 桌面产出目录 (~/Desktop/claudecode/)
+  6. 桌面产出目录 (~/Desktop/agent-output/)
   7. Codex 对话记录 (~/.codex/sessions/*/rollout-*.jsonl)
   8. Codex 记忆文档 (~/.codex/memories/)
   9. Codex Skill 资源 (~/.codex/skills/*/)
@@ -21,6 +21,7 @@ import re
 import sys
 import uuid
 import hashlib
+import redact_common
 from typing import Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,7 +38,7 @@ CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
 CLAUDE_FILE_HISTORY = CLAUDE_DIR / "file-history"
 CLAUDE_PASTE_CACHE = CLAUDE_DIR / "paste-cache"
 CLAUDE_SKILLS = CLAUDE_DIR / "skills"
-DESKTOP_OUTPUT = Path.home() / "Desktop" / "claudecode"
+DESKTOP_OUTPUT = Path.home() / "Desktop" / "agent-output"
 CODEX_DIR = Path.home() / ".codex"
 CODEX_SESSIONS = CODEX_DIR / "sessions"
 CODEX_ARCHIVED = CODEX_DIR / "archived_sessions"
@@ -45,6 +46,9 @@ CODEX_MEMORIES = CODEX_DIR / "memories"
 CODEX_SKILLS = CODEX_DIR / "skills"
 CODEX_STATE_DB = CODEX_DIR / "state_5.sqlite"
 CODEX_DOCS_OUTPUT = Path.home() / "Documents" / "Codex"
+WORKBENCH_DIR = Path.home() / "Desktop" / "agent-output" / "输出" / "agent-workbench"
+WORKBENCH_EVENTS_DIR = WORKBENCH_DIR / "data" / "events"
+WORKBENCH_SOURCE = "workbench-event"
 _DEDUP_CACHE: dict[str, set] | None = None
 
 
@@ -59,26 +63,31 @@ def decode_project_path(dir_name: str) -> str:
 
 
 def get_date_from_timestamp(ts: str) -> str:
+    # 归档日按本地时区（2026-07-18 拍板统一口径；记录 timestamp 本身保留原时区不动）。
+    # naive 字符串（如 Hermes SQL 的 '+8 hours' 产物）被 astimezone 视为本地，恒等不偏移。
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
+        return dt.astimezone().strftime("%Y-%m-%d")
     except (ValueError, AttributeError):
-        return datetime.now().strftime("%Y-%m-%d")
+        return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
 def get_date_from_mtime(path: Path) -> str:
     try:
         dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d")
+        return dt.astimezone().strftime("%Y-%m-%d")
     except OSError:
-        return datetime.now().strftime("%Y-%m-%d")
+        return datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
 def file_hash(path: Path) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
     return h.hexdigest()[:16]
 
 
@@ -108,6 +117,12 @@ def load_existing_dedup_set(source_type: str) -> set:
                         dedup_key = record.get("_dedup_key", "") or legacy_dedup_key(record)
                         if dedup_key:
                             _DEDUP_CACHE.setdefault(source, set()).add(dedup_key)
+                        # file 类源兜底键：让缺 _dedup_key 的老记录也参与去重（与 file_seen 同口径）
+                        fn = record.get("file_name")
+                        fs = record.get("file_size")
+                        if fn and fs is not None:
+                            fb = file_fallback_key(source, fn, fs, record.get("timestamp", ""))
+                            _DEDUP_CACHE.setdefault(source, set()).add(fb)
                     except (json.JSONDecodeError, KeyError):
                         continue
     return _DEDUP_CACHE.setdefault(source_type, set())
@@ -134,19 +149,74 @@ def legacy_dedup_key(record: dict) -> str:
     return ""
 
 
+def file_fallback_key(source: str, file_name, file_size, timestamp: str) -> str:
+    """file 类源的兜底去重键：source|basename|size|mtime（不含内容哈希）。
+    load 端与采集端用同一口径，让缺 _dedup_key 的老记录也能去重。"""
+    return f"fb|{source}|{os.path.basename(str(file_name))}|{file_size}|{timestamp}"
+
+
+def file_seen(existing: set, dedup_key: str, source: str, path) -> bool:
+    """file 类源去重：主键 file_hash 之外再认一个兜底键(source|basename|size|mtime)。
+
+    根因：老记录写入时未保留 _dedup_key，file 类源无法用 file_hash 重建主键，
+    导致每轮采集把没变的老文件当新记录重复 append（实测 claude-code-skill 膨胀 79%、
+    codex-output 43%）。兜底键对未改动文件重采时稳定，挡住完全重复；文件一变 mtime/size
+    必变→兜底键变→仍按新记录采集（不丢新内容，守 append-only）。
+    命中任一键=重复(返回 True 跳过)；否则登记两键返回 False。
+    """
+    if not dedup_key or dedup_key.endswith("|"):
+        return True
+    fb = ""
+    try:
+        st = path.stat()
+        ts = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+        fb = file_fallback_key(source, path.name, st.st_size, ts)
+    except OSError:
+        fb = ""
+    if dedup_key in existing or (fb and fb in existing):
+        return True
+    existing.add(dedup_key)
+    if fb:
+        existing.add(fb)
+    return False
+
+
+def redact_record_content(record: dict) -> dict:
+    """对记录中的文本内容字段脱敏。"""
+    if not isinstance(record, dict):
+        return record
+    rec = dict(record)
+    for key in ("content", "text", "snippet", "title", "summary"):
+        value = rec.get(key)
+        if isinstance(value, str):
+            rec[key] = redact_common.redact(value)
+    return rec
+
+
 def write_records(records_by_date: dict):
     """将记录写入日文件和全量索引。"""
     for date_str, records in sorted(records_by_date.items()):
         daily_file = DAILY_DIR / f"{date_str}.jsonl"
+        # 契约（与 web_capture.append_records 对齐）：daily 全净化；index 额外保留 _dedup_key 原值。
+        # load_existing_dedup_set 从 index 读 _dedup_key 做增量去重，codex/hermes 的 legacy 重建键
+        # 与截断+脱敏后的 content 必然失配，删掉它会让这些源每轮全量重采（79% 膨胀事故同族）。
+        # _dedup_key 不参与脱敏：脱敏会改变键值，与采集端生成的原始键失配，等价于删除。
+        clean_pairs = []
+        for record in records:
+            dedup_key = record.get("_dedup_key")
+            clean = redact_common.redact_tree({k: v for k, v in record.items() if not k.startswith("_")})
+            clean_pairs.append((clean, dedup_key))
+
         with open(daily_file, "a", encoding="utf-8") as f:
-            for record in records:
-                # 写入前去掉内部去重字段
-                clean = {k: v for k, v in record.items() if not k.startswith("_")}
+            for clean, _ in clean_pairs:
                 f.write(json.dumps(clean, ensure_ascii=False) + "\n")
 
         with open(INDEX_FILE, "a", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            for clean, dedup_key in clean_pairs:
+                indexed = dict(clean)
+                if dedup_key is not None:
+                    indexed["_dedup_key"] = dedup_key
+                f.write(json.dumps(indexed, ensure_ascii=False) + "\n")
 
 
 def copy_to_immortal(src: Path, category: str, date_str: str) -> Optional[str]:
@@ -321,7 +391,7 @@ def collect_memory_docs(since: Optional[str] = None) -> dict:
                     continue
 
             dedup_key = f"mem|{doc_file.relative_to(memory_dir)}|{file_hash(doc_file)}"
-            if dedup_key in existing:
+            if file_seen(existing, dedup_key, "claude-code-memory", doc_file):
                 continue
             existing.add(dedup_key)
 
@@ -389,7 +459,7 @@ def collect_file_history(since: Optional[str] = None) -> dict:
                     continue
 
             dedup_key = f"fh|{session_dir.name}|{version_file.name}|{file_hash(version_file)}"
-            if dedup_key in existing:
+            if file_seen(existing, dedup_key, "claude-code-file-history", version_file):
                 continue
             existing.add(dedup_key)
 
@@ -460,7 +530,7 @@ def collect_paste_cache(since: Optional[str] = None) -> dict:
                 continue
 
         dedup_key = f"paste|{cache_file.name}|{file_hash(cache_file)}"
-        if dedup_key in existing:
+        if file_seen(existing, dedup_key, "claude-code-paste-cache", cache_file):
             continue
         existing.add(dedup_key)
 
@@ -531,7 +601,7 @@ def collect_skills(since: Optional[str] = None) -> dict:
                     continue
 
             dedup_key = f"skill|{skill_name}|{doc_file.relative_to(skill_dir)}|{file_hash(doc_file)}"
-            if dedup_key in existing:
+            if file_seen(existing, dedup_key, "claude-code-skill", doc_file):
                 continue
             existing.add(dedup_key)
 
@@ -575,7 +645,7 @@ def collect_skills(since: Optional[str] = None) -> dict:
 
 
 # ============================================================
-# 采集器 6: 桌面产出目录 (~/Desktop/claudecode/)
+# 采集器 6: 桌面产出目录 (~/Desktop/agent-output/)
 # ============================================================
 
 def collect_desktop_output(since: Optional[str] = None) -> dict:
@@ -617,7 +687,7 @@ def collect_desktop_output(since: Optional[str] = None) -> dict:
                 continue
 
         dedup_key = f"desk|{doc_file.relative_to(DESKTOP_OUTPUT)}|{file_hash(doc_file)}"
-        if dedup_key in existing:
+        if file_seen(existing, dedup_key, "desktop-output", doc_file):
             continue
         existing.add(dedup_key)
 
@@ -851,7 +921,7 @@ def collect_codex_memories(since: Optional[str] = None) -> dict:
                 continue
 
         dedup_key = f"codex-mem|{doc_file.relative_to(CODEX_MEMORIES)}|{file_hash(doc_file)}"
-        if dedup_key in existing:
+        if file_seen(existing, dedup_key, "codex-memory", doc_file):
             continue
         existing.add(dedup_key)
 
@@ -919,7 +989,7 @@ def collect_codex_skills(since: Optional[str] = None) -> dict:
                 continue
 
             dedup_key = f"codex-skill|{skill_name}|{doc_file.relative_to(skill_dir)}|{file_hash(doc_file)}"
-            if dedup_key in existing:
+            if file_seen(existing, dedup_key, "codex-skill", doc_file):
                 continue
             existing.add(dedup_key)
 
@@ -980,7 +1050,7 @@ def collect_codex_output(since: Optional[str] = None) -> dict:
     }
     # 构建产物/无记忆价值文件，连索引都不要
     SKIP_EXTENSIONS = {
-        ".svg", ".wasm", ".map", ".lock", ".project_a",
+        ".svg", ".wasm", ".map", ".lock", ".tiangong",
         ".woff", ".woff2", ".ttf", ".otf", ".eot",
         ".min.js", ".min.css",
     }
@@ -1012,7 +1082,7 @@ def collect_codex_output(since: Optional[str] = None) -> dict:
                 continue
 
         dedup_key = f"codex-out|{doc_file.relative_to(CODEX_DOCS_OUTPUT)}|{file_hash(doc_file)}"
-        if dedup_key in existing:
+        if file_seen(existing, dedup_key, "codex-output", doc_file):
             continue
         existing.add(dedup_key)
 
@@ -1136,7 +1206,7 @@ def collect_autoclaw_skills(since: Optional[str] = None) -> dict:
 
                 skill_name = parent.name if parent.name != "skills" else doc_file.parent.name
                 dedup_key = f"ac-skill|{skill_name}|{doc_file.relative_to(skill_dir)}|{file_hash(doc_file)}"
-                if dedup_key in existing:
+                if file_seen(existing, dedup_key, "autoclaw-skill", doc_file):
                     continue
                 existing.add(dedup_key)
 
@@ -1323,7 +1393,7 @@ def collect_hermes_memories(since: Optional[str] = None) -> dict:
                 continue
 
         dedup_key = f"h-mem|{doc_file.name}|{file_hash(doc_file)}"
-        if dedup_key in existing:
+        if file_seen(existing, dedup_key, "hermes-memory", doc_file):
             continue
         existing.add(dedup_key)
 
@@ -1389,7 +1459,7 @@ def collect_hermes_skills(since: Optional[str] = None) -> dict:
                     continue
 
             dedup_key = f"h-skill|{skill_name}|{doc_file.relative_to(skill_dir)}|{file_hash(doc_file)}"
-            if dedup_key in existing:
+            if file_seen(existing, dedup_key, "hermes-skill", doc_file):
                 continue
             existing.add(dedup_key)
 
@@ -1426,6 +1496,200 @@ def collect_hermes_skills(since: Optional[str] = None) -> dict:
     return stats
 
 
+# ============================================================
+# 采集器 15: 用户本人工作台事件 (agent-workbench data/events/*.jsonl)
+# ============================================================
+
+def workbench_source_enabled() -> bool:
+    """workbench-event 采集器默认关闭:仅当 sources.json 里该源显式 enabled=true 才执行。
+
+    条目缺失、配置文件缺失或损坏时一律视为关闭,保证每日自动化默认跑不到这条链路。
+    """
+    try:
+        config = load_sources_config()
+    except (OSError, json.JSONDecodeError):
+        return False
+    for src in config.get("sources", []):
+        if src.get("name") == WORKBENCH_SOURCE:
+            return bool(src.get("enabled", False))
+    return False
+
+
+def workbench_event_to_records(event: dict) -> list:
+    """把单条工作台回流事件映射为 index 记录列表,纯函数不落盘。
+
+    映射规则:
+      - sensitivity=sensitive 的事件直接跳过(客户数据不出本机)
+      - dispatch_result 写两条:role=user 存 payload.title+prompt_user_only;
+        role=assistant 从 payload.result_file 指向的 md 读全文,读不到就用 result_excerpt
+      - correction 写一条,完整保留 rejected/chosen/reason 三字段
+      - 其他 type 暂不入库,返回空列表
+      - _dedup_key 统一为 "wb|"+event_id,事件级幂等
+    """
+    if event.get("sensitivity") == "sensitive":
+        return []
+    event_id = str(event.get("event_id") or "").strip()
+    if not event_id:
+        return []
+    event_type = event.get("type") or ""
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    timestamp = str(event.get("ts") or event.get("timestamp") or "")
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).isoformat()
+    dedup_key = f"wb|{event_id}"
+    base = {
+        "source": WORKBENCH_SOURCE,
+        "project": "agent-workbench",
+        "session_id": str(event.get("task_id") or payload.get("task_id") or ""),
+        "timestamp": timestamp,
+        "_dedup_key": dedup_key,
+    }
+
+    if event_type == "dispatch_result":
+        title = str(payload.get("title") or "")
+        # 工作台生产侧 prompt_user_only 是对象 {title, detail, collection},按字段拼正文,
+        # 直接 str() 会把 dict repr 垃圾永久写进 append-only 索引;兼容字符串形态
+        puo = payload.get("prompt_user_only")
+        if isinstance(puo, dict):
+            parts = []
+            detail = str(puo.get("detail") or "").strip()
+            collection = str(puo.get("collection") or "").strip()
+            if detail:
+                parts.append(detail)
+            if collection:
+                parts.append(f"所属项目:{collection}")
+            prompt_user_only = "\n".join(parts)
+        else:
+            prompt_user_only = str(puo or "")
+        user_content = f"{title}\n\n{prompt_user_only}".strip()
+
+        assistant_content = ""
+        result_file = str(payload.get("result_file") or "")
+        if result_file:
+            result_path = Path(result_file).expanduser()
+            if not result_path.is_absolute():
+                result_path = WORKBENCH_DIR / result_path
+            try:
+                if result_path.is_file() and result_path.stat().st_size < 500000:
+                    assistant_content = result_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:30000]
+            except OSError:
+                assistant_content = ""
+        if not assistant_content:
+            assistant_content = str(payload.get("result_excerpt") or "")
+
+        return [
+            {
+                **base,
+                "id": str(uuid.uuid4()),
+                "type": "dispatch_result",
+                "role": "user",
+                "content": user_content,
+            },
+            {
+                **base,
+                "id": str(uuid.uuid4()),
+                "type": "dispatch_result",
+                "role": "assistant",
+                "content": assistant_content,
+                "file_name": result_file,
+            },
+        ]
+
+    if event_type == "correction":
+        rejected = str(payload.get("rejected") or event.get("rejected") or "")
+        chosen = str(payload.get("chosen") or event.get("chosen") or "")
+        reason = str(payload.get("reason") or event.get("reason") or "")
+        content = (
+            f"[纠正] {base['session_id']}\n"
+            f"rejected: {rejected}\n"
+            f"chosen: {chosen}\n"
+            f"reason: {reason}"
+        )
+        return [
+            {
+                **base,
+                "id": str(uuid.uuid4()),
+                "type": "correction",
+                "role": "user",
+                "content": content,
+                "rejected": rejected,
+                "chosen": chosen,
+                "reason": reason,
+            }
+        ]
+
+    return []
+
+
+def collect_workbench(since: Optional[str] = None) -> dict:
+    """采集用户本人工作台回流事件(data/events/*.jsonl,单向拉,永不回写工作台)。"""
+    stats = {
+        "files_scanned": 0,
+        "records_collected": 0,
+        "bad_lines": 0,
+        "sensitive_skipped": 0,
+    }
+    if not WORKBENCH_EVENTS_DIR.exists():
+        return stats
+
+    existing = load_existing_dedup_set(WORKBENCH_SOURCE)
+    daily_buffers = {}
+
+    for events_file in sorted(WORKBENCH_EVENTS_DIR.glob("*.jsonl")):
+        if not events_file.is_file():
+            continue
+        stats["files_scanned"] += 1
+
+        if since:
+            mtime = datetime.fromtimestamp(events_file.stat().st_mtime, tz=timezone.utc)
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            if mtime < since_dt:
+                continue
+
+        try:
+            lines = events_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                stats["bad_lines"] += 1
+                continue
+            if not isinstance(event, dict):
+                stats["bad_lines"] += 1
+                continue
+            if event.get("sensitivity") == "sensitive":
+                stats["sensitive_skipped"] += 1
+                continue
+
+            records = workbench_event_to_records(event)
+            if not records:
+                continue
+            dedup_key = records[0]["_dedup_key"]
+            if dedup_key in existing:
+                continue
+            existing.add(dedup_key)
+
+            for record in records:
+                date_str = get_date_from_timestamp(record["timestamp"])
+                if date_str not in daily_buffers:
+                    daily_buffers[date_str] = []
+                daily_buffers[date_str].append(record)
+                stats["records_collected"] += 1
+
+    write_records(daily_buffers)
+    return stats
+
+
 def main():
     since = None
     if len(sys.argv) > 1 and sys.argv[1] == "--since":
@@ -1438,7 +1702,8 @@ def main():
 
     all_stats = {}
     step = 0
-    total_steps = 14
+    workbench_enabled = workbench_source_enabled()
+    total_steps = 15 if workbench_enabled else 14
 
     def run_step(name, func):
         nonlocal step
@@ -1462,6 +1727,10 @@ def main():
     run_step("Hermes对话", collect_hermes_conversations)
     run_step("Hermes记忆", collect_hermes_memories)
     run_step("Hermes Skill", collect_hermes_skills)
+    if workbench_enabled:
+        run_step("工作台事件", collect_workbench)
+    else:
+        print("[跳过] 工作台事件(sources.json 中 workbench-event 未启用)")
 
     # 更新 sources.json
     config = load_sources_config()
@@ -1482,6 +1751,9 @@ def main():
         "hermes-memory": "Hermes记忆",
         "hermes-skill": "Hermes Skill",
     }
+    # workbench-event 只在真正跑过时更新 last_backup,避免自动注册把它写成 enabled=true
+    if workbench_enabled:
+        source_map[WORKBENCH_SOURCE] = "工作台事件"
 
     existing_sources = {s["name"]: s for s in config["sources"]}
     for src_name, display_name in source_map.items():

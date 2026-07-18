@@ -13,6 +13,7 @@ import shutil
 import sys
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from state_store import update_state_atomic
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -22,10 +23,11 @@ LOG_FILE = IMMORTAL_DIR / "backup.log"
 EXPORTS_DIR = IMMORTAL_DIR / "exports"
 SESSIONS_DIR = IMMORTAL_DIR / "sessions"
 STATE_FILE = IMMORTAL_DIR / "orchestrator_state.json"
+FREEZE_MARKER = IMMORTAL_DIR / "MAINTENANCE_FREEZE_DESTRUCTIVE"
 
 
 SKIP_EXTENSIONS = {
-    ".svg", ".wasm", ".map", ".lock", ".project_a",
+    ".svg", ".wasm", ".map", ".lock", ".tiangong",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
 }
 
@@ -206,14 +208,16 @@ def format_bytes(b: int) -> str:
 
 def record_cleanup_run(total_saved: int) -> None:
     """Update orchestrator state so status reflects manual cleanup runs."""
-    try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8")) if STATE_FILE.exists() else {}
-    except Exception:
-        state = {}
-    state["last_cleanup"] = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    state["last_cleanup_saved_bytes"] = total_saved
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    update_state_atomic(
+        STATE_FILE,
+        {
+            "last_cleanup": datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "last_cleanup_saved_bytes": total_saved,
+        },
+    )
 
 
 def main():
@@ -247,13 +251,16 @@ def main():
     print(f"  节省空间: {format_bytes(r2['saved_bytes'])}")
     print()
 
-    # 3. 裁剪日志
+    # 3. 裁剪日志（dry-run 必须零写入，日志裁剪也不例外）
     print("[3/5] 裁剪日志...")
-    r3 = trim_log()
-    if r3["trimmed"]:
-        print(f"  保留最近 {r3['kept_lines']} 行")
+    if dry_run:
+        print("  (dry-run) 跳过日志裁剪")
     else:
-        print(f"  日志已经够短（{r3['kept_lines']} 行），无需裁剪")
+        r3 = trim_log()
+        if r3["trimmed"]:
+            print(f"  保留最近 {r3['kept_lines']} 行")
+        else:
+            print(f"  日志已经够短（{r3['kept_lines']} 行），无需裁剪")
     print()
 
     r4 = {"deleted": 0, "freed_bytes": 0}
@@ -263,18 +270,18 @@ def main():
     print(f"  释放空间: {format_bytes(r_sessions.get('freed_bytes', 0))}")
     print()
 
-    print("[5/5] 便携备份清理...")
-    if prune_old_exports:
-        if not dry_run and not yes:
-            print("  已跳过：删除备份需要同时传 --yes")
-        else:
-            r4 = prune_exports(keep_exports, dry_run=dry_run, yes=yes)
-            action = "可释放" if dry_run else "释放"
-            print(f"  保留最近: {r4.get('kept', 0)} 个")
-            print(f"  删除备份: {r4.get('deleted', 0)} 个")
-            print(f"  {action}空间: {format_bytes(r4.get('freed_bytes', 0))}")
+    print(f"[5/5] 便携备份清理（默认保留最近 {keep_exports} 份）...")
+    if FREEZE_MARKER.exists():
+        print("  维护冻结中，跳过备份清理")
+    elif dry_run:
+        r4 = prune_exports(keep_exports, dry_run=True)
+        print(f"  保留最近: {r4.get('kept', 0)} 个")
+        print(f"  可删除备份: {r4.get('deleted', 0)} 个，可释放 {format_bytes(r4.get('freed_bytes', 0))}")
     else:
-        print("  默认不删除备份。需要清理时运行：cleanup.py --prune-exports --dry-run")
+        # 默认自动回收：保留最近 keep_exports 份，删除更老的（prune_exports 内部 max(1,keep) 保底）
+        r4 = prune_exports(keep_exports, dry_run=False, yes=True)
+        print(f"  保留最近: {r4.get('kept', 0)} 个")
+        print(f"  删除备份: {r4.get('deleted', 0)} 个，释放 {format_bytes(r4.get('freed_bytes', 0))}")
     print()
 
     total_saved = r1['freed_bytes'] + r2['saved_bytes'] + r_sessions.get('freed_bytes', 0) + r4.get('freed_bytes', 0)

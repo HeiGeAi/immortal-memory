@@ -15,14 +15,19 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from config import feishu_daily_sources, feishu_guard_args
+from process_utils import run_process
+from state_store import read_state as read_shared_state, update_state_atomic
 
 IMMORTAL_DIR = Path.home() / ".immortal"
 LOG_FILE = IMMORTAL_DIR / "backup.log"
 STATE_FILE = IMMORTAL_DIR / "orchestrator_state.json"
 LOCK_FILE = IMMORTAL_DIR / "orchestrator.lock"
+# 维护冻结 marker：存在时跳过一切不可逆清理（修复窗口的保险丝，采集/摘要/画像不受影响）
+FREEZE_MARKER = IMMORTAL_DIR / "MAINTENANCE_FREEZE_DESTRUCTIVE"
 SKILL_DIR = Path(__file__).resolve().parent
 GETNOTE_CONFIG = Path.home() / ".getnote" / "config.json"
 GETNOTE_LATEST_JSON = IMMORTAL_DIR / "getnote" / "latest.json"
@@ -30,12 +35,14 @@ STABLE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 DISTILL_INTERVAL_DAYS = 1  # 每天蒸馏一次（数据变化大的话有意义）
 CLEANUP_INTERVAL_DAYS = 7  # 每周清理一次磁盘
-PORTABLE_EXPORT_INTERVAL_DAYS = 7  # 每周生成一次可恢复便携包
+PORTABLE_EXPORT_INTERVAL_DAYS = 3  # 每 3 天生成一次可恢复便携包
 AUTO_DIGITAL_SOUL_DISTILL = True  # 每日自动蒸馏 digital-soul.md（索引已瘦身，蒸馏快且开销可控）
 FEISHU_INTERVAL_HOURS = 20  # 飞书源较重，每天最多跑一轮增量即可
 FEISHU_MIRROR_INVENTORY_INTERVAL_HOURS = 24  # 云文档/Wiki 清单每天刷新一轮
 FEISHU_MIRROR_DOWNLOAD_INTERVAL_HOURS = 12  # 文档导出限量跑，避免长时间占用 API
 PROFILE_ATTRIBUTION_AUDIT_INTERVAL_HOURS = 20  # 每天自动剥离污染画像
+WEB_CAPTURE_INTERVAL_HOURS = 4  # 浏览历史元信息轻量扫描，正文只走白名单或手动保存
+OBSIDIAN_SYNC_INTERVAL_HOURS = 4  # Obsidian 阅读层定期刷新入口、索引和断链状态
 GETNOTE_BACKFILL_INTERVAL_HOURS = 20  # 历史日记按 Get 笔记额度分批补齐
 GETNOTE_BACKFILL_MISSING_LIMIT = 5
 GETNOTE_PRUNE_EMPTY_INTERVAL_HOURS = 20  # 自动清理误同步的空日记
@@ -92,25 +99,40 @@ def child_env() -> dict:
     return env
 
 
-def run_script(name: str, *args, timeout: int = 600) -> tuple:
-    """运行脚本，返回 (成功与否, 输出)。"""
+def run_script(name: str, *args, timeout: int = 600, want_stdout: bool = False) -> tuple:
+    """运行脚本，返回 (成功与否, 输出)。
+
+    want_stdout=True 时只返回 stdout（给 --json 脚本用）：默认把 stdout+stderr 合并会让
+    任何 stderr 警告污染 JSON 解析，造成 Obsidian 这类阶段"假失败"。日志类调用保持默认合并。
+    """
     cmd = ["python3", str(SKILL_DIR / name)] + list(args)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env())
-        return (result.returncode == 0, result.stdout + result.stderr)
+        result = run_process(cmd, capture_output=True, text=True, timeout=timeout, env=child_env())
+        out = result.stdout if want_stdout else (result.stdout + result.stderr)
+        return (result.returncode == 0, out)
     except subprocess.TimeoutExpired:
         return (False, f"Timeout after {timeout}s")
     except Exception as e:
         return (False, str(e))
 
 
+def run_script_rc(name: str, *args, timeout: int = 600) -> tuple:
+    """同 run_script，但返回 (真实退出码, 输出)，供需要区分 partial(2) 的调用方使用。"""
+    cmd = ["python3", str(SKILL_DIR / name)] + list(args)
+    try:
+        result = run_process(cmd, capture_output=True, text=True, timeout=timeout, env=child_env())
+        return (result.returncode, result.stdout + result.stderr)
+    except subprocess.TimeoutExpired:
+        return (1, f"Timeout after {timeout}s")
+    except Exception as e:
+        return (1, str(e))
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            pass
+        state = read_shared_state(STATE_FILE, {})
+        if isinstance(state, dict):
+            return state
     return {
         "last_collect": None,
         "last_summary": None,
@@ -135,6 +157,8 @@ def load_state() -> dict:
         "last_getnote_diary_sync": None,
         "last_getnote_backfill": None,
         "last_getnote_prune_empty": None,
+        "last_web_collect": None,
+        "last_obsidian_sync": None,
         "last_cleanup": None,
         "collect_count": 0,
         "total_records": 0,
@@ -143,8 +167,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    update_state_atomic(STATE_FILE, state)
 
 
 def parse_collect_output(output: str) -> dict:
@@ -206,6 +229,24 @@ def collect():
         return False, {"total_new": 0, "by_source": {}}
 
 
+def web_collect():
+    log("=== 阶段 1W: 网页访问元信息扫描 ===")
+    ok, out = run_script("web_capture.py", "collect", "--json", timeout=300)
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        data = {"status": "error", "totals": {}, "raw": out.strip()[:500]}
+    totals = data.get("totals") if isinstance(data, dict) else {}
+    records = int((totals or {}).get("records_written") or 0)
+    filtered = int((totals or {}).get("visits_filtered") or 0)
+    errors = int((totals or {}).get("errors") or 0)
+    if ok and data.get("status") in {"ok", "disabled"}:
+        log(f"网页收录完成: 新增 {records} 条，过滤 {filtered} 条")
+        return True, data
+    log(f"网页收录需关注: status={data.get('status')} records={records} filtered={filtered} errors={errors}")
+    return False, data
+
+
 def parse_feishu_collect_output(output: str) -> int:
     total = 0
     in_section = False
@@ -224,20 +265,24 @@ def parse_feishu_collect_output(output: str) -> int:
 
 
 def collect_feishu():
+    """返回 (状态, info)。状态三态：'ok' / 'partial'（部分源失败）/ 'failed'。"""
     log("=== 阶段 F1: 飞书增量采集 ===")
     args = feishu_daily_args()
     if not args:
-        log("飞书采集跳过: 未配置 expected_user_name/open_id；先运行 immortal-memory init 绑定账号")
-        return True, {"total_new": 0}
-    ok, out = run_script("feishu_collect.py", *args, timeout=1800)
-    if ok:
+        log("飞书采集跳过: 未配置 expected_user_name/open_id；先运行 immortal.py init 绑定账号")
+        return "ok", {"total_new": 0}
+    rc, out = run_script_rc("feishu_collect.py", *args, timeout=1800)
+    # rc==2 有两种来源：我们的 partial 语义，以及 argparse 用法错误（也固定退 2）。
+    # 只有输出里带完成标记才认 partial，否则按硬失败处理，防止参数漂移被掩盖成部分成功。
+    if rc == 0 or (rc == 2 and "Feishu collect finished" in out):
         new_records = parse_feishu_collect_output(out)
-        log(f"飞书采集完成: 新增 {new_records} 条")
+        status = "partial" if rc == 2 else "ok"
+        log(f"飞书采集{'部分成功' if status == 'partial' else '完成'}: 新增 {new_records} 条")
         if "Issues:" in out:
-            log(f"飞书采集有非致命问题: {out.split('Issues:', 1)[1].strip()[:300]}")
-        return True, {"total_new": new_records}
+            log(f"飞书采集源级错误: {out.split('Issues:', 1)[1].strip()[:300]}")
+        return status, {"total_new": new_records}
     log(f"飞书采集失败: {out.strip()[:500]}")
-    return False, {"total_new": 0}
+    return "failed", {"total_new": 0}
 
 
 def feishu_clean():
@@ -344,7 +389,8 @@ def feishu_mirror_download():
 
 def summarize():
     log("=== 阶段 2: 生成摘要 ===")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # daily 文件名已统一为本地日；03:03 班次若用 UTC today 会指向前一天、漏掉本地今天的文件
+    today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
     ok, out = run_script("summary.py", "--since", today)
     if ok:
         log(f"摘要生成成功")
@@ -354,26 +400,9 @@ def summarize():
         return False
 
 
-def update_timeline():
-    log("=== 阶段 3: 更新时间线 ===")
-    ok, out = run_script("timeline.py")
-    if ok:
-        log("时间线已更新")
-        return True
-    else:
-        log(f"时间线失败: {out.strip()[:300]}")
-        return False
-
-
-def update_dashboard():
-    log("=== 阶段 4: 更新看板 ===")
-    ok, out = run_script("dashboard.py")
-    if ok:
-        log("看板已更新")
-        return True
-    else:
-        log(f"看板更新失败: {out.strip()[:300]}")
-        return False
+# update_timeline() / update_dashboard() 已删除（2026-06-17）：
+# timeline/dashboard 早于 2026-06-14 停用，这两个包装函数在 run_main 里零调用，
+# 是误导性死代码。timeline.py/dashboard.py 本体保留（train/CLI/profile_review 仍承重）。
 
 
 def distill():
@@ -451,6 +480,17 @@ def quality_report():
     return False
 
 
+def cards_build():
+    log("=== 阶段 5H: 构建判断力卡片盒（纠正即记忆）===")
+    ok, out = run_script("cards.py", "build", timeout=180)
+    if ok:
+        line = out.strip().splitlines()[-1] if out.strip() else "done"
+        log(f"判断力卡片盒已更新: {line[:240]}")
+        return True
+    log(f"cards build failed: {out.strip()[:300]}")
+    return False
+
+
 def daily_digest():
     log("=== 阶段 5F: 生成每日变化摘要 ===")
     ok, out = run_script("daily_digest.py", timeout=120)
@@ -475,7 +515,8 @@ def product_brief():
 
 def portable_export():
     log("=== 阶段 5G: 生成便携恢复备份 ===")
-    ok, out = run_script("export_restore.py", "create-export", timeout=2400)
+    # want_stdout=True：stderr 的任何警告混进输出都会毁掉 JSON 解析（Obsidian 九天假失败同族坑）
+    ok, out = run_script("export_restore.py", "create-export", timeout=2400, want_stdout=True)
     if ok:
         try:
             data = json.loads(out)
@@ -499,7 +540,7 @@ def restore_check_export(export_dir: str):
     if not export_dir:
         log("备份校验跳过: export_dir 缺失")
         return False, {}
-    ok, out = run_script("export_restore.py", "restore-check", export_dir, timeout=3600)
+    ok, out = run_script("export_restore.py", "restore-check", export_dir, timeout=3600, want_stdout=True)
     if ok:
         try:
             data = json.loads(out)
@@ -525,6 +566,23 @@ def agent_entry_refresh():
         return True
     log(f"Agent Entry 刷新失败: {out.strip()[:500]}")
     return False
+
+
+def obsidian_sync():
+    log("=== 阶段 7A: 刷新 Obsidian 阅读层 ===")
+    ok, out = run_script("obsidian_sync.py", "sync", "--json", timeout=180, want_stdout=True)
+    try:
+        # 只截取输出里的 JSON 段，双保险防任何前后噪音污染解析（曾造成 9 天假失败）
+        s = out[out.find("{"): out.rfind("}") + 1] if "{" in out and "}" in out else out
+        data = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        data = {"status": "error", "broken_links_count": 0, "raw": out.strip()[:500]}
+    broken = int(data.get("broken_links_count") or 0)
+    if ok and data.get("status") in {"ok", "disabled"}:
+        log(f"Obsidian 阅读层已同步: 断链 {broken} 条")
+        return True, data
+    log(f"Obsidian 阅读层需关注: status={data.get('status')} broken={broken}")
+    return False, data
 
 
 def getnote_credentials_present() -> bool:
@@ -616,7 +674,11 @@ def getnote_prune_empty():
 
 
 def cleanup():
+    """返回 True=完成 / "frozen"=冻结跳过（不记账不报错）/ False=失败。"""
     log("=== 阶段 6: 磁盘清理 ===")
+    if FREEZE_MARKER.exists():
+        log("检测到维护冻结 marker，跳过不可逆清理（skipped_maintenance_freeze）")
+        return "frozen"
     ok, out = run_script("cleanup.py", timeout=300)
     if ok:
         log("清理完成")
@@ -627,11 +689,26 @@ def cleanup():
 
 
 def update_total_records(state: dict):
-    """更新总记录数。"""
+    """更新总记录数。优先用 SQLite docs 计数，避免每轮全量逐行读 1GB index.jsonl。"""
     index_file = IMMORTAL_DIR / "index.jsonl"
-    if index_file.exists():
-        count = sum(1 for _ in open(index_file, "r"))
-        state["total_records"] = count
+    if not index_file.exists():
+        return
+    # 快路径：search_index.db 的 docs count（已 sync 到位时等于源行数）
+    try:
+        import sqlite3
+        db = IMMORTAL_DIR / "search_index.db"
+        if db.exists():
+            con = sqlite3.connect(str(db))
+            count = con.execute("SELECT count(*) FROM docs").fetchone()[0]
+            con.close()
+            if count and count > 0:
+                state["total_records"] = count
+                return
+    except Exception:
+        pass
+    # 回退：全量逐行计数（保正确性）
+    count = sum(1 for _ in open(index_file, "r"))
+    state["total_records"] = count
 
 
 def acquire_lock() -> bool:
@@ -645,10 +722,28 @@ def acquire_lock() -> bool:
                 os.kill(pid, 0)
                 log(f"已有编排器实例在运行，跳过本轮: pid={pid}")
                 return False
+            age = max(0.0, time.time() - LOCK_FILE.stat().st_mtime)
+            if age < 30:
+                log("lock 尚未写入 pid，按活跃实例处理以避免重入")
+                return False
+            log("发现过期空 lock，自动清理")
+            LOCK_FILE.unlink(missing_ok=True)
+            return acquire_lock()
         except ProcessLookupError:
             log("发现过期 lock，自动清理")
             LOCK_FILE.unlink(missing_ok=True)
             return acquire_lock()
+        except (ValueError, IndexError):
+            try:
+                age = max(0.0, time.time() - LOCK_FILE.stat().st_mtime)
+            except OSError:
+                age = 0.0
+            if age >= 30:
+                log("发现过期异常 lock，自动清理")
+                LOCK_FILE.unlink(missing_ok=True)
+                return acquire_lock()
+            log("lock 内容异常但仍新鲜，跳过本轮以避免重入")
+            return False
         except Exception:
             log("无法确认 lock 状态，跳过本轮以避免重入")
             return False
@@ -682,6 +777,7 @@ def run_main():
     log(f"========= 编排器启动 (UTC {now.strftime('%Y-%m-%d %H:%M')}) =========")
     log(f"上次采集: {state.get('last_collect') or '从未'}")
     log(f"上次飞书采集: {state.get('last_feishu_collect') or '从未'}")
+    log(f"上次网页收录: {state.get('last_web_collect') or '从未'}")
     log(f"上次蒸馏: {state.get('last_distill') or '从未'}")
 
     # 阶段 1: 采集
@@ -691,22 +787,39 @@ def run_main():
     else:
         errors.append("collect failed")
 
+    web_new = 0
+    web_due_hours = hours_since(state.get("last_web_collect"))
+    if web_due_hours >= WEB_CAPTURE_INTERVAL_HOURS:
+        log(f"距上次网页收录 {web_due_hours:.1f} 小时，触发轻量网页历史扫描")
+        web_ok, web_info = web_collect()
+        web_totals = web_info.get("totals") if isinstance(web_info, dict) else {}
+        web_new = int((web_totals or {}).get("records_written") or 0)
+        if web_ok:
+            state["last_web_collect"] = now_iso
+        else:
+            errors.append("web collect failed")
+    else:
+        log(f"距上次网页收录 {web_due_hours:.1f} 小时 < {WEB_CAPTURE_INTERVAL_HOURS} 小时，跳过")
+
     # 阶段 2-3: 摘要 + 时间线（只有采集成功才做）
     if collect_ok:
         if summarize():
             state["last_summary"] = now_iso
         else:
             errors.append("summary failed")
-        if not update_timeline():
-            errors.append("timeline failed")
+        # timeline.html 已停用（2026-06-14 Owner 决策：纯展示物，无人消费）
 
     # 飞书增量采集较重，最多每天跑一轮；成功后刷新 clean/distill review layer。
     feishu_new = 0
     feishu_due_hours = hours_since(state.get("last_feishu_collect"))
     if feishu_due_hours >= FEISHU_INTERVAL_HOURS:
         log(f"距上次飞书采集 {feishu_due_hours:.1f} 小时，触发飞书增量")
-        feishu_ok, feishu_info = collect_feishu()
+        feishu_status, feishu_info = collect_feishu()
+        feishu_ok = feishu_status in ("ok", "partial")
         feishu_new = feishu_info.get("total_new", 0)
+        state["last_feishu_status"] = feishu_status
+        if feishu_status == "partial":
+            errors.append("feishu partial: 部分源采集失败，详见 feishu/state.json last_errors")
         if feishu_ok:
             state["last_feishu_collect"] = now_iso
             if feishu_clean():
@@ -823,8 +936,11 @@ def run_main():
     days_since_cleanup = days_since(state.get("last_cleanup"))
     if days_since_cleanup >= CLEANUP_INTERVAL_DAYS:
         log(f"距上次清理 {days_since_cleanup:.1f} 天，触发清理")
-        if cleanup():
+        cleanup_result = cleanup()
+        if cleanup_result is True:
             state["last_cleanup"] = now_iso
+        elif cleanup_result == "frozen":
+            pass  # 冻结跳过：不记账（解冻后按真实间隔立即补跑），也不算错误
         else:
             errors.append("cleanup failed")
 
@@ -833,23 +949,21 @@ def run_main():
     update_total_records(state)
     state["last_run_new_records"] = collect_info.get("total_new", 0)
     state["last_run_feishu_new_records"] = feishu_new
+    state["last_run_web_new_records"] = web_new
     state["errors"] = errors[-10:]  # 保留最近 10 个错误
 
     save_state(state)
 
-    if people_index_ok and not daily_digest():
-        errors.append("digest failed")
-        state["errors"] = errors[-10:]
-        save_state(state)
+    # 每日 digest（日报）已停用（2026-06-14 Owner 决策：无价值，且曾以遥测噪音污染 agent-context）
+    # product brief（goal.md）已停用（2026-06-14 Owner 决策：meta 自述，无消费者）
 
-    if quality_ok and product_brief():
-        state["last_product_brief"] = now_iso
-        state["errors"] = errors[-10:]
-        save_state(state)
-    elif quality_ok:
-        errors.append("product brief failed")
-        state["errors"] = errors[-10:]
-        save_state(state)
+    # 阶段 5H: 构建判断力卡片盒（纠正即记忆），供 agent-context 消费
+    if cards_build():
+        state["last_cards_build"] = now_iso
+    else:
+        errors.append("cards build failed")
+    state["errors"] = errors[-10:]
+    save_state(state)
 
     days_since_export = days_since(state.get("last_portable_export"))
     if days_since_export >= PORTABLE_EXPORT_INTERVAL_DAYS:
@@ -879,11 +993,7 @@ def run_main():
     else:
         log(f"距上次便携备份 {days_since_export:.1f} 天 < {PORTABLE_EXPORT_INTERVAL_DAYS} 天，跳过")
 
-    # 阶段 4: 看板放在数据、画像、人物索引和 digest 之后，展示最新记忆层。
-    if not update_dashboard():
-        errors.append("dashboard failed")
-        state["errors"] = errors[-10:]
-        save_state(state)
+    # dashboard.html 已停用（2026-06-14 Owner 决策：5MB/天展示物，基本不打开）
 
     if agent_entry_refresh():
         state["last_agent_entry"] = now_iso
@@ -892,54 +1002,32 @@ def run_main():
     state["errors"] = errors[-10:]
     save_state(state)
 
-    getnote_ok, getnote_data = getnote_diary_sync()
-    if getnote_ok:
-        state["last_getnote_diary_sync"] = getnote_data.get("generated_at") or datetime.now(timezone.utc).isoformat()
-        state["last_getnote_diary_status"] = getnote_data.get("status") or "ok"
-        state["last_getnote_diary_date"] = getnote_data.get("latest_date") or ""
-        results = getnote_data.get("results") if isinstance(getnote_data.get("results"), list) else []
-        if results:
-            state["last_getnote_diary_note_id"] = results[-1].get("note_id") or ""
-    else:
-        errors.append("getnote diary sync failed")
-        state["last_getnote_diary_status"] = "error"
-    state["errors"] = errors[-10:]
-    save_state(state)
-
-    getnote_prune_due_hours = hours_since(state.get("last_getnote_prune_empty"))
-    if getnote_prune_due_hours >= GETNOTE_PRUNE_EMPTY_INTERVAL_HOURS:
-        log(f"距上次 Get 笔记空日记清理 {getnote_prune_due_hours:.1f} 小时，触发分批清理")
-        prune_ok, prune_data = getnote_prune_empty()
-        state["last_getnote_prune_empty"] = datetime.now(timezone.utc).isoformat()
-        state["last_getnote_prune_empty_status"] = prune_data.get("status") or ("ok" if prune_ok else "error")
-        if not prune_ok:
-            errors.append("getnote prune empty failed")
+    obsidian_due_hours = hours_since(state.get("last_obsidian_sync"))
+    if obsidian_due_hours >= OBSIDIAN_SYNC_INTERVAL_HOURS:
+        log(f"距上次 Obsidian 同步 {obsidian_due_hours:.1f} 小时，触发阅读层刷新")
+        obsidian_ok, obsidian_data = obsidian_sync()
+        if obsidian_ok:
+            state["last_obsidian_sync"] = datetime.now(timezone.utc).isoformat()
+        state["last_obsidian_sync_status"] = obsidian_data.get("status") or ("ok" if obsidian_ok else "error")
+        state["last_obsidian_broken_links"] = int(obsidian_data.get("broken_links_count") or 0)
+        if not obsidian_ok:
+            errors.append("obsidian sync failed")
         state["errors"] = errors[-10:]
         save_state(state)
     else:
         log(
-            f"距上次 Get 笔记空日记清理 {getnote_prune_due_hours:.1f} 小时 < "
-            f"{GETNOTE_PRUNE_EMPTY_INTERVAL_HOURS} 小时，跳过"
+            f"距上次 Obsidian 同步 {obsidian_due_hours:.1f} 小时 < "
+            f"{OBSIDIAN_SYNC_INTERVAL_HOURS} 小时，跳过"
         )
 
-    getnote_backfill_due_hours = hours_since(state.get("last_getnote_backfill"))
-    if getnote_backfill_due_hours >= GETNOTE_BACKFILL_INTERVAL_HOURS:
-        log(f"距上次 Get 笔记历史补齐 {getnote_backfill_due_hours:.1f} 小时，触发分批补齐")
-        backfill_ok, backfill_data = getnote_backfill_history()
-        state["last_getnote_backfill"] = datetime.now(timezone.utc).isoformat()
-        state["last_getnote_backfill_status"] = backfill_data.get("status") or ("ok" if backfill_ok else "error")
-        if not backfill_ok:
-            errors.append("getnote backfill failed")
-        state["errors"] = errors[-10:]
-        save_state(state)
-    else:
-        log(
-            f"距上次 Get 笔记历史补齐 {getnote_backfill_due_hours:.1f} 小时 < "
-            f"{GETNOTE_BACKFILL_INTERVAL_HOURS} 小时，跳过"
-        )
+    # Get 笔记日记同步/补齐/清理 已全部暂停（2026-06-14 Owner 决策：止血）。
+    # 原因：自动日记内容低质（断句乱码），且曾把 API key 等凭证同步到外部 App。
+    # getnote_sync.py 与历史日记保留；凭证仍在时可手动 `immortal.py getnote-diary`，
+    # 但不再进每日自动流水线。要彻底恢复需重新评估脱敏与质量。
 
     log(f"========= 编排器完成 =========")
     log(f"  本次新增: {collect_info.get('total_new', 0)} 条")
+    log(f"  网页新增: {web_new} 条")
     log(f"  飞书新增: {feishu_new} 条")
     log(f"  总记录数: {state['total_records']:,}")
     log(f"  采集次数: {state['collect_count']}")

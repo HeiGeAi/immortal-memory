@@ -38,6 +38,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "mode": "auto",
         "slug_prefix": "user",
     },
+    "distill": {
+        "persona": "",          # 数字分身称呼，空=用 owner_display_name，绝不写死某人
+        "project_keywords": [],  # 个人项目实体，空=不做项目统计（标品中性默认）
+        "people": [],            # 关注人物名单，空=不做人物统计
+        "topic_keywords": [],    # 话题词，空=用 distill 内置通用 AI/工作词
+    },
     "automation": {
         "daily_launch_agent_label": "",
         "daily_schedule": [
@@ -46,6 +52,47 @@ DEFAULT_CONFIG: dict[str, Any] = {
             {"hour": 20, "minute": 17},
             {"hour": 3, "minute": 3},
         ],
+    },
+    "web_capture": {
+        "enabled": True,
+        "browsers": [
+            {
+                "name": "chrome",
+                "profile": "Default",
+                "history_path": "~/Library/Application Support/Google/Chrome/Default/History",
+            },
+            {
+                "name": "edge",
+                "profile": "Default",
+                "history_path": "~/Library/Application Support/Microsoft Edge/Default/History",
+            },
+        ],
+        "auto_capture_metadata": True,
+        "fulltext_allow_domains": [],
+        "deny_domains": [
+            "accounts.google.com",
+            "login.microsoftonline.com",
+            "login.live.com",
+            "appleid.apple.com",
+            "icloud.com",
+            "gmail.com",
+            "mail.google.com",
+            "outlook.live.com",
+            "outlook.office.com",
+            "paypal.com",
+            "stripe.com",
+            "alipay.com",
+            "weixin.qq.com",
+            "web.wechat.com",
+        ],
+        "max_visits_per_run": 200,
+        "max_pages_per_run": 5,
+        "history_lookback_hours": 24,
+        "strip_url_query": True,
+    },
+    "obsidian": {
+        "enabled": True,
+        "vault_path": "~/Documents/Immortal Obsidian Vault",
     },
     "extra_sources": [],
 }

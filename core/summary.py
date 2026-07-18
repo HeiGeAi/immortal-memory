@@ -4,13 +4,18 @@
 从归档数据中生成每日交互摘要，输出到 ~/.immortal/summaries/
 """
 
+import argparse
+import gzip
 import json
+import re
 import sys
 import os
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import Counter
+import redact_common
+from file_utils import atomic_write_text
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -18,13 +23,27 @@ DAILY_DIR = IMMORTAL_DIR / "daily"
 SUMMARIES_DIR = IMMORTAL_DIR / "summaries"
 
 
+def sanitize_local_path(value: str) -> str:
+    text = str(value or "").replace(str(Path.home()), "~")
+    text = re.sub(r"^/Users/[^/]+", "~", text)
+    text = re.sub(r"^/home/[^/]+", "~", text)
+    return redact_common.redact(text)
+
+
 def load_daily_records(date: str) -> list:
     """加载指定日期的所有记录。"""
     records = []
     daily_file = DAILY_DIR / f"{date}.jsonl"
-    if not daily_file.exists():
+    compressed_file = DAILY_DIR / f"{date}.jsonl.gz"
+    if daily_file.exists():
+        opener = open
+        source_file = daily_file
+    elif compressed_file.exists():
+        opener = gzip.open
+        source_file = compressed_file
+    else:
         return records
-    with open(daily_file, "r", encoding="utf-8") as f:
+    with opener(source_file, "rt", encoding="utf-8") as f:
         for line in f:
             try:
                 records.append(json.loads(line.strip()))
@@ -77,14 +96,22 @@ def generate_summary(date: str, records: list) -> str:
         ("codex-output", "Codex 产出"),
     ]
 
-    for source_key, display_name in source_order:
+    display_names = dict(source_order)
+    ordered_sources = [
+        key for key, _ in source_order if key in by_source
+    ] + sorted(key for key in by_source if key not in display_names)
+
+    for source_key in ordered_sources:
+        display_name = display_names.get(source_key, source_key)
         if source_key not in by_source:
             continue
         source_records = by_source[source_key]
         lines.append(f"## {display_name} ({len(source_records)}条)")
         lines.append("")
 
-        if "conversation" in source_key:
+        if "conversation" in source_key or any(
+            item.get("role") in {"user", "assistant"} for item in source_records
+        ):
             # 对话类：提取用户说了什么
             sessions = {}
             for r in source_records:
@@ -100,8 +127,8 @@ def generate_summary(date: str, records: list) -> str:
                 user_msgs_in_session = [m for m in msgs if m.get("role") == "user"]
                 if user_msgs_in_session:
                     # 取第一条用户消息作为话题摘要
-                    first_user = user_msgs_in_session[0].get("content", "")[:150].replace("\n", " ")
-                    project = msgs[0].get("project", "").replace("~", "~")
+                    first_user = redact_common.redact(user_msgs_in_session[0].get("content", "")[:150].replace("\n", " "))
+                    project = sanitize_local_path(msgs[0].get("project", ""))
                     lines.append(f"  - **会话 {sid}** ({project})")
                     lines.append(f"    {first_user}")
                     if len(user_msgs_in_session) > 1:
@@ -157,8 +184,9 @@ def generate_summary(date: str, records: list) -> str:
 
         else:
             for r in source_records[:5]:
-                fname = r.get("file_name", "")
-                lines.append(f"  - {fname}")
+                value = r.get("file_name") or r.get("title") or r.get("content") or r.get("type") or "record"
+                value = sanitize_local_path(value)
+                lines.append(f"  - {' '.join(value.split())[:200]}")
             if len(source_records) > 5:
                 lines.append(f"  - ... 等 {len(source_records) - 5} 个")
             lines.append("")
@@ -170,11 +198,21 @@ def generate_all_summaries(since: Optional[str] = None):
     """生成所有日期的摘要。"""
     SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
 
-    daily_files = sorted(DAILY_DIR.glob("*.jsonl"))
+    daily_by_date = {}
+    for daily_file in sorted(DAILY_DIR.glob("*.jsonl*")):
+        name = daily_file.name
+        if name.endswith(".jsonl.gz"):
+            date = name[:-9]
+        elif name.endswith(".jsonl"):
+            date = name[:-6]
+        else:
+            continue
+        existing = daily_by_date.get(date)
+        if existing is None or daily_file.suffix == ".jsonl":
+            daily_by_date[date] = daily_file
     generated = 0
 
-    for daily_file in daily_files:
-        date = daily_file.stem
+    for date, daily_file in sorted(daily_by_date.items()):
 
         if since and date < since:
             continue
@@ -190,28 +228,31 @@ def generate_all_summaries(since: Optional[str] = None):
             continue
 
         summary = generate_summary(date, records)
-        summary_file.write_text(summary, encoding="utf-8")
+        atomic_write_text(summary_file, summary)
         generated += 1
         print(f"  {date}: {len(records)}条记录 -> 摘要已生成")
 
     return generated
 
 
-def main():
-    since = None
-    if len(sys.argv) > 1 and sys.argv[1] == "--since":
-        since = sys.argv[2] if len(sys.argv) > 2 else None
-    elif len(sys.argv) > 1 and sys.argv[1] == "--date":
-        date = sys.argv[2] if len(sys.argv) > 2 else None
-        if date:
-            records = load_daily_records(date)
-            summary = generate_summary(date, records)
-            print(summary)
-            return
-
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Generate Immortal daily summaries")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--since", help="Regenerate summaries from this date")
+    group.add_argument("--date", help="Print one date without writing files")
+    group.add_argument("--backfill-all", action="store_true", help="Regenerate every stale summary")
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    if not (args.since or args.date or args.backfill_all):
+        parser.print_help()
+        return 0
+    if args.date:
+        records = load_daily_records(args.date)
+        print(generate_summary(args.date, records))
+        return 0
     print("生成每日摘要...")
-    generated = generate_all_summaries(since)
+    generated = generate_all_summaries(args.since)
     print(f"\n共生成 {generated} 个摘要文件")
+    return 0
 
 
 if __name__ == "__main__":

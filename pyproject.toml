@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "immortal-memory"
-version = "0.1.0"
+version = "0.8.0"
 description = "Local-first personal memory layer for AI agents"
 requires-python = ">=3.10"
 license = "MIT"
@@ -21,7 +21,7 @@ include-package-data = true
 immortal_memory = "core"
 
 [tool.setuptools.package-data]
-immortal_memory = ["*.json", "*.md", "agents/*.yaml"]
+immortal_memory = ["VERSION", "*.json", "*.md", "agents/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Build a source-backed user profile for the Immortal Skill.
+Build a source-backed Owner profile for the Immortal Skill.
 
 This is the compact personal information layer used before deeper recall.
 It does not replace raw records. It gives Codex a stable map of identity,
@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+from file_utils import atomic_write_text
 
 
 SKILL_DIR = Path(__file__).resolve().parent
@@ -28,12 +29,21 @@ PROFILE_MD = IMMORTAL_DIR / "profile.md"
 PROFILE_COMPACT_MD = IMMORTAL_DIR / "profile_compact.md"
 REVIEWED_PROFILE_JSONL = IMMORTAL_DIR / "reviewed" / "profile_memories.jsonl"
 
+# owner 名字从配置读取（标品化：画像标题不写死某人），失败回退中性默认
+import sys as _sys
+_sys.path.insert(0, str(SKILL_DIR))
+try:
+    import config as _config
+    OWNER = _config.owner_display_name() or "记忆库主人"
+except Exception:
+    OWNER = "记忆库主人"
+
 
 SECTION_SOURCES = [
     {
         "id": "identity",
         "title": "身份与定位",
-        "purpose": "确认 Configured User 是谁，以及所有任务默认应站在哪个视角说话。",
+        "purpose": "确认 Owner 是谁，以及所有任务默认应站在哪个视角说话。",
         "files": ["user_identity.md", "user_account_names.md"],
     },
     {
@@ -58,7 +68,7 @@ SECTION_SOURCES = [
     {
         "id": "communication",
         "title": "协作与沟通偏好",
-        "purpose": "Codex 和 Configured User 对话时必须遵守的工作方式。",
+        "purpose": "Codex 和 Owner 对话时必须遵守的工作方式。",
         "files": [
             "feedback_communication_style.md",
             "feedback_autonomous_agent.md",
@@ -68,11 +78,11 @@ SECTION_SOURCES = [
     {
         "id": "technical_capability",
         "title": "技术能力与项目素材",
-        "purpose": "判断 Configured User 能做什么、做过什么、哪些经历可以脱敏复用。",
+        "purpose": "判断 Owner 能做什么、做过什么、哪些经历可以脱敏复用。",
         "files": [
             "user_technical_skills.md",
             "project_machine0_editor.md",
-            "project_searchsvc_mcp.md",
+            "project_metaso_mcp.md",
             "feedback_frontend_design_skill.md",
             "feedback_avenir_web.md",
         ],
@@ -80,7 +90,7 @@ SECTION_SOURCES = [
     {
         "id": "decision_principles",
         "title": "判断原则与认知框架",
-        "purpose": "让 Agent 按 Configured User 的方式判断，而不是回到通用答案。",
+        "purpose": "让 Agent 按 Owner 的方式判断，而不是回到通用答案。",
         "files": [
             "feedback_context_infrastructure.md",
             "feedback_context_engineering.md",
@@ -106,7 +116,7 @@ SECTION_SOURCES = [
         "id": "current_projects",
         "title": "当前项目与外部事件",
         "purpose": "保留近期需要跟进的项目、域名、成本和供应商变化。",
-        "files": ["project_immortal_origin.md", "project_sitec_domain_sunset.md", "project_anthropic_rate_limit_may_2026.md"],
+        "files": ["project_immortal_origin.md", "project_kunvis_domain_sunset.md", "project_anthropic_rate_limit_may_2026.md"],
         "pinned_items": [
             "永生 Skill 的第一原点是防删库和防数据丢失：沉淀语料、文件、文档、AI 对话和用户输出，先保全再提炼。",
             "防丢失是第一性原理，有用性是第二层目标，数字分身是第三层目标。",
@@ -119,9 +129,9 @@ SECTION_SOURCES = [
 
 RAW_PROFILE_TERMS = [
     "完整画像",
-    "Configured User认知体系",
-    "Configured User（用户本人）完整档案",
-    "Configured User（用户本人）超级完整档案",
+    "Owner认知体系",
+    "Memory Owner完整档案",
+    "Memory Owner超级完整档案",
     "你要记住，我是自媒体作者，也是一家公司的CTO",
 ]
 
@@ -130,12 +140,12 @@ RECENT_PROFILE_TERMS = [
     "赛博永生",
     "记忆库",
     "digital soul",
-    "主账号",
-    "主账号",
-    "主账号实验室",
-    "账号边界A",
-    "项目A",
-    "协作账号",
+    "内容账号B",
+    "内容账号B",
+    "内容账号B实验室",
+    "技术账号A",
+    "业务项目A",
+    "内容账号A",
     "Claude Code",
     "Codex",
     "OpenClaw",
@@ -175,8 +185,8 @@ RECENT_FACT_RULES = [
     },
     {
         "id": "persona_boundary",
-        "text": "账号边界是硬规则：主账号、账号边界A、外部参考账号必须分开。外部参考账号只能借方法，不能替换作者身份；账号边界A人设不能套到主账号。",
-        "terms": ["主账号", "账号边界A", "外部参考账号", "人设", "另一个账号"],
+        "text": "账号边界是硬规则：内容账号B、技术账号A、卡兹克必须分开。卡兹克只能借方法，不能替换作者身份；技术账号A人设不能套到内容账号B。",
+        "terms": ["内容账号B", "技术账号A", "卡兹克", "人设", "另一个账号"],
     },
     {
         "id": "direct_correction",
@@ -204,12 +214,12 @@ COMPACT_NOISE_ITEMS = {
     "短视频口播风格",
     "核心问题",
     "自我修正",
-    "协作账号的产品设计方法论",
+    "内容创作者A的产品设计方法论",
     "AI成本探索原则",
     "语言风格",
     "Agent交互原则",
     "非编程任务的思考框架",
-    "与Configured User现有系统的整合",
+    "与Owner现有系统的整合",
     "核心论点",
     "三要素系统",
     "三层架构",
@@ -243,18 +253,24 @@ COMPACT_NOISE_PREFIXES = (
 
 
 def redact(text: str) -> str:
-    patterns = [
-        (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-        (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(apikey\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"(?i)(密码\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    return text
+    """统一走 redact_common（单一真源，覆盖 ghp_/AKIA/gk_live_/JWT/URL 内嵌凭证）。
+    导入失败时回退内联硬化集，绝不裸奔。"""
+    try:
+        from redact_common import redact as _r
+        return _r(text)
+    except Exception:
+        patterns = [
+            (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+            (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
+            (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+            (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+            (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+        ]
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text)
+        return text
 
 
 def strip_frontmatter(text: str) -> str:
@@ -575,14 +591,17 @@ def build_profile() -> dict:
 
 def write_outputs(profile: dict) -> None:
     IMMORTAL_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILE_JSON.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-    PROFILE_MD.write_text(render_markdown(profile), encoding="utf-8")
-    PROFILE_COMPACT_MD.write_text(render_compact_markdown(profile), encoding="utf-8")
+    atomic_write_text(
+        PROFILE_JSON,
+        json.dumps(profile, ensure_ascii=False, indent=2) + "\n",
+    )
+    atomic_write_text(PROFILE_MD, render_markdown(profile))
+    atomic_write_text(PROFILE_COMPACT_MD, render_compact_markdown(profile))
 
 
 def render_markdown(profile: dict) -> str:
     lines = [
-        "# Configured User Profile",
+        f"# {OWNER} Profile",
         "",
         f"Generated: {profile['generated_at']}",
         f"Version: {profile['version']}",
@@ -683,7 +702,7 @@ def render_compact_markdown(profile: dict) -> str:
         "current_projects": 10,
     }
     lines = [
-        "# Configured User Profile Compact",
+        f"# {OWNER} Profile Compact",
         "",
         f"Generated: {profile['generated_at']}",
         "",
@@ -758,7 +777,7 @@ def summarize(profile: dict) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build user profile from Immortal memory sources")
+    parser = argparse.ArgumentParser(description="Build Owner profile from Immortal memory sources")
     parser.add_argument("--show", action="store_true", help="Print generated markdown after writing")
     parser.add_argument("--json", action="store_true", help="Print generated JSON after writing")
     args = parser.parse_args()

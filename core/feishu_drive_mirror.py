@@ -577,8 +577,6 @@ class FeishuMirror:
             raise RuntimeError("missing token")
         if action == "fetch_doc":
             path = DOC_DIR / self.output_base(row, ".json")
-            if path.exists() and not self.args.overwrite:
-                return path
             data = self.run_lark(
                 ["docs", "+fetch", "--api-version", "v2", "--as", "user", "--doc", token, "--doc-format", "markdown", "--detail", "simple", "--format", "json"],
                 timeout=180,
@@ -604,8 +602,6 @@ class FeishuMirror:
             out_dir = MIRROR_DIR / out_dir_rel
             out_dir.mkdir(parents=True, exist_ok=True)
             expected = out_dir / self.output_base(row, suffix).name
-            if expected.exists() and not self.args.overwrite:
-                return expected
             argv = [
                 "drive", "+export",
                 "--as", "user",
@@ -615,20 +611,22 @@ class FeishuMirror:
                 "--output-dir", str(out_dir_rel),
                 "--file-name", expected.name,
             ]
-            if self.args.overwrite:
+            if self.args.overwrite or expected.exists():
                 argv.append("--overwrite")
             self.run_lark(argv, timeout=300, cwd=MIRROR_DIR)
-            return expected if expected.exists() else out_dir
+            if not expected.is_file() or expected.stat().st_size <= 0:
+                raise RuntimeError(f"export did not produce a non-empty file: {expected}")
+            return expected
         if action == "download_file":
             path_rel = Path("files") / self.output_base(row, "")
             path = MIRROR_DIR / path_rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists() and not self.args.overwrite:
-                return path
             argv = ["drive", "+download", "--as", "user", "--file-token", token, "--output", str(path_rel)]
-            if self.args.overwrite:
+            if self.args.overwrite or path.exists():
                 argv.append("--overwrite")
             self.run_lark(argv, timeout=300, cwd=MIRROR_DIR)
+            if not path.is_file() or path.stat().st_size <= 0:
+                raise RuntimeError(f"download did not produce a non-empty file: {path}")
             return path
         raise RuntimeError(f"unknown action {action}")
 

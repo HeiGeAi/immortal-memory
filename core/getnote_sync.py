@@ -423,7 +423,7 @@ def is_low_value_text(text: str) -> bool:
         return True
     if ("你是谁" in stripped and "你的任务" in stripped) or ("检查项" in stripped and "修正规则" in stripped):
         return True
-    if "你的唯一任务是创作" in stripped or "你是账号边界A" in stripped:
+    if "你的唯一任务是创作" in stripped or "你是技术账号A" in stripped:
         return True
     if stripped.startswith("Automation:"):
         return True
@@ -438,8 +438,8 @@ def normalize_activity(text: str) -> str:
     rules = [
         (r"他视频后面如果是博客内容", ""),
         (r"codex cli|能打开我的 codex", "排查 Codex CLI 打开问题。"),
-        (r"teamsite\.ai|teamco|共享 AI skil", "学习团队共享 AI skill 的做法。"),
-        (r"账号边界A服务器搭建|服务器搭建", "推进 账号边界A服务器搭建。"),
+        (r"yage\.ai|team-co|共享 AI skil", "学习团队共享 AI skill 的做法。"),
+        (r"0 ?号机房服务器搭建|服务器搭建", "推进 0 号机房服务器搭建。"),
         (r"需要装什么插件|什么插件/skill/工具/mcp|评估.*插件", "评估项目需要补哪些插件和工具。"),
         (r"几千块的计算.*浪费时间|浪费时间", "算清楚时间成本"),
         (r"合同.*法务", "合同法务确认"),
@@ -453,7 +453,7 @@ def normalize_activity(text: str) -> str:
         (r"get ?笔记", "推进 Get 笔记与永生记忆库的日记同步链路。"),
         (r"biji\.com/openapi|openapi", "验证 Get 笔记 OpenAPI 入口和本地接入方式。"),
         (r"开源|github", "推进永生记忆库开源空壳版本的脱敏发布。"),
-        (r"免费用 GPT 生图|GPT Image-2|example\.com", "继续打磨 GPT 生图站的文章和入口，把免费这件事讲得更像人话。"),
+        (r"免费用 GPT 生图|GPT Image-2|heigeai\.com", "继续打磨 GPT 生图站的文章和入口，把免费这件事讲得更像人话。"),
         (r"个人开发者免费做的网站|土豆服务器|升级服务器", "想清楚免费生图站的真实成本和服务器问题。"),
         (r"superpowers", "研究 superpowers 项目，判断它能不能补进自己的工具链。"),
         (r"封面图|章节配图|配图需要", "继续测试文章配图流程。"),

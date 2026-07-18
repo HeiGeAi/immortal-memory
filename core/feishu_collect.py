@@ -27,6 +27,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import redact_common
+
 
 IMMORTAL_DIR = Path.home() / ".immortal"
 DAILY_DIR = IMMORTAL_DIR / "daily"
@@ -142,6 +145,12 @@ def mark_seen(conn: sqlite3.Connection, source: str, record_key: str) -> bool:
         return False
 
 
+def already_seen(conn: sqlite3.Connection, record_key: str) -> bool:
+    """只查不写：用于「先探测、fetch 成功再落标记」的采集顺序，避免失败时永久毒化。"""
+    row = conn.execute("select 1 from seen where record_key = ? limit 1", (record_key,)).fetchone()
+    return row is not None
+
+
 def parse_dt(value: str | None, *, end_of_day: bool = False) -> datetime | None:
     if not value:
         return None
@@ -159,12 +168,19 @@ def parse_dt(value: str | None, *, end_of_day: bool = False) -> datetime | None:
     return dt
 
 
-def window_from_args(args: argparse.Namespace) -> tuple[datetime, datetime]:
+def window_from_args(args: argparse.Namespace, last_window_end: str | None = None) -> tuple[datetime, datetime]:
     end = parse_dt(args.until, end_of_day=True) or datetime.now(LOCAL_TZ)
     if args.all:
         start = datetime(2020, 1, 1, tzinfo=LOCAL_TZ)
+    elif parse_dt(args.since):
+        start = parse_dt(args.since)
     else:
-        start = parse_dt(args.since) or (end - timedelta(days=args.days))
+        start = end - timedelta(days=args.days)
+        # 停摆兜底：若上次窗口结束早于默认起点，说明中间有缺口（auth 过期/关机/TCC 挡 launchd）。
+        # 把起点回退到 last_window_end 稍前，把停摆期一并补采，避免固定 --days 窗口漏掉中间数据。
+        prev_end = parse_dt(last_window_end) if last_window_end else None
+        if prev_end and prev_end < start:
+            start = prev_end - timedelta(hours=1)  # 1h 重叠冗余，seen 去重表挡住重复
     if start >= end:
         raise ValueError("--since must be earlier than --until")
     return start, end
@@ -270,15 +286,26 @@ def ensure_sources_config() -> None:
         write_json(SOURCES_FILE, config)
 
 
-def update_sources_backup(stats: dict[str, Any]) -> None:
+def update_sources_backup(stats: dict[str, Any], failed_sources: set[str] | None = None) -> None:
+    """只为本轮实际请求且没有出错的源刷新 last_backup。
+
+    stats 的 key 是本轮请求过的 source type；failed_sources 是本轮出错的
+    source type 集合。未请求或出错的源保持旧时间戳，避免把失败伪装成新鲜。
+    """
     config = read_json(SOURCES_FILE, {"sources": []})
     now = iso_now()
+    failed = set(failed_sources or [])
     for item in config.get("sources", []):
-        if item.get("name") in SOURCE_DEFS:
-            item["last_backup"] = now
-            source = item.get("type")
-            item.setdefault("stats", {})
-            item["stats"]["last_new_records"] = stats.get(source, 0)
+        if item.get("name") not in SOURCE_DEFS:
+            continue
+        source = item.get("type")
+        if source not in stats:
+            continue
+        if source in failed or item.get("name") in failed:
+            continue
+        item["last_backup"] = now
+        item.setdefault("stats", {})
+        item["stats"]["last_new_records"] = stats.get(source, 0)
     write_json(SOURCES_FILE, config)
 
 
@@ -336,6 +363,16 @@ def auth_user_identity(body: dict[str, Any]) -> tuple[str, str]:
 def data_part(body: dict[str, Any]) -> dict[str, Any]:
     data = body.get("data", body)
     return data if isinstance(data, dict) else {"items": data}
+
+
+def next_page_token(data: dict[str, Any]) -> str:
+    """Return a usable continuation token without reviving a finished page."""
+    token = str(data.get("page_token") or data.get("next_page_token") or "")
+    if not token:
+        return ""
+    if data.get("has_more") is False:
+        return ""
+    return token
 
 
 def doc_search_meta(item: dict[str, Any]) -> dict[str, Any]:
@@ -420,7 +457,10 @@ def write_records(records: list[dict[str, Any]]) -> None:
         daily_file = DAILY_DIR / f"{day}.jsonl"
         with open(daily_file, "a", encoding="utf-8") as daily, open(INDEX_FILE, "a", encoding="utf-8") as index:
             for item in items:
-                line = json.dumps(item, ensure_ascii=False)
+                # 落盘前：去内部字段 + 递归脱敏（含 metadata 嵌套、文件名、去重键）
+                clean = {k: v for k, v in item.items() if not k.startswith("_")}
+                clean = redact_common.redact_tree(clean)
+                line = json.dumps(clean, ensure_ascii=False)
                 daily.write(line + "\n")
                 index.write(line + "\n")
 
@@ -432,7 +472,8 @@ class Collector:
         self.run_id = str(uuid.uuid4())
         self.stats: dict[str, int] = defaultdict(int)
         self.errors: list[dict[str, str]] = []
-        self.start, self.end = window_from_args(args)
+        prev_state = read_json(STATE_FILE, {})
+        self.start, self.end = window_from_args(args, prev_state.get("last_window_end"))
         self.chats: list[dict[str, Any]] = []
         self.self_user: dict[str, Any] | None = None
 
@@ -512,7 +553,7 @@ class Collector:
             }
         )
         write_json(STATE_FILE, state)
-        update_sources_backup(stats)
+        update_sources_backup(stats, failed_sources={e.get("source") for e in self.errors})
         log_event("info", "run_finished", run_id=self.run_id, stats=stats, errors=len(self.errors))
 
     def collect_contact_self(self) -> None:
@@ -554,20 +595,29 @@ class Collector:
         records: list[dict[str, Any]] = []
         while True:
             page += 1
-            params: dict[str, Any] = {"page_size": self.args.chat_page_size, "sort_type": "ByCreateTimeAsc"}
+            command = [
+                "im",
+                "+chat-list",
+                "--as",
+                "user",
+                "--page-size",
+                str(self.args.chat_page_size),
+                "--sort",
+                "create_time",
+            ]
             if page_token:
-                params["page_token"] = page_token
+                command.extend(["--page-token", page_token])
             ok, body, err = run_lark(
-                ["im", "chats", "list", "--as", "user", "--params", json.dumps(params), "--format", "json"],
+                [*command, "--format", "json"],
                 timeout=60,
             )
             if not ok:
                 self.error("feishu-chat", err)
                 break
             data = data_part(body)
-            items = data.get("items") or []
+            items = data.get("chats") or []
             if not isinstance(items, list):
-                self.error("feishu-chat", "unexpected chats list response")
+                self.error("feishu-chat", "unexpected chat-list response")
                 break
             for chat in items:
                 if not isinstance(chat, dict):
@@ -599,9 +649,8 @@ class Collector:
                     self.add_records(records)
                     self.conn.commit()
                     return
-            page_token = data.get("page_token") or ""
-            has_more = bool(data.get("has_more")) or bool(page_token)
-            if not has_more:
+            page_token = next_page_token(data)
+            if not page_token:
                 break
             if self.args.chat_page_limit and page >= self.args.chat_page_limit:
                 break
@@ -663,9 +712,8 @@ class Collector:
                         self.add_records(records)
                         self.conn.commit()
                         return
-                page_token = data.get("page_token") or ""
-                has_more = bool(data.get("has_more")) or bool(page_token)
-                if not has_more:
+                page_token = next_page_token(data)
+                if not page_token:
                     break
                 if self.args.member_page_limit and page >= self.args.member_page_limit:
                     break
@@ -759,14 +807,17 @@ class Collector:
                     if self.args.max_messages and total >= self.args.max_messages:
                         self.add_records(records)
                         self.conn.commit()
+                        self.error(
+                            "feishu-im",
+                            f"max_messages limit reached at {total}; remaining chats/pages were not scanned",
+                        )
                         return
                 if len(records) >= self.args.flush_size:
                     self.add_records(records)
                     records = []
                     self.conn.commit()
-                page_token = data.get("page_token") or ""
-                has_more = bool(data.get("has_more")) or bool(page_token)
-                if not has_more:
+                page_token = next_page_token(data)
+                if not page_token:
                     break
                 if self.args.message_page_limit and page >= self.args.message_page_limit:
                     break
@@ -852,14 +903,17 @@ class Collector:
                 if self.args.max_messages and total >= self.args.max_messages:
                     self.add_records(records)
                     self.conn.commit()
+                    self.error(
+                        "feishu-im-search",
+                        f"max_messages limit reached at {total}; remaining pages were not scanned",
+                    )
                     return
             if len(records) >= self.args.flush_size:
                 self.add_records(records)
                 records = []
                 self.conn.commit()
-            page_token = data.get("page_token") or ""
-            has_more = bool(data.get("has_more")) and bool(page_token)
-            if not has_more:
+            page_token = next_page_token(data)
+            if not page_token:
                 break
             if self.args.message_page_limit and page >= self.args.message_page_limit:
                 break
@@ -1114,9 +1168,8 @@ class Collector:
                             session_id=meeting_id,
                         )
                     )
-                page_token = data.get("page_token") or ""
-                has_more = bool(data.get("has_more")) and bool(page_token)
-                if not has_more:
+                page_token = next_page_token(data)
+                if not page_token:
                     break
                 if self.args.vc_page_limit and page >= self.args.vc_page_limit:
                     break
@@ -1381,9 +1434,8 @@ class Collector:
                         self.add_records(records)
                         records = []
                         self.conn.commit()
-                    page_token = data.get("page_token") or ""
-                    has_more = bool(data.get("has_more")) and bool(page_token)
-                    if not has_more:
+                    page_token = next_page_token(data)
+                    if not page_token:
                         break
                     if self.args.minutes_page_limit and page >= self.args.minutes_page_limit:
                         break
@@ -1572,9 +1624,8 @@ class Collector:
                 self.add_records(records)
                 records = []
                 self.conn.commit()
-            page_token = data.get("page_token") or ""
-            has_more = bool(data.get("has_more")) and bool(page_token)
-            if not has_more:
+            page_token = next_page_token(data)
+            if not page_token:
                 break
             if self.args.docs_page_limit and page >= self.args.docs_page_limit:
                 break
@@ -1612,8 +1663,10 @@ class Collector:
             return
         for item in docs:
             token = item["token"]
+            # 先探 seen（不落标记），fetch 成功后才 mark_seen：瞬时失败（超时/限流/权限抖动）
+            # 不能永久毒化文档。对齐 collect_vc_note_doc_contents 的正确顺序。
             key = f"feishu-doc-content|{token}"
-            if not mark_seen(self.conn, "feishu-doc-content", key):
+            if already_seen(self.conn, key):
                 continue
             ok, body, err = run_lark(["docs", "+fetch", "--as", "user", "--doc", token, "--format", "json"], timeout=90)
             if not ok:
@@ -1622,6 +1675,7 @@ class Collector:
             content_text = self.extract_doc_fetch_text(body)
             if not content_text:
                 content_text = compact_json(data_part(body), 8000)
+            mark_seen(self.conn, "feishu-doc-content", key)
             document = item["document"]
             title = doc_search_title(document)
             url = doc_search_url(document)
@@ -1674,7 +1728,9 @@ class Collector:
             self.error("feishu-mail", err2)
             return
         data = data_part(body2)
-        messages = data.get("messages") or data.get("items") or data if isinstance(data, list) else []
+        messages = data.get("messages")
+        if messages is None:
+            messages = data.get("items")
         if not isinstance(messages, list):
             self.error("feishu-mail", "unexpected mail triage response")
             return
@@ -1806,7 +1862,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {item['source']}: {item['message'][:180]}")
         if len(collector.errors) > 10:
             print(f"  ... {len(collector.errors) - 10} more")
-    return 0
+    return run_exit_code(collector.errors)
+
+
+def run_exit_code(errors: list) -> int:
+    """统一退出码：0=success，2=partial（有源级错误但主流程完成）。"""
+    return 2 if errors else 0
 
 
 if __name__ == "__main__":

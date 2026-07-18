@@ -207,7 +207,17 @@ def command_context(args: argparse.Namespace) -> int:
     cmd = [sys.executable, str(SKILL_DIR / "immortal.py"), "context", query, "--since", args.since]
     if args.with_recall:
         cmd.append("--with-recall")
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SKILL_DIR), timeout=args.timeout)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SKILL_DIR), timeout=args.timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.output.decode("utf-8", "replace") if isinstance(exc.output, bytes) else (exc.output or "")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        result = subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout=stdout,
+            stderr=(stderr + f"\ncontext generation timed out after {args.timeout}s").strip(),
+        )
     body = result.stdout.strip()
     if result.stderr.strip():
         body = body + "\n\nSTDERR:\n" + result.stderr.strip()
