@@ -27,7 +27,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
-from command_hints import cli_command
+from control_center import ControlCenter
+from control_center_ui import control_center_page_html
 
 
 HOME = Path.home()
@@ -42,6 +43,7 @@ DEFAULT_DASHBOARD = IMMORTAL_DIR / "dashboard.html"
 DEFAULT_TIMELINE = IMMORTAL_DIR / "timeline.html"
 DEFAULT_SESSIONS_DIR = IMMORTAL_DIR / "sessions"
 DEFAULT_AGENT_ENTRY = IMMORTAL_DIR / "agent" / "ENTRY.md"
+DEFAULT_CONTROL_JOBS = IMMORTAL_DIR / "runtime" / "control_jobs.json"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 MEMORY_ID_RE = re.compile(r"`([a-f0-9]{24})`")
 CHECK_LINE_RE = re.compile(r"^-\s*\[([ xX])\]\s+`([a-f0-9]{24})`")
@@ -369,9 +371,35 @@ def session_summary(path: Path) -> dict[str, Any]:
 
 
 class FactoryStore:
-    def __init__(self) -> None:
-        self.jobs: dict[str, dict[str, Any]] = {}
+    def __init__(self, history_path: Path = DEFAULT_CONTROL_JOBS) -> None:
+        self.history_path = Path(history_path)
         self.lock = threading.Lock()
+        saved = read_json(self.history_path, [])
+        saved_jobs = saved if isinstance(saved, list) else []
+        self.jobs: dict[str, dict[str, Any]] = {
+            str(item["id"]): item
+            for item in saved_jobs
+            if isinstance(item, dict) and item.get("id")
+        }
+        interrupted = False
+        for job in self.jobs.values():
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "failed"
+                job["error"] = "控制中心服务重启，任务结果无法继续确认"
+                job["finished_at"] = now_local()
+                interrupted = True
+        if interrupted:
+            with self.lock:
+                self._persist_locked()
+
+    def _persist_locked(self) -> None:
+        jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        write_json_atomic(self.history_path, jobs[:JOB_HISTORY_LIMIT])
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+            return [dict(item) for item in jobs[:JOB_HISTORY_LIMIT]]
 
     def snapshot(self) -> dict[str, Any]:
         state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
@@ -430,13 +458,10 @@ class FactoryStore:
             "roles": roles,
             "jobs": jobs[:JOB_HISTORY_LIMIT],
             "commands": {
-                "collect": cli_command("run"),
-                "clean": " && ".join(
-                    cli_command(command)
-                    for command in ("feishu-clean", "feishu-distill", "profile-auto-review")
-                ),
-                "role": cli_command("task-compile", "目标", "--mode", "auto"),
-                "health": cli_command("health", "--max-age-hours", "30"),
+                "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
+                "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
+                "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
+                "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
             },
         }
 
@@ -460,6 +485,7 @@ class FactoryStore:
         }
         with self.lock:
             self.jobs[job_id] = job
+            self._persist_locked()
         thread = threading.Thread(target=self._run_job, args=(job_id, kind, body), daemon=True)
         thread.start()
         return job
@@ -473,6 +499,7 @@ class FactoryStore:
         with self.lock:
             if job_id in self.jobs:
                 self.jobs[job_id].update(updates)
+                self._persist_locked()
 
     def _append_output(self, job_id: str, stdout: str = "", stderr: str = "") -> None:
         with self.lock:
@@ -483,6 +510,7 @@ class FactoryStore:
                 job["stdout"] = (str(job.get("stdout") or "") + stdout)[-50000:]
             if stderr:
                 job["stderr"] = (str(job.get("stderr") or "") + stderr)[-50000:]
+            self._persist_locked()
 
     def _run_job(self, job_id: str, kind: str, body: dict[str, Any]) -> None:
         started = time.time()
@@ -558,6 +586,21 @@ class FactoryStore:
             return [(cmd, COMMAND_TIMEOUTS["task_compile"])]
         if kind == "health":
             return [([python, immortal, "health", "--max-age-hours", "30"], COMMAND_TIMEOUTS["health"])]
+        if kind == "run":
+            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
+        if kind == "backup_verify":
+            return [
+                (
+                    [python, immortal, "backup-status", "--verify", "--max-age-hours", "168"],
+                    COMMAND_TIMEOUTS["health"],
+                )
+            ]
+        if kind == "profile_refresh":
+            return [
+                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
+                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
+            ]
         raise ValueError("unknown factory job kind")
 
     def _success_summary(self, kind: str, body: dict[str, Any]) -> str:
@@ -571,6 +614,12 @@ class FactoryStore:
             return "一键采集、清洗和任务上下文生成已完成。"
         if kind == "health":
             return "健康检查已完成。"
+        if kind == "run":
+            return "Immortal 全流程已完成。"
+        if kind == "backup_verify":
+            return "最新便携备份校验已完成。"
+        if kind == "profile_refresh":
+            return "长期画像和质量报告已刷新。"
         return "任务完成。"
 
     @staticmethod
@@ -588,6 +637,17 @@ def shlex_quote(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=@+-]+", value):
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def is_allowed_local_origin(value: str) -> bool:
+    if not value:
+        return True
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and parsed.username is None and parsed.password is None and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
 
 
 def page_html(title: str) -> str:
@@ -1426,6 +1486,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def factory(self) -> FactoryStore:
         return self.server.factory  # type: ignore[attr-defined]
 
+    @property
+    def control_center(self) -> ControlCenter:
+        return self.server.control_center  # type: ignore[attr-defined]
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
@@ -1453,6 +1517,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
+            payload = control_center_page_html("Immortal Control Center").encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if parsed.path == "/snapshot":
             if DEFAULT_DASHBOARD.exists():
                 payload = DEFAULT_DASHBOARD.read_bytes()
                 self.send_response(HTTPStatus.OK)
@@ -1461,6 +1533,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+            payload = (
+                "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\">"
+                "<title>Legacy Snapshot</title><body><h1>旧快照尚未生成</h1>"
+                "<p>实时状态请返回 <a href=\"/\">Immortal Control Center</a>。</p></body></html>"
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if parsed.path == "/review":
             payload = page_html("长期画像审阅台").encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -1516,6 +1599,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/factory/state":
             self.send_json(self.factory.snapshot())
             return
+        if parsed.path == "/api/control-center/state":
+            self.send_json(self.control_center.build_snapshot(jobs=self.factory.list_jobs()))
+            return
         if parsed.path.startswith("/api/factory/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
             job = self.factory.get_job(job_id)
@@ -1533,6 +1619,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if not is_allowed_local_origin(self.headers.get("Origin") or ""):
+                self.send_json({"error": "origin is not allowed"}, status=403)
+                return
             body = self.read_body()
             if parsed.path == "/api/review":
                 memory_id = str(body.get("id") or "")
@@ -1545,6 +1634,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/factory/jobs":
                 kind = str(body.get("kind") or "")
                 self.send_json(self.factory.start_job(kind, body), status=202)
+                return
+            if parsed.path == "/api/control-center/actions":
+                action = str(body.get("action") or "")
+                if action not in {"run", "health", "backup_verify", "profile_refresh"}:
+                    raise ValueError("unknown control action")
+                active = self.factory.list_jobs()
+                if action == "run" and any(
+                    item.get("kind") == "run" and item.get("status") in {"queued", "running"}
+                    for item in active
+                ):
+                    raise ValueError("Immortal is already running")
+                self.send_json(self.factory.start_job(action, {}), status=202)
                 return
             self.send_json({"error": "not found"}, status=404)
         except Exception as exc:
@@ -1567,9 +1668,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = ReviewStore(args.proposal, args.memories, args.reviewed, args.review_state)
     factory = FactoryStore()
+    control_center = ControlCenter(IMMORTAL_DIR, skill_dir=SKILL_DIR, service_reachable=True)
     server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
     server.store = store  # type: ignore[attr-defined]
     server.factory = factory  # type: ignore[attr-defined]
+    server.control_center = control_center  # type: ignore[attr-defined]
     url = f"http://{args.host}:{args.port}/"
     print(f"Immortal dashboard: {url}")
     print(f"Task context compiler: {url}agent-factory")

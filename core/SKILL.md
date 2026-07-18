@@ -53,7 +53,13 @@ Open the local control surface:
 immortal-memory profile-review --host 127.0.0.1 --port 8765
 ```
 
-Then open `http://127.0.0.1:8765/agent-factory`.
+Then open `http://127.0.0.1:8765/`.
+
+The root page is the evidence-driven Immortal Control Center. It shows live
+runtime heartbeat, orchestrator stages, real outputs, scheduler state, backup
+trust, persistent history, and allowlisted local controls. The task context
+compiler remains at `/agent-factory`, and the legacy snapshot is available at
+`/snapshot`.
 
 ## Core Commands
 

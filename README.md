@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v0.8.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v0.9.0-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -130,6 +130,8 @@ immortal-memory agent-factory
 ```
 
 然后访问 http://127.0.0.1:8765/
+
+根页面现在是实时的 Immortal Control Center。它分别核对本地服务、每日调度器、最近运行、真实产出和备份可信度。证据缺失时显示“证据不足”，不会因为页面能打开就显示绿色。任务上下文生成器仍在 `/agent-factory`，旧静态快照保留在 `/snapshot`。
 
 ## 产品边界（它替代不了什么）
 
@@ -289,6 +291,8 @@ immortal-memory agent-factory
 ```
 
 Then visit http://127.0.0.1:8765/
+
+The root page is now the live Immortal Control Center. It shows evidence-backed runtime heartbeat, stages, outputs, scheduler state, backup trust, history, and allowlisted local controls. The task context compiler remains at `/agent-factory`, and the legacy static snapshot remains at `/snapshot`.
 
 ## How other agents use it
 

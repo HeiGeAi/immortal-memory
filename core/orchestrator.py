@@ -15,11 +15,13 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from config import feishu_daily_sources, feishu_guard_args
 from process_utils import run_process
+from runtime_telemetry import RuntimeTelemetry
 from state_store import read_state as read_shared_state, update_state_atomic
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -32,6 +34,9 @@ SKILL_DIR = Path(__file__).resolve().parent
 GETNOTE_CONFIG = Path.home() / ".getnote" / "config.json"
 GETNOTE_LATEST_JSON = IMMORTAL_DIR / "getnote" / "latest.json"
 STABLE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+RUNTIME_TELEMETRY = RuntimeTelemetry(IMMORTAL_DIR / "runtime")
+_ACTIVE_STAGE = ""
+_STAGE_ERROR_COUNT = 0
 
 DISTILL_INTERVAL_DAYS = 1  # 每天蒸馏一次（数据变化大的话有意义）
 CLEANUP_INTERVAL_DAYS = 7  # 每周清理一次磁盘
@@ -90,6 +95,36 @@ def log(msg: str):
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def telemetry_stage(stage_id: str, label: str, errors: list) -> None:
+    """Finish the previous broad stage and start the next evidence checkpoint."""
+    global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
+    if _ACTIVE_STAGE:
+        added = max(0, len(errors) - _STAGE_ERROR_COUNT)
+        status = "attention" if added else "success"
+        summary = f"新增 {added} 个需关注项" if added else "阶段完成"
+        RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status=status, summary=summary)
+    RUNTIME_TELEMETRY.start_stage(stage_id, label)
+    _ACTIVE_STAGE = stage_id
+    _STAGE_ERROR_COUNT = len(errors)
+
+
+def telemetry_finish_active(errors: list) -> None:
+    global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
+    if not _ACTIVE_STAGE:
+        return
+    added = max(0, len(errors) - _STAGE_ERROR_COUNT)
+    status = "attention" if added else "success"
+    summary = f"新增 {added} 个需关注项" if added else "阶段完成"
+    RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status=status, summary=summary)
+    _ACTIVE_STAGE = ""
+    _STAGE_ERROR_COUNT = 0
+
+
+def telemetry_heartbeat_loop(stop_event: threading.Event, interval: float = 30.0) -> None:
+    while not stop_event.wait(interval):
+        RUNTIME_TELEMETRY.heartbeat()
 
 
 def child_env() -> dict:
@@ -762,9 +797,42 @@ def release_lock():
 def main():
     if not acquire_lock():
         return
+    global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
+    _ACTIVE_STAGE = ""
+    _STAGE_ERROR_COUNT = 0
+    RUNTIME_TELEMETRY.start_run(
+        trigger=os.environ.get("IMMORTAL_TRIGGER") or "schedule",
+        pid=os.getpid(),
+        stage_total=7,
+    )
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=telemetry_heartbeat_loop,
+        args=(heartbeat_stop,),
+        daemon=True,
+        name="immortal-telemetry-heartbeat",
+    )
+    heartbeat_thread.start()
     try:
-        run_main()
+        outcome = run_main() or {}
+        results = outcome.get("results") if isinstance(outcome, dict) else {}
+        errors = outcome.get("errors") if isinstance(outcome, dict) else []
+        status = outcome.get("status") if isinstance(outcome, dict) else "success"
+        telemetry_finish_active(errors or [])
+        RUNTIME_TELEMETRY.finish_run(
+            status=str(status or "success"),
+            results=results if isinstance(results, dict) else {},
+            error="；".join(str(item) for item in (errors or [])),
+        )
+    except Exception as exc:
+        if _ACTIVE_STAGE:
+            RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="failed", error=str(exc))
+            _ACTIVE_STAGE = ""
+        RUNTIME_TELEMETRY.finish_run(status="failed", error=str(exc))
+        raise
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
         release_lock()
 
 
@@ -781,12 +849,14 @@ def run_main():
     log(f"上次蒸馏: {state.get('last_distill') or '从未'}")
 
     # 阶段 1: 采集
+    telemetry_stage("collect", "本地增量采集", errors)
     collect_ok, collect_info = collect()
     if collect_ok:
         state["last_collect"] = now_iso
     else:
         errors.append("collect failed")
 
+    telemetry_stage("external", "外部来源同步", errors)
     web_new = 0
     web_due_hours = hours_since(state.get("last_web_collect"))
     if web_due_hours >= WEB_CAPTURE_INTERVAL_HOURS:
@@ -883,6 +953,7 @@ def run_main():
             f"{FEISHU_MIRROR_DOWNLOAD_INTERVAL_HOURS} 小时，跳过"
         )
 
+    telemetry_stage("distill", "记忆清洗与蒸馏", errors)
     # 阶段 5: 数字人格蒸馏默认关闭。飞书先进入 review layer，避免噪声直接污染 digital-soul.md。
     days_since_distill = days_since(state.get("last_distill"))
     if AUTO_DIGITAL_SOUL_DISTILL and days_since_distill >= DISTILL_INTERVAL_DAYS:
@@ -896,6 +967,7 @@ def run_main():
     else:
         log("自动 digital-soul 蒸馏已关闭；飞书数据只自动合并到 reviewed/profile layer")
 
+    telemetry_stage("profile", "画像与关系网络", errors)
     if profile():
         state["last_profile"] = now_iso
         if profile_nuwa():
@@ -905,6 +977,7 @@ def run_main():
     else:
         errors.append("profile failed")
 
+    telemetry_stage("quality", "索引与质量检查", errors)
     # 阶段 5C/5D: 人物索引和关联证据先刷新；状态落盘后再生成 digest，避免摘要滞后一轮。
     people_index_ok = people_index()
     if people_index_ok:
@@ -932,6 +1005,7 @@ def run_main():
     else:
         log("关联证据网络未成功，跳过记忆质量报告")
 
+    telemetry_stage("backup", "备份与恢复校验", errors)
     # 阶段 6: 磁盘清理（每周）
     days_since_cleanup = days_since(state.get("last_cleanup"))
     if days_since_cleanup >= CLEANUP_INTERVAL_DAYS:
@@ -995,6 +1069,7 @@ def run_main():
 
     # dashboard.html 已停用（2026-06-14 Owner 决策：5MB/天展示物，基本不打开）
 
+    telemetry_stage("sync", "阅读层与 Agent 入口", errors)
     if agent_entry_refresh():
         state["last_agent_entry"] = now_iso
     else:
@@ -1034,6 +1109,24 @@ def run_main():
     if errors:
         log(f"  警告: 错误: {', '.join(errors)}")
     log("")
+    return {
+        "status": "attention" if errors else "success",
+        "errors": errors,
+        "results": {
+            "new_records": collect_info.get("total_new", 0),
+            "web_new_records": web_new,
+            "feishu_new_records": feishu_new,
+            "total_records": state["total_records"],
+            "outputs_updated": [
+                "index",
+                "profile",
+                "people",
+                "relationships",
+                "quality",
+                "agent_entry",
+            ],
+        },
+    }
 
 
 if __name__ == "__main__":

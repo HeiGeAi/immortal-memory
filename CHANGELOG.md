@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.0
+
+- Add an evidence-driven local Control Center for runtime heartbeat, stages, outputs, risks, history, and safe operations.
+- Persist structured orchestrator telemetry and bounded control-job history across service restarts.
+- Keep unknown, stale, partial, and same-disk backup states distinct from healthy.
+- Add allowlisted controls for a full run, health check, backup verification, and profile refresh.
+- Preserve the legacy generated snapshot at `/snapshot`.
+
 ## 0.8.0
 
 - Make SQLite synchronization transactional, concurrent-safe, and tolerant of incomplete JSONL tails.
