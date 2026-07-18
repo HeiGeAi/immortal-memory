@@ -6,6 +6,7 @@
 - Persist structured orchestrator telemetry and bounded control-job history across service restarts.
 - Keep unknown, stale, partial, and same-disk backup states distinct from healthy.
 - Add allowlisted controls for a full run, health check, backup verification, and profile refresh.
+- Refine the Control Center with a Nocturne Teal interface, accessible action states, reduced-motion support, and overflow-safe mobile and print layouts.
 - Preserve the legacy generated snapshot at `/snapshot`.
 
 ## 0.8.0

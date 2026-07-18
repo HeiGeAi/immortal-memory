@@ -13,14 +13,35 @@ def test_page_contains_truth_sections_and_live_api():
     assert "/api/control-center/actions" in page
 
 
-def test_page_is_responsive_printable_and_has_no_animation():
+def test_page_is_responsive_printable_and_motion_respectful():
     page = control_center_page_html("Immortal Control Center")
-    lowered = page.lower()
 
     assert "@media (max-width: 760px)" in page
     assert "@media print" in page
-    assert "animation:" not in lowered
-    assert "transition:" not in lowered
+    assert "@media (prefers-reduced-motion: reduce)" in page
+
+
+def test_page_has_accessible_motion_and_action_feedback():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert 'aria-live="polite"' in page
+    assert "aria-busy" in page
+    assert "is-loading" in page
+    assert "@keyframes beacon" in page
+    assert "@keyframes stage-flow" in page
+
+
+def test_page_contains_long_evidence_without_horizontal_overflow():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert "overflow-wrap: anywhere" in page
+    assert "overflow-x: clip" in page
+
+
+def test_print_view_removes_navigation_and_controls():
+    page = control_center_page_html("Immortal Control Center")
+
+    assert ".nav, .control-panel { display: none; }" in page
 
 
 def test_page_has_safe_control_labels_and_navigation():
