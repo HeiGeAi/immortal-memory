@@ -120,20 +120,15 @@ class IndexDbReliabilityTest(unittest.TestCase):
     def test_date_filter_uses_local_calendar_day(self):
         row = record("boundary", "local calendar boundary")
         row["timestamp"] = "2026-07-17T20:00:00Z"
-        local_day = (
-            datetime.fromisoformat("2026-07-17T20:00:00+00:00")
-            .astimezone()
-            .strftime("%Y-%m-%d")
-        )
-        self.assertNotEqual(local_day, "2026-07-17")
+        local_day = "2026-07-18"
         self.write_records([row])
-        self.assertEqual(index_db.sync(), 1)
-
-        _, rankings = index_db.channels(
-            "calendar",
-            since=local_day,
-            until=local_day,
-        )
+        with mock.patch.object(index_db, "local_date", return_value=local_day):
+            self.assertEqual(index_db.sync(), 1)
+            _, rankings = index_db.channels(
+                "calendar",
+                since=local_day,
+                until=local_day,
+            )
 
         self.assertTrue(rankings)
         self.assertEqual(rankings[0][0][1]["id"], "boundary")

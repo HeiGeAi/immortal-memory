@@ -187,7 +187,7 @@ def command_context(args: argparse.Namespace) -> int:
     query = (args.query or "当前任务").strip()
 
     preflight = gather_preflight(query=query, since=args.since)
-    if preflight["context_status"] == STATUS_UNAVAILABLE and not args.force:
+    if preflight["context_status"] == STATUS_UNAVAILABLE and not getattr(args, "force", False):
         AGENT_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "generated_at": now_local(),
