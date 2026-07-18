@@ -56,6 +56,35 @@ else:
 PY
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
+CONTROL_PORT=18765
+HOME="$TMP_HOME" python3 "$ROOT/core/profile_review.py" --host 127.0.0.1 --port "$CONTROL_PORT" >/tmp/immortal-memory-control.txt 2>&1 &
+CONTROL_PID=$!
+trap 'kill "$CONTROL_PID" "$SERVER_PID" 2>/dev/null || true; rm -rf "$TMP_HOME"' EXIT
+HOME="$TMP_HOME" python3 - <<PY
+import json
+import time
+import urllib.request
+
+base = "http://127.0.0.1:${CONTROL_PORT}"
+for _ in range(30):
+    try:
+        health = json.load(urllib.request.urlopen(base + "/healthz", timeout=2))
+        break
+    except Exception:
+        time.sleep(0.1)
+else:
+    raise SystemExit("control center did not start")
+assert health == {"status": "ok"}
+capabilities = json.load(urllib.request.urlopen(base + "/api/v1/capabilities", timeout=5))
+assert {item["id"] for item in capabilities["modules"]} == {
+    "overview", "runs", "sources", "memories", "profile", "agent", "backup", "diagnostics"
+}
+page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
+assert 'data-view="overview"' in page
+assert 'data-view="diagnostics"' in page
+PY
+kill "$CONTROL_PID" 2>/dev/null || true
+wait "$CONTROL_PID" 2>/dev/null || true
 HOME="$TMP_HOME" python3 "$ROOT/core/immortal.py" health --max-age-hours 9999 || true
 HOME="$TMP_HOME" python3 "$ROOT/core/immortal.py" agent-audit --limit 10 >/tmp/immortal-memory-audit.txt
 test -s "$TMP_HOME/.immortal/agent/ENTRY.md"

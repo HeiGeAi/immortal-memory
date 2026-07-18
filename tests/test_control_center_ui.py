@@ -1,85 +1,94 @@
 from control_center_ui import control_center_page_html
 
 
-def test_page_contains_truth_sections_and_live_api():
-    page = control_center_page_html("Immortal Control Center")
+def test_page_contains_all_real_modules_and_no_legacy_links():
+    page = control_center_page_html()
 
-    assert "运行证明" in page
-    assert "当前运行" in page
-    assert "本轮产出" in page
-    assert "风险与建议" in page
-    assert "最近运行" in page
-    assert "/api/control-center/state" in page
-    assert "/api/control-center/actions" in page
+    for view in (
+        "overview",
+        "runs",
+        "sources",
+        "memories",
+        "profile",
+        "agent",
+        "backup",
+        "diagnostics",
+    ):
+        assert f'data-view="{view}"' in page
+    assert 'href="/timeline"' not in page
+    assert 'href="/snapshot"' not in page
+    assert 'href="/agent-factory"' not in page
+    assert 'href="/review"' not in page
+    assert "window.confirm" not in page
+    assert 'role="dialog"' in page
+
+
+def test_page_uses_v1_live_apis_and_controlled_jobs():
+    page = control_center_page_html()
+
+    for endpoint in (
+        "/api/v1/capabilities",
+        "/api/v1/overview",
+        "/api/v1/jobs",
+        "/api/v1/sources",
+        "/api/v1/memories",
+        "/api/v1/profile/candidates",
+        "/api/v1/agent",
+        "/api/v1/backups",
+        "/api/v1/diagnostics",
+    ):
+        assert endpoint in page
+    assert "/api/control-center/actions" not in page
+
+
+def test_page_initial_load_is_capabilities_plus_selected_module():
+    page = control_center_page_html()
+
+    assert "capabilities = await api('/api/v1/capabilities')" in page
+    assert "await switchView" in page
+    assert "const RENDERERS" in page
+    assert "Promise.all([api('/api/v1/jobs'), api('/api/v1/overview')])" in page
 
 
 def test_page_is_responsive_printable_and_motion_respectful():
-    page = control_center_page_html("Immortal Control Center")
+    page = control_center_page_html()
 
     assert "@media (max-width: 760px)" in page
     assert "@media print" in page
     assert "@media (prefers-reduced-motion: reduce)" in page
+    assert "overflow-x: clip" in page
+    assert ".hero-side { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));" in page
+    assert ".drawer[aria-hidden=\"true\"] { display: none; }" in page
+    assert "font: 650 clamp(30px, 2.8vw, 44px)/1 var(--mono)" in page
 
 
-def test_page_has_accessible_motion_and_action_feedback():
-    page = control_center_page_html("Immortal Control Center")
+def test_page_has_accessible_feedback_drawer_and_dialog():
+    page = control_center_page_html()
 
     assert 'aria-live="polite"' in page
     assert "aria-busy" in page
-    assert "is-loading" in page
-    assert "@keyframes beacon" in page
-    assert "@keyframes stage-flow" in page
+    assert 'aria-label="详情面板"' in page
+    assert 'aria-modal="true"' in page
+    assert "showModal()" in page
 
 
-def test_page_contains_long_evidence_without_horizontal_overflow():
-    page = control_center_page_html("Immortal Control Center")
+def test_controls_use_instrument_structure_and_real_states():
+    page = control_center_page_html()
 
-    assert "overflow-wrap: anywhere" in page
-    assert "overflow-x: clip" in page
-
-
-def test_print_view_removes_navigation_and_controls():
-    page = control_center_page_html("Immortal Control Center")
-
-    assert ".nav, .control-panel { display: none; }" in page
-
-
-def test_control_buttons_use_instrument_switch_structure():
-    page = control_center_page_html("Immortal Control Center")
-
-    assert 'class="button instrument primary action"' in page
-    assert 'class="instrument-light"' in page
-    assert 'class="instrument-copy"' in page
-    assert "<small>RUN · 7 STAGES</small>" in page
-    assert 'class="link"' in page
-    assert 'class="link instrument"' not in page
-
-
-def test_instrument_buttons_define_visual_and_accessible_states():
-    page = control_center_page_html("Immortal Control Center")
-
-    assert ".instrument-light" in page
+    assert 'class="control primary"' in page
+    assert ".control::before" in page
+    assert ".control::after" in page
     assert "clip-path: polygon" in page
-    assert ".instrument.is-loading .instrument-light" in page
-    assert ".instrument.is-success .instrument-light" in page
-    assert ".instrument.is-error .instrument-light" in page
-    assert ".instrument:disabled .instrument-light" in page
+    assert ".control:disabled" in page
+    assert "STAGE BOUNDARY" in page
 
 
-def test_button_state_updates_labels_without_replacing_instrument_dom():
-    page = control_center_page_html("Immortal Control Center")
+def test_sensitive_modules_are_server_paginated_and_on_demand():
+    page = control_center_page_html()
 
-    assert "button.querySelector('.instrument-copy strong')" in page
-    assert "button.querySelector('.instrument-copy small')" in page
-    assert "button.textContent = label" not in page
-
-
-def test_page_has_safe_control_labels_and_navigation():
-    page = control_center_page_html("Immortal Control Center")
-
-    assert "立即运行全流程" in page
-    assert "运行健康检查" in page
-    assert "校验最新备份" in page
-    assert "刷新画像" in page
-    assert 'href="/agent-factory"' in page
-    assert 'href="/review"' in page
+    assert "memoryOffset" in page
+    assert "profileOffset" in page
+    assert "openMemory" in page
+    assert "openProfile" in page
+    assert "MASKED" in page
+    assert "SERVER FILTER" in page

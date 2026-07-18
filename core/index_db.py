@@ -62,6 +62,7 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
         "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
         "role TEXT, project TEXT, content TEXT)"
     )
+    con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
     con.execute(

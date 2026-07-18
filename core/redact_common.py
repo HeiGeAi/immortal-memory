@@ -21,8 +21,8 @@ _PATTERNS = [
     (r"(?i)\b(token|bearer|secret)(\s*[:：=]\s*)\S{16,}", r"\1\2[REDACTED]"),
     # 厂商特征 token
     (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
-    (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "github_pat_[REDACTED]"),
+    (r"gh[posru]_[A-Za-z0-9]{20,}", "gh_[REDACTED]"),
+    (r"github_pat_[A-Za-z0-9_]{20,}", "github_pat_[REDACTED]"),
     (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
     (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
     (r"\bxox[baprs]-[A-Za-z0-9\-]{10,}", "xox-[REDACTED]"),

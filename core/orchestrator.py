@@ -89,6 +89,33 @@ def feishu_mirror_guard_args() -> list[str]:
     return guards if guards else []
 
 
+class ControlJobCanceled(RuntimeError):
+    """Raised only at an orchestrator stage boundary."""
+
+
+def control_job_cancel_requested(
+    job_id: str,
+    *,
+    runtime_dir=None,
+) -> bool:
+    scoped_job_id = str(job_id or "").strip()
+    if not scoped_job_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", scoped_job_id):
+        return False
+    root = Path(runtime_dir) if runtime_dir is not None else RUNTIME_TELEMETRY.runtime_dir
+    marker = root / "cancel_requests" / f"{scoped_job_id}.json"
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(value, dict) and value.get("job_id") == scoped_job_id
+
+
+def raise_if_control_job_canceled() -> None:
+    job_id = os.environ.get("IMMORTAL_CONTROL_JOB_ID") or ""
+    if control_job_cancel_requested(job_id):
+        raise ControlJobCanceled(f"控制中心任务 {job_id} 已请求取消")
+
+
 def log(msg: str):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{now}] {msg}"
@@ -100,6 +127,7 @@ def log(msg: str):
 def telemetry_stage(stage_id: str, label: str, errors: list) -> None:
     """Finish the previous broad stage and start the next evidence checkpoint."""
     global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
+    raise_if_control_job_canceled()
     if _ACTIVE_STAGE:
         added = max(0, len(errors) - _STAGE_ERROR_COUNT)
         status = "attention" if added else "success"
@@ -488,6 +516,17 @@ def people_index():
     return False
 
 
+def search_index_sync():
+    log("=== 阶段 5C0: 同步控制中心检索索引 ===")
+    ok, out = run_script("index_db.py", "sync", timeout=900)
+    if ok:
+        summary = out.strip().splitlines()[-1] if out.strip() else "索引已同步"
+        log(f"控制中心检索索引已同步: {summary[:240]}")
+        return True
+    log(f"控制中心检索索引同步失败: {out.strip()[:300]}")
+    return False
+
+
 def relationship_index():
     log("=== 阶段 5D: 更新关联证据网络 ===")
     ok, out = run_script("relationship_index.py", timeout=360)
@@ -824,6 +863,11 @@ def main():
             results=results if isinstance(results, dict) else {},
             error="；".join(str(item) for item in (errors or [])),
         )
+    except ControlJobCanceled as exc:
+        if _ACTIVE_STAGE:
+            RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="canceled", error=str(exc))
+            _ACTIVE_STAGE = ""
+        RUNTIME_TELEMETRY.finish_run(status="canceled", error=str(exc))
     except Exception as exc:
         if _ACTIVE_STAGE:
             RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="failed", error=str(exc))
@@ -979,6 +1023,11 @@ def run_main():
 
     telemetry_stage("quality", "索引与质量检查", errors)
     # 阶段 5C/5D: 人物索引和关联证据先刷新；状态落盘后再生成 digest，避免摘要滞后一轮。
+    if search_index_sync():
+        state["last_search_index_sync"] = now_iso
+    else:
+        errors.append("search index sync failed")
+
     people_index_ok = people_index()
     if people_index_ok:
         state["last_people_index"] = now_iso

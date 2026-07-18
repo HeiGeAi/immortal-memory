@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import urllib.error
+import urllib.request
+
+import pytest
+
+from control_center import ControlCenter
+from control_data import ControlData
+from profile_review import FactoryStore, ReviewHandler, ReviewStore, ThreadingHTTPServer
+
+
+def start_server(tmp_path):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ReviewHandler)
+    server.store = ReviewStore(
+        tmp_path / "proposal.md",
+        tmp_path / "memories.jsonl",
+        tmp_path / "reviewed.jsonl",
+        tmp_path / "review_state.json",
+    )
+    server.factory = FactoryStore(history_path=tmp_path / "runtime" / "control_jobs.json")
+    server.control_center = ControlCenter(
+        tmp_path,
+        skill_dir=tmp_path,
+        scheduler_probe=lambda: {"status": "unknown", "detail": "test"},
+        service_reachable=True,
+    )
+    server.control_data = ControlData(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}"
+
+
+def get_json(url: str) -> tuple[int, dict]:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def test_healthz_is_lightweight_and_readyz_reports_dependencies(tmp_path):
+    (tmp_path / "runtime").mkdir()
+    server, base = start_server(tmp_path)
+    try:
+        health_status, health = get_json(base + "/healthz")
+        ready_status, ready = get_json(base + "/readyz")
+        capability_status, capabilities = get_json(base + "/api/v1/capabilities")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert health_status == 200
+    assert health == {"status": "ok"}
+    assert ready_status == 200
+    assert ready["status"] == "ready"
+    assert capability_status == 200
+    assert {item["id"] for item in capabilities["modules"]} >= {
+        "overview",
+        "runs",
+        "sources",
+        "memories",
+        "profile",
+        "agent",
+        "backup",
+        "diagnostics",
+    }
+
+
+def test_readyz_returns_503_when_vault_is_missing(tmp_path):
+    server, base = start_server(tmp_path)
+    server.control_data.immortal_dir = tmp_path / "missing-vault"
+    try:
+        status, payload = get_json(base + "/readyz")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 503
+    assert payload["status"] == "not_ready"
+    assert payload["checks"]["vault_readable"] is False
+
+
+def test_v1_overview_reuses_truth_snapshot(tmp_path):
+    server, base = start_server(tmp_path)
+    try:
+        legacy_status, legacy = get_json(base + "/api/control-center/state")
+        v1_status, v1 = get_json(base + "/api/v1/overview")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert legacy_status == 200
+    assert v1_status == 200
+    assert v1 == legacy
+
+
+def write_index(root, count=60):
+    rows = [
+        {
+            "id": f"memory-{index}",
+            "timestamp": f"2026-07-{(index % 18) + 1:02d}T08:00:00Z",
+            "source": "feishu-im" if index % 2 else "codex",
+            "type": "message",
+            "sensitivity": "confidential",
+            "content": f"private memory body {index}",
+        }
+        for index in range(count)
+    ]
+    (root / "index.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def test_memory_list_is_bounded_and_omits_full_content(tmp_path):
+    write_index(tmp_path)
+    data = ControlData(tmp_path)
+
+    page = data.memories({"limit": ["20"], "offset": ["0"]})
+    encoded = json.dumps(page, ensure_ascii=False)
+
+    assert len(page["items"]) == 20
+    assert page["total"] == 60
+    assert page["limit"] == 20
+    assert all("content" not in item and "evidence" not in item for item in page["items"])
+    assert "private memory body 59" not in encoded
+
+
+def test_memory_filters_and_detail_use_stable_id(tmp_path):
+    write_index(tmp_path, count=6)
+    data = ControlData(tmp_path)
+
+    page = data.memories({"q": ["body 3"], "source": ["feishu-im"], "limit": ["100"]})
+    detail = data.memory_detail("memory-3")
+
+    assert page["limit"] == 50
+    assert [item["id"] for item in page["items"]] == ["memory-3"]
+    assert detail["id"] == "memory-3"
+    assert detail["content"] == "private memory body 3"
+
+
+def test_memory_detail_rejects_path_identifiers(tmp_path):
+    data = ControlData(tmp_path)
+
+    with pytest.raises(ValueError):
+        data.memory_detail("../../profile.json")
+
+
+def test_sources_keep_partial_and_skipped_distinct_from_success(tmp_path):
+    (tmp_path / "orchestrator_state.json").write_text(
+        json.dumps(
+            {
+                "last_collect": "2026-07-18T08:00:00Z",
+                "last_run_new_records": 4,
+                "last_feishu_collect": "2026-07-18T07:00:00Z",
+                "last_feishu_status": "partial",
+                "last_run_feishu_new_records": 2,
+                "last_obsidian_sync_status": "disabled",
+            }
+        ),
+        encoding="utf-8",
+    )
+    data = ControlData(tmp_path)
+
+    sources = {item["id"]: item for item in data.sources()["items"]}
+
+    assert sources["local"]["status"] == "success"
+    assert sources["feishu"]["status"] == "partial"
+    assert sources["obsidian"]["status"] == "skipped"
+
+
+def test_memory_and_source_routes_are_live(tmp_path):
+    write_index(tmp_path, count=3)
+    server, base = start_server(tmp_path)
+    try:
+        source_status, sources = get_json(base + "/api/v1/sources")
+        list_status, page = get_json(base + "/api/v1/memories?limit=2")
+        detail_status, detail = get_json(base + "/api/v1/memories/memory-1")
+        bad_status, bad = get_json(base + "/api/v1/memories/..%2Fprofile.json")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert source_status == 200
+    assert len(sources["items"]) == 5
+    assert list_status == 200
+    assert len(page["items"]) == 2
+    assert detail_status == 200
+    assert detail["id"] == "memory-1"
+    assert bad_status == 400
+    assert bad["error"]["code"] == "invalid_memory_id"
+
+
+def test_memory_api_uses_sqlite_index_without_scanning_jsonl(tmp_path, monkeypatch):
+    db = tmp_path / "search_index.db"
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "create table docs("
+            "rowid integer primary key, rec_id text, ts text, source text, "
+            "role text, project text, content text)"
+        )
+        connection.execute("create table meta(key text primary key, value text)")
+        connection.execute(
+            "insert into docs(rec_id,ts,source,role,project,content) values(?,?,?,?,?,?)",
+            ("fast-1", "2026-07-18T08:00:00Z", "codex", "assistant", "immortal", "fast indexed memory"),
+        )
+        connection.execute("insert into meta(key,value) values('last_size','0')")
+    data = ControlData(tmp_path)
+    monkeypatch.setattr(
+        data,
+        "_iter_memories",
+        lambda: (_ for _ in ()).throw(AssertionError("jsonl scan used")),
+    )
+
+    page = data.memories({"limit": ["20"]})
+    detail = data.memory_detail("fast-1")
+
+    assert page["total"] == 1
+    assert page["items"][0]["id"] == "fast-1"
+    assert page["backend"] == "sqlite"
+    assert detail["content"] == "fast indexed memory"

@@ -148,7 +148,7 @@ def main():
     if cc.get("expiring_soon"):
         print()
         print(f"⚠️ {len(cc['expiring_soon'])} 个 CronCreate 即将过期")
-        print("  当前 Codex 版以 LaunchAgent 为主；请用 immortal-memory health 确认主链路是否正常")
+        print("  当前 Codex 版以 LaunchAgent 为主；请用 immortal.py health 确认主链路是否正常")
 
     print()
     if launchd["ok"]:

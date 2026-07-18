@@ -17,7 +17,7 @@ class VersionGovernanceTest(unittest.TestCase):
                 immortal.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(version, "0.9.0")
+        self.assertEqual(version, "1.0.0")
         self.assertIn(version, output.getvalue())
 
 

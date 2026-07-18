@@ -81,24 +81,24 @@ def bridge_metadata() -> dict[str, Any]:
         "quality_status": quality.get("status"),
         "quality_score": quality.get("score"),
         "quality_issues": quality.get("issue_count"),
-        "product_goal": product.get("one_sentence"),
         "paths": {
             "entry_md": str(ENTRY_MD),
             "latest_context_md": str(LATEST_CONTEXT_MD),
             "profile_compact": str(IMMORTAL_DIR / "profile_compact.md"),
             "profile_nuwa": str(IMMORTAL_DIR / "profile_nuwa.md"),
             "people_index": str(IMMORTAL_DIR / "people" / "people_index.md"),
-            "digest": str(IMMORTAL_DIR / "digests" / "latest.md"),
-            "product_goal": str(IMMORTAL_DIR / "product" / "goal.md"),
+            # 2026-06-14：digest/product 已停用，改注入判断力卡片盒（纠正即记忆）
+            "cards": str(IMMORTAL_DIR / "cards" / "cards.md"),
+            "cards_compact": str(IMMORTAL_DIR / "cards" / "cards_compact.md"),
         },
         "commands": {
             "health": cli_command("health", "--max-age-hours", "72"),
             "agent_context": cli_command("agent-context", "<当前任务>", "--print"),
             "recall": cli_command("recall", "<主题>"),
             "context": cli_command("context", "<当前任务>"),
+            "cards": cli_command("cards", "list"),
         },
         "local_urls": {
-            "dashboard": "http://127.0.0.1:8765/",
             "agent_entry": "http://127.0.0.1:8765/agent-entry",
             "agent_factory": "http://127.0.0.1:8765/agent-factory",
         },
