@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from export_restore import get_backup_status
+from command_hints import cli_command
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -191,7 +192,7 @@ def load_agent_entry():
     return (
         "# Immortal Agent Entry\n\n"
         "Agent 接入文件还未生成。运行：\n\n"
-        "`python3 ~/.codex/skills/immortal/immortal.py agent-entry`\n"
+        f"`{cli_command('agent-entry')}`\n"
     )
 
 
@@ -256,8 +257,8 @@ def load_feishu_metrics():
         "proposal_path": str(FEISHU_PROFILE_MERGE),
         "reviewed_path": str(REVIEWED_PROFILE_MD),
         "review_url": "http://127.0.0.1:8765/",
-        "review_command": "python3 ~/.codex/skills/immortal/immortal.py profile-auto-review",
-        "audit_command": "python3 ~/.codex/skills/immortal/immortal.py profile-review --open",
+        "review_command": cli_command("profile-auto-review"),
+        "audit_command": cli_command("profile-review", "--open"),
         "proposal_size_kb": FEISHU_PROFILE_MERGE.stat().st_size / 1024 if FEISHU_PROFILE_MERGE.exists() else 0,
         "proposal_preview": "\n".join(preview_lines),
         "reviewed_preview": reviewed_preview,
@@ -516,7 +517,7 @@ def render_quality_panel(quality: dict[str, Any]) -> str:
         status = "missing"
         score = 0
         issue_count = 0
-        recommendation = "质量层还没有生成，自动任务下一轮会补齐；也可以由 Codex 手动运行 immortal.py quality。"
+        recommendation = "质量层还没有生成，自动任务下一轮会补齐；也可以由 Codex 手动运行 immortal-memory quality。"
         issues_html = '<div class="digest-empty">暂无质量报告</div>'
         observations_html = ""
         identity_metrics = {}
@@ -584,7 +585,7 @@ def render_feedback_panel(feedback: dict[str, Any]) -> str:
             <div class="digest-head">
                 <div>
                     <h3>运行反馈</h3>
-                    <p>还没有生成反馈报告。自动任务下一轮会生成，也可以运行 immortal.py feedback。</p>
+                    <p>还没有生成反馈报告。自动任务下一轮会生成，也可以运行 immortal-memory feedback。</p>
                 </div>
                 <div class="digest-badge quality-status-missing">MISSING</div>
             </div>
@@ -638,7 +639,7 @@ def render_feedback_panel(feedback: dict[str, Any]) -> str:
             <div class="panel-header">提醒</div>
             <div class="panel-body"><ul class="digest-attention">{attention_html}</ul></div>
         </div>
-        <div class="cmd-tip">python3 ~/.codex/skills/immortal/immortal.py feedback --notify</div>
+        <div class="cmd-tip">{html.escape(cli_command('feedback', '--notify'))}</div>
     </div>
     """
 
@@ -664,6 +665,14 @@ def render_lifeline_panel(
     recent_collect = str((digest.get("summary") or {}).get("recent_collect_time_local") or last_collect)
     backup_info = backup_display(backup)
     status_text = "正常" if not errors and digest_status == "ok" and quality_status in {"ok", "attention"} and backup_info["ok"] else "需要关注"
+    doctor_command = html.escape(cli_command("doctor"))
+    health_command = html.escape(cli_command("health"))
+    export_command = html.escape(cli_command("export"))
+    restore_command = html.escape(
+        cli_command("restore-check", str(backup_info["path"] or "<export-path>"))
+    )
+    run_command = html.escape(cli_command("run"))
+    context_command = html.escape(cli_command("context", "当前任务"))
     return f"""
     <section class="lifeline-hero">
         <div>
@@ -712,12 +721,12 @@ def render_lifeline_panel(
     <div class="lifeline-actions">
         <a class="factory-action" href="#agent"><b>Agent 接入</b><code>给 Claude Code / Codex / 其他本地 Agent 的统一入口</code></a>
         <a class="factory-action" href="#factory"><b>任务上下文生成器</b><code>主看板内打开按钮式采集、清洗、短期上下文编译工作流</code></a>
-        <div><b>体检</b><code>python3 ~/.codex/skills/immortal/immortal.py doctor</code></div>
-        <div><b>新鲜度</b><code>python3 ~/.codex/skills/immortal/immortal.py health</code></div>
-        <div><b>立即备份</b><code>python3 ~/.codex/skills/immortal/immortal.py export</code></div>
-        <div><b>恢复校验</b><code>python3 ~/.codex/skills/immortal/immortal.py restore-check "{html.escape(str(backup_info['path'] or '<export-path>'))}"</code></div>
-        <div><b>立即采集</b><code>python3 ~/.codex/skills/immortal/immortal.py run</code></div>
-        <div><b>召回上下文</b><code>python3 ~/.codex/skills/immortal/immortal.py context "当前任务"</code></div>
+        <div><b>体检</b><code>{doctor_command}</code></div>
+        <div><b>新鲜度</b><code>{health_command}</code></div>
+        <div><b>立即备份</b><code>{export_command}</code></div>
+        <div><b>恢复校验</b><code>{restore_command}</code></div>
+        <div><b>立即采集</b><code>{run_command}</code></div>
+        <div><b>召回上下文</b><code>{context_command}</code></div>
     </div>
     """
 
@@ -871,11 +880,18 @@ def generate_html():
         if LATEST_AGENT_CONTEXT_FILE.exists()
         else "missing"
     )
+    agent_context_command = cli_command("agent-context", "<当前任务>", "--print")
     agent_handoff_prompt = (
         "请先读取 ~/.immortal/agent/ENTRY.md，然后针对当前任务运行："
-        "python3 ~/.codex/skills/immortal/immortal.py agent-context \"<当前任务>\" --print，"
+        f"{agent_context_command}，"
         "把返回内容作为理解用户本人的长期上下文。"
     )
+    people_command = html.escape(cli_command("people"))
+    relationships_command = html.escape(cli_command("relationships"))
+    agent_entry_command = html.escape(cli_command("agent-entry"))
+    agent_context_html_command = html.escape(cli_command("agent-context", "当前任务", "--print"))
+    recall_topic_command = html.escape(cli_command("recall", "主题"))
+    recall_keyword_command = html.escape(cli_command("recall", "你的关键词"))
 
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2732,8 +2748,8 @@ body > * {{ position: relative; z-index: 1; }}
                     <div class="feishu-path">自动识别文件：{html.escape(feishu['proposal_path'])}</div>
                     <div class="review-actions">
                         <span class="review-command">{html.escape(feishu['review_command'])}</span>
-                        <span class="review-command">python3 ~/.codex/skills/immortal/immortal.py people</span>
-                        <span class="review-command">python3 ~/.codex/skills/immortal/immortal.py relationships</span>
+                        <span class="review-command">{people_command}</span>
+                        <span class="review-command">{relationships_command}</span>
                     </div>
                     <div class="feishu-grid" style="margin:0">
                         <div class="feishu-card"><div class="k">待归因素材</div><div class="n">{feishu['candidate_memories']:,}</div></div>
@@ -2776,9 +2792,9 @@ body > * {{ position: relative; z-index: 1; }}
                 <textarea class="handoff-copy" readonly>{html.escape(agent_handoff_prompt)}</textarea>
             </div>
             <div class="agent-command-list">
-                <code>python3 ~/.codex/skills/immortal/immortal.py agent-entry</code>
-                <code>python3 ~/.codex/skills/immortal/immortal.py agent-context "当前任务" --print</code>
-                <code>python3 ~/.codex/skills/immortal/immortal.py recall "主题"</code>
+                <code>{agent_entry_command}</code>
+                <code>{agent_context_html_command}</code>
+                <code>{recall_topic_command}</code>
             </div>
         </div>
         <div class="agent-card">
@@ -2813,7 +2829,7 @@ body > * {{ position: relative; z-index: 1; }}
         <input type="text" class="search-input" id="search-input" placeholder="在记忆中搜索…（如：飞书、写作、招聘）">
     </div>
     <div class="search-hint">前端搜索基于采样数据（每日 10 条用户发言）。要全量搜索 {total:,} 条记录，请运行下方命令：</div>
-    <div class="cmd-tip">python3 ~/.codex/skills/immortal/immortal.py recall "你的关键词"</div>
+    <div class="cmd-tip">{recall_keyword_command}</div>
     <div class="search-results" id="search-results" style="margin-top:16px"></div>
 </div>
 

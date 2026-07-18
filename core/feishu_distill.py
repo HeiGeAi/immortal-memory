@@ -36,7 +36,7 @@ DEFAULT_PRIORITIES = {"high", "medium"}
 
 
 def load_owner_identity() -> tuple[list[str], str]:
-    aliases = ["用户本人", "用户本人", "Configured User", "用户本人"]
+    aliases = ["用户本人", "用户本人", "Owner", "用户本人"]
     open_id = ""
     if load_config is None:
         return aliases, open_id
@@ -70,10 +70,10 @@ TAG_RE = re.compile(r"<[^>]+>")
 
 PROJECT_TERMS = {
     "immortal": ["永生", "赛博永生", "记忆库", "digital soul", "immortal", "删库", "语料"],
-    "project_a": ["项目A", "中台", "智能体", "知识库", "某区域电商", "外部客户A"],
-    "main_account": ["用户本人AI", "主账号", "主账号", "用户本人", "用户本人"],
-    "machine0": ["账号边界A", "账号边界A"],
-    "partner_brand": ["协作账号", "协作账号", "标题 Skill", "写作工作流", "商业化稿件"],
+    "tiangong": ["业务项目A", "中台", "智能体", "知识库", "客户项目A", "客户甲"],
+    "heige_ai": ["用户本人AI", "内容账号B", "内容账号B", "用户本人", "用户本人"],
+    "machine0": ["技术账号A", "技术账号A"],
+    "xiaoshengbibi": ["内容账号A", "内容创作者A", "标题 Skill", "写作工作流", "商业化稿件"],
     "feishu": ["飞书", "多维表格", "妙记", "日程", "服务群"],
     "openclaw": ["OpenClaw", "DeskClaw", "龙虾", "Claude Code", "Codex", "Hermes"],
     "content_ops": ["小红书", "私域", "投放", "选题", "公众号", "短视频", "TGIF", "老乡鸡"],
@@ -83,20 +83,20 @@ PROJECT_TERMS = {
 STRONG_PROFILE_TERMS = [
     "用户本人",
     "用户本人",
-    "Configured User",
-    "协作账号",
-    "项目A",
-    "账号边界A",
-    "账号边界A",
+    "Owner",
+    "内容创作者A",
+    "业务项目A",
+    "技术账号A",
+    "技术账号A",
     "用户本人AI",
-    "主账号",
-    "协作账号",
+    "内容账号B",
+    "内容账号A",
     "永生",
     "记忆库",
     "赛博永生",
     "中台",
-    "某区域电商",
-    "外部客户A",
+    "客户项目A",
+    "客户甲",
     "客户",
     "合同",
     "报价",
@@ -121,7 +121,7 @@ GENERIC_DOC_TITLE_RE = re.compile(
 CORE_DOC_TITLE_RE = re.compile(
     r"(工作流|路线图|账号定位|自我介绍|知识库|总目录|"
     r"客户|合同|价格确认|工作安排|业务发展|运营规划|绩效|招聘|试用期|项目|方案|总表|"
-    r"项目A|用户本人|账号边界A|账号边界A|协作账号|协作账号|永生|记忆库|Skill)"
+    r"天宫|用户本人|技术账号A|技术账号A|内容账号A|内容创作者A|永生|记忆库|Skill)"
 )
 MEETING_TITLE_RE = re.compile(r"(会议纪要|智能纪要|文字记录|周例会|视频会议|会议记录)")
 RAW_TRANSCRIPT_TITLE_RE = re.compile(r"(文字记录|视频会议|会议记录)")
@@ -133,30 +133,30 @@ STRUCTURED_SUMMARY_TITLE_RE = re.compile(
 PEOPLE_TERMS = [
     "用户本人",
     "用户本人",
-    "Configured User",
-    "同事代理账号",
-    "协作者C",
-    "协作者C",
-    "协作账号",
-    "协作者A",
-    "协作账号",
-    "协作者L",
-    "协作者D",
-    "协作者E",
-    "协作者F",
-    "协作者G",
-    "协作者B",
-    "协作者H",
-    "错误账号",
-    "错误账号",
-    "错误账号",
-    "协作者I",
-    "协作者J",
-    "协作者K",
-    "外部客户A",
-    "协作者B",
+    "Owner",
+    "协作者庚",
+    "协作者庚",
+    "协作者庚",
+    "内容创作者A",
+    "协作者己",
+    "内容账号A",
+    "协作者戊",
+    "Collaborator D",
+    "协作者丙",
+    "协作者甲",
+    "协作者乙",
+    "协作者辛",
+    "协作者壬",
+    "协作者丑",
+    "协作者丑",
+    "协作者丑",
+    "协作者癸",
+    "协作者子",
+    "协作者寅",
+    "客户甲",
+    "协作者辛",
 ]
-MAMA_ROLE_RE = re.compile(r"@?同事代理账号\s*协作者C|@?同事代理账号")
+MAMA_ROLE_RE = re.compile(r"@?协作者庚\s*协作者庚|@?协作者庚")
 
 DECISION_TERMS = ["决定", "明确", "拍板", "采用", "选用", "不再", "转向", "统一", "收口", "替代"]
 PREFERENCE_TERMS = ["原则", "最高原则", "要求", "必须", "不要", "不能", "优先", "规范", "标准", "偏好"]
@@ -165,13 +165,13 @@ LESSON_TERMS = ["复盘", "教训", "经验", "根因", "问题", "卡点", "解
 RELATION_TERMS = ["客户", "对接", "主导", "承接", "配合", "负责人", "服务群", "售前", "交付方"]
 
 JUNK_TASK_RE = re.compile(r"^(123123|测试|写明具体任务，，|填写下一步任务，，|填写具体的执行计划，，|剪辑|来自会话：)")
-USER_ALIAS_RE = re.compile(r"(用户本人|用户本人|Configured User|用户本人)")
-BIBI_ACCOUNT_TITLE_RE = re.compile(r"(协作账号的正确使用方式|协作账号 ·|三篇Claude Code对标文章审稿报告|协作账号.*审稿|协作账号.*文风)")
+USER_ALIAS_RE = re.compile(r"(用户本人|用户本人|Owner|用户本人)")
+BIBI_ACCOUNT_TITLE_RE = re.compile(r"(内容创作者A的正确使用方式|内容账号A ·|三篇Claude Code对标文章审稿报告|内容账号A.*审稿|内容账号A.*文风)")
 BIBI_ACCOUNT_STATEMENT_RE = re.compile(
-    r"(协作账号.*(内容特色|文风|选题|标题技巧|粉丝IP)|"
+    r"(内容账号A.*(内容特色|文风|选题|标题技巧|粉丝IP)|"
     r"零门槛硬糖|强能力不再普惠|准入证逻辑|高质量评论|持续新增信息)"
 )
-THIRD_PARTY_ONLY_RE = re.compile(r"^(协作者A|协作者D|协作者E|协作者F|协作者G|协作者B|协作者H|错误账号|协作者I|协作者J|协作者K|外部客户A|协作者B)(认为|指出|建议|表示|介绍)")
+THIRD_PARTY_ONLY_RE = re.compile(r"^(协作者己|Collaborator D|协作者丙|协作者甲|协作者乙|协作者辛|协作者壬|协作者丑|协作者癸|协作者子|协作者寅|客户甲|协作者辛)(认为|指出|建议|表示|介绍)")
 CANDIDATE_RESUME_RE = re.compile(r"(面试|候选人|曾在.*实习|工作\d+个?月|空窗|转正时被要求|全员被开|离职)")
 INSTRUCTIONAL_TOOL_RE = re.compile(r"(安装|卸载|配置|官方文档|使用教程|工作可视化工具使用讨论|Claude及相关工具展开交流)")
 FIRST_PERSON_VIEW_RE = re.compile(
@@ -179,11 +179,11 @@ FIRST_PERSON_VIEW_RE = re.compile(
     r"对我来说|刚到公司的下午|我的工作模式|我的脑子|我的决策资源|这会.*我的注意力)"
 )
 USER_ATTRIBUTION_RE = re.compile(
-    r"(用户本人|用户本人|Configured User|用户本人)(?:[：:，,、\s]*(?:明确|曾经|曾|也|再次|已|将会|会)?[：:，,、\s]*)"
+    r"(用户本人|用户本人|Owner|用户本人)(?:[：:，,、\s]*(?:明确|曾经|曾|也|再次|已|将会|会)?[：:，,、\s]*)"
     r"(提出|认为|表示|反馈|要求|决定|建议|负责|主导|优先|确认|需要|希望|准备|配置|使用)"
 )
 USER_DURABLE_REMINDER_RE = re.compile(
-    r"(用户本人|用户本人|Configured User|用户本人)(?:[：:，,、\s]*(?:明确|也|再次)?[：:，,、\s]*)提醒"
+    r"(用户本人|用户本人|Owner|用户本人)(?:[：:，,、\s]*(?:明确|也|再次)?[：:，,、\s]*)提醒"
     r".{0,80}(独立思考|不能完全依赖|风险|注意|别|不要|必须|建议|原则|规范|安全|数据|隐私|灰色|合规)"
 )
 USER_PERSPECTIVE_TOPIC_RE = re.compile(
@@ -191,29 +191,29 @@ USER_PERSPECTIVE_TOPIC_RE = re.compile(
     r"需求|偏好|目标|负责|主导|优先|策略|转型|报价|合同|收费|招聘|中台|Skill|skill)"
 )
 EXTERNAL_FACT_RE = re.compile(
-    r"((用户本人|用户本人|Configured User|用户本人).{0,8}介绍.{0,80}(要求|指标|级别|代理|ARR|保证金|考试|官方|政策|规则)|"
+    r"((用户本人|用户本人|Owner|用户本人).{0,8}介绍.{0,80}(要求|指标|级别|代理|ARR|保证金|考试|官方|政策|规则)|"
     r"指标要求：.{0,120}(ARR|保证金|考试|销售负责业务线))",
     re.I,
 )
 ONE_OFF_COORDINATION_RE = re.compile(
-    r"(用户本人|用户本人|Configured User|用户本人).{0,8}(提醒|让|叫|通知|安排).{0,40}"
-    r"(协作者D|协作者E|协作者F|协作者G|协作者B|协作者H|错误账号|协作者I|协作者J|协作者K).{0,80}"
+    r"(用户本人|用户本人|Owner|用户本人).{0,8}(提醒|让|叫|通知|安排).{0,40}"
+    r"(Collaborator D|协作者丙|协作者甲|协作者乙|协作者辛|协作者壬|协作者丑|协作者癸|协作者子|协作者寅).{0,80}"
     r"(查看|购买|处理|发|拉|上传|下载|开通|续费|确认)"
 )
 MEETING_INTRO_SUMMARY_RE = re.compile(r"^(本次会议|本章节|本段|会议主要|本章节主要|本次讨论)")
 SELF_STATEMENT_RE = re.compile(
     r"(我叫|我是|我的|我现在|我一开始|我准备|我希望|我认为|我担心|我的需求|我的工作|"
-    r"对我来说|适合我|Configured User\s*徐|用户本人.*(需求|偏好|原则|目标|工作|项目|调整|查看|负责|跟进|推进|确认)|"
+    r"对我来说|适合我|Owner\s*徐|用户本人.*(需求|偏好|原则|目标|工作|项目|调整|查看|负责|跟进|推进|确认)|"
     r"用户本人.*(需求|偏好|原则|目标|工作|项目|负责|跟进|推进|确认))",
     re.I,
 )
 CURRENT_PROJECT_RE = re.compile(
-    r"(永生|赛博永生|记忆库|digital soul|Mac mini|Codex|Claude Code|中台|项目A|"
-    r"某区域电商|外部客户A|客户|合同|报价|交付|飞书机器人)",
+    r"(永生|赛博永生|记忆库|digital soul|Mac mini|Codex|Claude Code|中台|业务项目A|"
+    r"客户项目A|客户甲|客户|合同|报价|交付|飞书机器人)",
     re.I,
 )
 COMPANY_CONTEXT_RE = re.compile(
-    r"(协作账号|协作账号|账号边界A|账号边界A|用户本人AI|主账号|主账号|账号定位|商务|绩效|"
+    r"(内容账号A|内容创作者A|技术账号A|技术账号A|用户本人AI|内容账号B|内容账号B|账号定位|商务|绩效|"
     r"招聘|写作工作流|标题 Skill|内容SOP|私域|公众号|小红书|商业化|业务|产品|收入|团队|公司)",
     re.I,
 )
@@ -278,7 +278,7 @@ def clean_markup(text: str) -> str:
 def owner_alias_pattern() -> re.Pattern:
     parts = [re.escape(alias) for alias in OWNER_ALIASES if alias]
     if not parts:
-        parts = [r"用户本人", r"用户本人", r"Configured User", r"用户本人"]
+        parts = [r"用户本人", r"用户本人", r"Owner", r"用户本人"]
     return re.compile("|".join(parts), re.I)
 
 
@@ -321,7 +321,7 @@ def owner_marker_near_statement(raw_text: str, statement: str, *, window: int = 
     if not owner_markers:
         return False
     owner_re = re.compile("|".join(owner_markers), re.I)
-    speaker_re = re.compile(r"(说话人\s*\d+|协作者D|协作者E|协作者F|协作者G|协作者B|协作者B|错误账号|协作者I|协作者J|协作者K|外部客户A|协作者C|协作者C)")
+    speaker_re = re.compile(r"(说话人\s*\d+|Collaborator D|协作者丙|协作者甲|协作者乙|协作者辛|协作者辛|协作者丑|协作者癸|协作者子|协作者寅|客户甲|协作者庚|协作者庚)")
     owner_hits = list(owner_re.finditer(before))
     if not owner_hits:
         return False
@@ -413,7 +413,7 @@ def find_people(text: str) -> list[str]:
     found = []
     has_mama_role = bool(MAMA_ROLE_RE.search(text))
     for name in PEOPLE_TERMS:
-        if name in {"协作账号", "协作账号"} and has_mama_role and name not in text.replace("同事代理账号", ""):
+        if name in {"内容创作者A", "内容账号A"} and has_mama_role and name not in text.replace("协作者庚", ""):
             continue
         if name in text:
             found.append(name)
@@ -424,7 +424,7 @@ def has_commitment_signal(text: str) -> bool:
     if re.search(r"(\[ \]|待办|todo|下周|本周|明天|后续|尽快|截止|deadline)", text, re.I):
         return True
     if re.search(r"(跟进|推进|配合|负责|完成|提交|交付|对齐|整理|提供|拉建|注册|宣贯)", text) and re.search(
-        r"(用户本人|用户本人|协作账号|协作者L|协作者D|协作者E|协作者F|协作者G|协作者B|客户|外部客户A|本周|下周|明天|后续)",
+        r"(用户本人|用户本人|内容创作者A|协作者戊|Collaborator D|协作者丙|协作者甲|协作者乙|协作者辛|客户|客户甲|本周|下周|明天|后续)",
         text,
     ):
         return True
@@ -644,11 +644,11 @@ def profile_review_exclusion_reason_from_parts(
     if ONE_OFF_COORDINATION_RE.search(statement or "") and not user_perspective:
         return "one_off_coordination_not_profile"
     if BIBI_ACCOUNT_TITLE_RE.search(title or "") and not user_perspective:
-        return "partner_account_specific"
+        return "bibi_account_specific"
     if BIBI_ACCOUNT_STATEMENT_RE.search(statement or "") and not user_perspective:
-        return "partner_account_specific"
-    if ("partner_brand" in projects or "协作账号" in people) and not user_perspective:
-        return "partner_account_specific"
+        return "bibi_account_specific"
+    if ("xiaoshengbibi" in projects or "内容创作者A" in people) and not user_perspective:
+        return "bibi_account_specific"
     if THIRD_PARTY_ONLY_RE.search(statement or "") and not user_perspective:
         return "third_party_view_not_about_user"
     if CANDIDATE_RESUME_RE.search(haystack) and not user_perspective:
@@ -663,12 +663,12 @@ def is_user_perspective_statement(
     statement: str,
     attribution: dict[str, Any] | None = None,
 ) -> bool:
-    """Return True when the statement records Configured User's own view, words, or durable working rule.
+    """Return True when the statement records Owner's own view, words, or durable working rule.
 
-    Source titles are weak evidence. A document about 协作账号 can still contain
-    first-person writing from 协作账号, while a generic report can mention 协作账号
-    without being Configured User's perspective. Require explicit Configured User attribution for
-    协作账号 account materials.
+    Source titles are weak evidence. A document about 内容创作者A can still contain
+    first-person writing from 内容创作者A, while a generic report can mention 内容创作者A
+    without being Owner's perspective. Require explicit Owner attribution for
+    内容创作者A account materials.
     """
     attribution_category = (attribution or {}).get("category", "")
     if attribution_category == "self_direct":
@@ -1268,7 +1268,7 @@ Generated: {coverage["generated_at"]}
 - This layer is review-only.
 - It does not write `digital-soul.md`.
 - Secret-looking content is redacted, marked `secret`, and skipped from main output unless `--include-secrets` is set.
-- The profile merge proposal is filtered for 用户本人/用户本人 long-term memory. 协作账号账号资料、旁人观点、候选人履历、工具安装说明和一次性资料会被降到非审阅层。
+- The profile merge proposal is filtered for 用户本人/用户本人 long-term memory. 内容创作者A账号资料、旁人观点、候选人履历、工具安装说明和一次性资料会被降到非审阅层。
 """
 
 

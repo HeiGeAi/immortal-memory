@@ -110,18 +110,24 @@ def compact(text: Any, limit: int = 120) -> str:
 
 
 def redact(text: str) -> str:
-    patterns = [
-        (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-        (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(apikey\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"(?i)(密码\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    return text
+    """统一走 redact_common（单一真源，覆盖 ghp_/AKIA/gk_live_/JWT/URL 内嵌凭证）。
+    导入失败时回退内联硬化集，绝不裸奔。"""
+    try:
+        from redact_common import redact as _r
+        return _r(text)
+    except Exception:
+        patterns = [
+            (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+            (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
+            (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+            (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+            (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+        ]
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text)
+        return text
 
 
 def top_prefixed(counters: dict[str, Any], prefix: str, limit: int = 8) -> list[dict[str, Any]]:

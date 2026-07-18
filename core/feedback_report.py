@@ -60,31 +60,80 @@ def top_issue_line(issue: dict[str, Any]) -> str:
     return f"{prefix}{title}: {detail}" if detail else f"{prefix}{title}"
 
 
+FRESHNESS_LIMIT_HOURS = 48
+
+
+def input_age_hours(value: Any) -> float | None:
+    dt = parse_iso(str(value)) if value else None
+    if not dt:
+        return None
+    return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600
+
+
 def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
-    digest_path = vault / "digests" / "latest.json"
+    """直接读活数据源：orchestrator state、quality latest、feishu state。
+
+    不再依赖已停用的 digests/latest.json——它自 2026-06-14 起不再刷新，
+    沿用它会把一个月前的旧错误当成今天的告警（审计 P2-4）。
+    每个输入都做新鲜度检查，超龄输入标记 stale 且不沿用其中的错误。
+    """
     state_path = vault / "orchestrator_state.json"
-    digest = read_json(digest_path, {})
+    quality_path = vault / "quality" / "latest.json"
+    feishu_state_path = vault / "feishu" / "state.json"
     state = read_json(state_path, {})
-    summary = digest.get("summary") if isinstance(digest.get("summary"), dict) else {}
-    feishu = digest.get("feishu") if isinstance(digest.get("feishu"), dict) else {}
-    quality = digest.get("quality") if isinstance(digest.get("quality"), dict) else {}
-    errors = digest.get("errors") if isinstance(digest.get("errors"), dict) else {}
-    people = digest.get("people") if isinstance(digest.get("people"), dict) else {}
+    quality = read_json(quality_path, {})
+    feishu_state = read_json(feishu_state_path, {})
+    people = read_json(vault / "people" / "people_index.json", {})
+
+    stale_inputs: list[str] = []
+
+    quality_age = input_age_hours(quality.get("generated_at"))
+    quality_fresh = quality_age is not None and quality_age <= FRESHNESS_LIMIT_HOURS
+    if not quality_fresh:
+        stale_inputs.append(f"quality ({quality_age:.0f}h ago)" if quality_age else "quality (missing)")
+        quality = {}
+
+    feishu_age = input_age_hours(feishu_state.get("last_run_at"))
+    feishu_fresh = feishu_age is not None and feishu_age <= FRESHNESS_LIMIT_HOURS
+    feishu_errors = feishu_state.get("last_errors") if isinstance(feishu_state.get("last_errors"), list) else []
+    if not feishu_fresh:
+        stale_inputs.append(f"feishu ({feishu_age:.0f}h ago)" if feishu_age else "feishu (missing)")
+        feishu_errors = []
+
+    summary = {
+        "recent_collect_time": state.get("last_collect"),
+        "recent_collect_time_local": local_time(state.get("last_collect")),
+        "total_records": state.get("total_records"),
+        "new_records": state.get("last_run_new_records"),
+        "feishu_new_records": state.get("last_run_feishu_new_records"),
+        "collect_count": state.get("collect_count"),
+    }
+    feishu = {
+        "last_collect": state.get("last_feishu_collect"),
+        "last_status": state.get("last_feishu_status"),
+        "last_clean": state.get("last_feishu_clean"),
+        "last_distill": state.get("last_feishu_distill"),
+        "source_errors": len(feishu_errors),
+    }
 
     issue_count = int_value(quality.get("issue_count"))
     quality_status = str(quality.get("status") or "missing")
-    error_status = str(errors.get("status") or "missing")
-    current_errors = errors.get("current") if isinstance(errors.get("current"), list) else []
+    current_errors = state.get("errors") if isinstance(state.get("errors"), list) else []
     top_issues = quality.get("top_issues") if isinstance(quality.get("top_issues"), list) else []
-    attention = digest.get("attention") if isinstance(digest.get("attention"), list) else []
+    attention = list(stale_inputs)
+    if feishu_errors:
+        attention.append(f"feishu 源级错误 {len(feishu_errors)} 个（见 feishu/state.json last_errors）")
 
-    if run_status is not None and run_status != 0:
+    if run_status is not None and run_status not in (0, 2):
         status = "failed"
         status_label = "运行失败"
-    elif current_errors or error_status not in {"ok", "missing"}:
+    elif current_errors:
         status = "failed"
         status_label = "存在错误"
-    elif quality_status == "attention" or issue_count > 0:
+    elif run_status == 2 or feishu_errors or str(state.get("last_feishu_status") or "") == "partial":
+        status = "partial"
+        status_label = "部分成功"
+    elif quality_status == "attention" or issue_count > 0 or stale_inputs:
         status = "attention"
         status_label = "需要关注"
     else:
@@ -109,7 +158,7 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
         "status_label": status_label,
         "run_status": run_status,
         "summary": {
-            "generated_at": digest.get("generated_at"),
+            "generated_at": now_local().isoformat(timespec="seconds"),
             "recent_collect_time": summary.get("recent_collect_time"),
             "recent_collect_time_local": summary.get("recent_collect_time_local"),
             "total_records": int_value(summary.get("total_records")),
@@ -118,12 +167,13 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
             "collect_count": int_value(summary.get("collect_count")),
         },
         "feishu": {
-            "last_collect": feishu.get("last_collect") or state.get("last_feishu_collect"),
-            "last_clean": (feishu.get("clean") or {}).get("generated_at") if isinstance(feishu.get("clean"), dict) else None,
-            "last_distill": (feishu.get("distilled") or {}).get("generated_at") if isinstance(feishu.get("distilled"), dict) else None,
-            "clean_records": int_value((feishu.get("clean") or {}).get("clean_records") if isinstance(feishu.get("clean"), dict) else None),
-            "distilled_memories": int_value((feishu.get("distilled") or {}).get("memories") if isinstance(feishu.get("distilled"), dict) else None),
+            "last_collect": feishu.get("last_collect"),
+            "last_status": feishu.get("last_status"),
+            "last_clean": feishu.get("last_clean"),
+            "last_distill": feishu.get("last_distill"),
+            "source_errors": int_value(feishu.get("source_errors")),
         },
+        "stale_inputs": stale_inputs,
         "quality": {
             "status": quality_status,
             "status_label": str(quality.get("status_label") or status_label),
@@ -133,9 +183,9 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
             "recommendation": str(quality.get("recommendation") or ""),
         },
         "errors": {
-            "status": error_status,
+            "status": "error" if current_errors else "ok",
             "current": current_errors[:8],
-            "recent_log_warnings": (errors.get("recent_log_warnings") or [])[:5],
+            "recent_log_warnings": [],
         },
         "people": {
             "count": int_value(people.get("count")),
@@ -143,10 +193,9 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
         },
         "attention": [str(item) for item in attention[:8]],
         "paths": {
-            "digest_md": str(vault / "digests" / "latest.md"),
-            "dashboard": str(vault / "dashboard.html"),
-            "timeline": str(vault / "timeline.html"),
             "quality_json": str(vault / "quality" / "latest.json"),
+            "feishu_state": str(vault / "feishu" / "state.json"),
+            "feedback_md": str(vault / "feedback" / "latest.md"),
         },
     }
     return report
@@ -174,9 +223,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         "## 自动化链路",
         f"- 最近采集：{local_time(summary.get('recent_collect_time') or summary.get('recent_collect_time_local'))}",
         f"- 采集次数：{summary['collect_count']:,}",
-        f"- 飞书最近采集：{local_time(feishu.get('last_collect'))}",
-        f"- 飞书 Clean：{local_time(feishu.get('last_clean'))}；clean records {feishu['clean_records']:,}",
-        f"- 飞书 Distill：{local_time(feishu.get('last_distill'))}；distilled memories {feishu['distilled_memories']:,}",
+        f"- 飞书最近采集：{local_time(feishu.get('last_collect'))}（{feishu.get('last_status') or 'unknown'}；源级错误 {int(feishu.get('source_errors') or 0)} 个）",
+        f"- 飞书 Clean：{local_time(feishu.get('last_clean'))}",
+        f"- 飞书 Distill：{local_time(feishu.get('last_distill'))}",
         "",
         "## 质量关注",
     ]
@@ -209,10 +258,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         [
             "",
             "## 文件",
-            f"- Digest：{report['paths']['digest_md']}",
-            f"- Dashboard：{report['paths']['dashboard']}",
-            f"- Timeline：{report['paths']['timeline']}",
             f"- Quality：{report['paths']['quality_json']}",
+            f"- Feishu state：{report['paths']['feishu_state']}",
+            f"- Feedback：{report['paths']['feedback_md']}",
             "",
         ]
     )
@@ -270,9 +318,11 @@ def main() -> int:
     history_md.write_text(markdown, encoding="utf-8")
 
     notification_status = "skipped"
+    notification_failed = False
     if args.notify:
         ok, detail = send_notification(report)
         notification_status = detail if ok else f"failed: {detail}"
+        notification_failed = not ok
 
     print("Immortal feedback report")
     print(f"Status: {report['status_label']}")
@@ -282,6 +332,11 @@ def main() -> int:
     if args.print:
         print()
         print(markdown)
+    # 统一退出码：0=success，1=failed，2=partial。报告失败或必需通知未送达都不允许假绿
+    if report["status"] == "failed" or notification_failed:
+        return 1
+    if report["status"] == "partial":
+        return 2
     return 0
 
 

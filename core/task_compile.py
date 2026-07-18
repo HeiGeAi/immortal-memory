@@ -171,7 +171,17 @@ def command_compile(args: argparse.Namespace) -> int:
     ]
     if args.with_recall:
         cmd.append("--with-recall")
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SKILL_DIR), timeout=args.timeout + 30)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(SKILL_DIR), timeout=args.timeout + 30)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.output.decode("utf-8", "replace") if isinstance(exc.output, bytes) else (exc.output or "")
+        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        result = subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout=stdout,
+            stderr=(stderr + f"\ncontext bridge timed out after {args.timeout + 30}s").strip(),
+        )
 
     owner = owner_display_name()
     context_text = context_path.read_text(encoding="utf-8", errors="ignore") if context_path.exists() else ""

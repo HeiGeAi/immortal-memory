@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -27,6 +28,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
+from control_center import ControlCenter
+from control_center_ui import control_center_page_html
+from control_data import ControlData
+from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
+from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
+from process_utils import run_process
+
 
 HOME = Path.home()
 SKILL_DIR = Path(__file__).resolve().parent
@@ -40,6 +48,7 @@ DEFAULT_DASHBOARD = IMMORTAL_DIR / "dashboard.html"
 DEFAULT_TIMELINE = IMMORTAL_DIR / "timeline.html"
 DEFAULT_SESSIONS_DIR = IMMORTAL_DIR / "sessions"
 DEFAULT_AGENT_ENTRY = IMMORTAL_DIR / "agent" / "ENTRY.md"
+DEFAULT_CONTROL_JOBS = IMMORTAL_DIR / "runtime" / "control_jobs.json"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 MEMORY_ID_RE = re.compile(r"`([a-f0-9]{24})`")
 CHECK_LINE_RE = re.compile(r"^-\s*\[([ xX])\]\s+`([a-f0-9]{24})`")
@@ -180,13 +189,26 @@ def file_mtime(path: Path) -> str:
 
 
 class ReviewStore:
-    def __init__(self, proposal: Path, memories: Path, reviewed: Path, review_state: Path) -> None:
+    def __init__(
+        self,
+        proposal: Path,
+        memories: Path,
+        reviewed: Path,
+        review_state: Path,
+        *,
+        audit_path: Path | None = None,
+    ) -> None:
         self.proposal = proposal
         self.memories = memories
         self.reviewed = reviewed
         self.review_state = review_state
+        if audit_path is None:
+            vault = review_state.parent.parent if review_state.parent.name == "reviewed" else review_state.parent
+            audit_path = vault / "runtime" / "profile_actions.jsonl"
+        self.audit_path = Path(audit_path)
+        self.audit_lock = threading.Lock()
 
-    def build_state(self) -> dict[str, Any]:
+    def _candidate_rows(self) -> list[dict[str, Any]]:
         proposal_ids, checked_ids = parse_proposal(self.proposal)
         memory_rows = load_jsonl(self.memories)
         reviewed_rows = load_jsonl(self.reviewed)
@@ -231,18 +253,127 @@ class ReviewStore:
                 }
             )
 
-        counts = {
+        return candidates
+
+    @staticmethod
+    def _counts(candidates: list[dict[str, Any]]) -> dict[str, int]:
+        return {
             "total": len(candidates),
             "pending": sum(1 for item in candidates if item["review_state"] == "pending"),
             "selected": sum(1 for item in candidates if item["review_state"] == "selected"),
             "rejected": sum(1 for item in candidates if item["review_state"] == "rejected"),
             "merged": sum(1 for item in candidates if item["review_state"] == "merged"),
-            "reviewed_total": len(reviewed_ids),
-            "all_profile_memories": len(memory_rows),
+        }
+
+    @staticmethod
+    def _list_item(row: dict[str, Any]) -> dict[str, Any]:
+        confidential = row.get("sensitivity") == "confidential"
+        item = {
+            key: value
+            for key, value in row.items()
+            if key not in {"evidence", "source_url"}
+        }
+        item["masked"] = confidential
+        if confidential:
+            item["statement"] = ""
+            item["summary"] = "敏感内容，按需查看"
+            item["source_title"] = "敏感来源"
+        return item
+
+    def list_candidates(
+        self,
+        *,
+        limit: int = 20,
+        offset: int = 0,
+        review_state: str = "",
+        focus: str = "",
+        memory_type: str = "",
+        sensitivity: str = "",
+        query: str = "",
+        sort: str = "priority",
+    ) -> dict[str, Any]:
+        safe_limit = min(50, max(1, int(limit)))
+        safe_offset = max(0, int(offset))
+        rows = self._candidate_rows()
+        counts = self._counts(rows)
+        needle = str(query or "").strip().casefold()
+        filtered = []
+        for row in rows:
+            if review_state and row["review_state"] != review_state:
+                continue
+            if focus and row["focus"] != focus:
+                continue
+            if memory_type and row["memory_type"] != memory_type:
+                continue
+            if sensitivity and row["sensitivity"] != sensitivity:
+                continue
+            if needle and needle not in " ".join(
+                (
+                    str(row.get("statement") or ""),
+                    str(row.get("evidence") or ""),
+                    str(row.get("source_title") or ""),
+                    " ".join(row.get("projects") or []),
+                    " ".join(row.get("people") or []),
+                )
+            ).casefold():
+                continue
+            filtered.append(row)
+        if sort == "confidence":
+            filtered.sort(key=lambda item: (float(item["confidence"]), item["id"]), reverse=True)
+        elif sort == "relevance":
+            filtered.sort(key=lambda item: (float(item["relevance_score"]), item["id"]), reverse=True)
+        elif sort == "date":
+            filtered.sort(key=lambda item: (item["valid_from"], item["id"]), reverse=True)
+        else:
+            rank = {"selected": 0, "pending": 1, "rejected": 2, "merged": 3}
+            filtered.sort(
+                key=lambda item: (
+                    rank.get(item["review_state"], 9),
+                    -float(item["relevance_score"]),
+                    -float(item["confidence"]),
+                    item["id"],
+                )
+            )
+        return {
+            "items": [
+                self._list_item(row)
+                for row in filtered[safe_offset : safe_offset + safe_limit]
+            ],
+            "total": len(filtered),
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "has_more": safe_offset + safe_limit < len(filtered),
+            "counts": counts,
+        }
+
+    def candidate_detail(self, memory_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-f0-9]{24}", str(memory_id or "")):
+            raise ValueError("invalid memory id")
+        row = next((item for item in self._candidate_rows() if item["id"] == memory_id), None)
+        if not row:
+            raise KeyError("candidate not found")
+        return {**row, "masked": False}
+
+    def build_state(self) -> dict[str, Any]:
+        page = self.list_candidates(limit=50, offset=0)
+        all_memories = load_jsonl(self.memories)
+        reviewed_rows = load_jsonl(self.reviewed)
+        counts = {
+            **page["counts"],
+            "reviewed_total": len(
+                {row.get("memory_id") for row in reviewed_rows if row.get("memory_id")}
+            ),
+            "all_profile_memories": len(all_memories),
         }
         return {
             "counts": counts,
-            "candidates": candidates,
+            "candidates": page["items"],
+            "pagination": {
+                "total": page["total"],
+                "offset": page["offset"],
+                "limit": page["limit"],
+                "has_more": page["has_more"],
+            },
             "paths": {
                 "proposal": str(self.proposal),
                 "profile_memories": str(self.memories),
@@ -256,6 +387,27 @@ class ReviewStore:
                 "review_state": file_mtime(self.review_state),
             },
         }
+
+    def _audit_action(
+        self,
+        action: str,
+        target_id: str,
+        *,
+        result: str,
+        recoverable: bool,
+    ) -> None:
+        event = {
+            "at": now_local(),
+            "action": action,
+            "target_id": target_id,
+            "result": result,
+            "recoverable": recoverable,
+        }
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.audit_lock:
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            self.audit_path.chmod(0o600)
 
     def update_review(self, memory_id: str, action: str) -> dict[str, Any]:
         if not re.fullmatch(r"[a-f0-9]{24}", memory_id):
@@ -285,6 +437,17 @@ class ReviewStore:
             raise ValueError("unknown action")
 
         save_review_state(self.review_state, state)
+        canonical_action = {
+            "select": "approve",
+            "unselect": "unapprove",
+            "pending": "unapprove",
+        }.get(action, action)
+        self._audit_action(
+            canonical_action,
+            memory_id,
+            result="ok",
+            recoverable=True,
+        )
         return self.build_state()
 
     def merge(self) -> dict[str, Any]:
@@ -293,20 +456,27 @@ class ReviewStore:
         profile_cmd = [sys.executable, str(SKILL_DIR / "profile.py")]
         merge = subprocess.run(merge_cmd, capture_output=True, text=True, timeout=120)
         if merge.returncode != 0:
+            self._audit_action("merge", "selected", result="failed", recoverable=True)
             return {
                 "ok": False,
                 "step": "profile_merge",
                 "returncode": merge.returncode,
-                "stdout": merge.stdout,
-                "stderr": merge.stderr,
+                "stdout": sanitize_job_output(merge.stdout),
+                "stderr": sanitize_job_output(merge.stderr),
             }
         profile = subprocess.run(profile_cmd, capture_output=True, text=True, timeout=180)
+        self._audit_action(
+            "merge",
+            "selected",
+            result="ok" if profile.returncode == 0 else "failed",
+            recoverable=True,
+        )
         return {
             "ok": profile.returncode == 0,
             "step": "profile",
             "returncode": profile.returncode,
-            "stdout": (merge.stdout + "\n" + profile.stdout).strip(),
-            "stderr": (merge.stderr + "\n" + profile.stderr).strip(),
+            "stdout": sanitize_job_output((merge.stdout + "\n" + profile.stdout).strip()),
+            "stderr": sanitize_job_output((merge.stderr + "\n" + profile.stderr).strip()),
             "elapsed_seconds": round(time.time() - started, 2),
             "state": self.build_state(),
         }
@@ -367,9 +537,46 @@ def session_summary(path: Path) -> dict[str, Any]:
 
 
 class FactoryStore:
-    def __init__(self) -> None:
-        self.jobs: dict[str, dict[str, Any]] = {}
+    def __init__(
+        self,
+        history_path: Path = DEFAULT_CONTROL_JOBS,
+        *,
+        immortal_dir: Path = IMMORTAL_DIR,
+        skill_dir: Path = SKILL_DIR,
+        runner: Any = run_process,
+    ) -> None:
+        self.history_path = Path(history_path)
+        self.immortal_dir = Path(immortal_dir)
+        self.skill_dir = Path(skill_dir)
+        self.runner = runner
         self.lock = threading.Lock()
+        saved = read_json(self.history_path, [])
+        saved_jobs = saved if isinstance(saved, list) else []
+        self.jobs: dict[str, dict[str, Any]] = {
+            str(item["id"]): item
+            for item in saved_jobs
+            if isinstance(item, dict) and item.get("id")
+        }
+        interrupted = False
+        for job in self.jobs.values():
+            if job.get("status") in {"queued", "running", "cancel_requested"}:
+                job["status"] = "interrupted"
+                job["error_code"] = "service_restarted"
+                job["error"] = "控制中心服务重启，任务结果无法继续确认"
+                job["finished_at"] = now_local()
+                interrupted = True
+        if interrupted:
+            with self.lock:
+                self._persist_locked()
+
+    def _persist_locked(self) -> None:
+        jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        write_json_atomic(self.history_path, jobs[:JOB_HISTORY_LIMIT])
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self.lock:
+            jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+            return [dict(item) for item in jobs[:JOB_HISTORY_LIMIT]]
 
     def snapshot(self) -> dict[str, Any]:
         state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
@@ -437,6 +644,20 @@ class FactoryStore:
 
     def start_job(self, kind: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         body = body or {}
+        if kind not in {
+            "collect",
+            "clean",
+            "full",
+            "role",
+            "session",
+            "health",
+            "run",
+            "backup_verify",
+            "profile_refresh",
+        }:
+            raise ValueError("unknown factory job kind")
+        if kind in {"run", "collect", "full"} and self._orchestrator_is_active():
+            raise JobConflict("Immortal 编排器已经运行")
         job_id = uuid.uuid4().hex[:12]
         job = {
             "id": job_id,
@@ -452,9 +673,12 @@ class FactoryStore:
             "commands": [],
             "summary": "",
             "error": "",
+            "error_code": "",
+            "body": dict(body),
         }
         with self.lock:
             self.jobs[job_id] = job
+            self._persist_locked()
         thread = threading.Thread(target=self._run_job, args=(job_id, kind, body), daemon=True)
         thread.start()
         return job
@@ -468,6 +692,7 @@ class FactoryStore:
         with self.lock:
             if job_id in self.jobs:
                 self.jobs[job_id].update(updates)
+                self._persist_locked()
 
     def _append_output(self, job_id: str, stdout: str = "", stderr: str = "") -> None:
         with self.lock:
@@ -475,12 +700,14 @@ class FactoryStore:
             if not job:
                 return
             if stdout:
-                job["stdout"] = (str(job.get("stdout") or "") + stdout)[-50000:]
+                job["stdout"] = sanitize_job_output(str(job.get("stdout") or "") + stdout)
             if stderr:
-                job["stderr"] = (str(job.get("stderr") or "") + stderr)[-50000:]
+                job["stderr"] = sanitize_job_output(str(job.get("stderr") or "") + stderr)
+            self._persist_locked()
 
     def _run_job(self, job_id: str, kind: str, body: dict[str, Any]) -> None:
         started = time.time()
+        before_run = run_evidence_marker(self.immortal_dir / "runtime" / "current_run.json")
         self._update_job(job_id, status="running", started_at=now_local())
         try:
             commands = self._commands_for(kind, body)
@@ -488,21 +715,56 @@ class FactoryStore:
             last_code = 0
             attention = False
             for cmd, timeout in commands:
+                current = self.get_job(job_id) or {}
+                if current.get("status") == "cancel_requested":
+                    self._update_job(
+                        job_id,
+                        status="canceled",
+                        error_code="canceled_at_safe_boundary",
+                        summary="任务已在安全阶段边界停止。",
+                    )
+                    return
                 self._append_output(job_id, stdout=f"$ {self._display_cmd(cmd)}\n")
-                result = subprocess.run(
+                result = self.runner(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    cwd=str(SKILL_DIR),
+                    cwd=str(self.skill_dir),
+                    env={
+                        **os.environ,
+                        "IMMORTAL_TRIGGER": "control_center",
+                        "IMMORTAL_CONTROL_JOB_ID": job_id,
+                    },
                 )
                 last_code = result.returncode
                 self._append_output(job_id, stdout=result.stdout, stderr=result.stderr)
+                current = self.get_job(job_id) or {}
+                if current.get("status") == "cancel_requested":
+                    self._update_job(
+                        job_id,
+                        status="canceled",
+                        error_code="canceled_at_safe_boundary",
+                        summary="任务已在安全阶段边界停止。",
+                        returncode=last_code,
+                    )
+                    return
                 if result.returncode != 0:
                     if result.returncode == 2 and any(part in {"profile-nuwa", "role-distill", "agent-build", "task-compile", "agent-session"} for part in cmd):
                         attention = True
                         continue
                     raise RuntimeError(f"command failed with code {result.returncode}: {self._display_cmd(cmd)}")
+            if kind in {"run", "collect", "full"}:
+                after_run = run_evidence_marker(self.immortal_dir / "runtime" / "current_run.json")
+                if not after_run or after_run == before_run or after_run[3] != "success":
+                    self._update_job(
+                        job_id,
+                        status="failed",
+                        error_code="run_not_observed",
+                        error="命令已退出，但没有观察到新的成功运行证据",
+                        returncode=last_code,
+                    )
+                    return
             self._update_job(
                 job_id,
                 status="attention" if attention else "success",
@@ -510,13 +772,20 @@ class FactoryStore:
                 summary=self._success_summary(kind, body),
             )
         except Exception as exc:
-            self._update_job(job_id, status="failed", error=str(exc), returncode=1)
+            self._update_job(
+                job_id,
+                status="failed",
+                error_code="command_failed",
+                error=sanitize_job_output(str(exc)),
+                returncode=1,
+            )
         finally:
             self._update_job(job_id, finished_at=now_local(), elapsed_seconds=round(time.time() - started, 2))
+            self._cancel_marker(job_id).unlink(missing_ok=True)
 
     def _commands_for(self, kind: str, body: dict[str, Any]) -> list[tuple[list[str], int]]:
         python = sys.executable
-        immortal = str(SKILL_DIR / "immortal.py")
+        immortal = str(self.skill_dir / "immortal.py")
         if kind == "collect":
             return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
         if kind == "clean":
@@ -530,7 +799,7 @@ class FactoryStore:
                 ([python, immortal, "relationships"], COMMAND_TIMEOUTS["relationships"]),
                 ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
                 ([python, immortal, "digest"], COMMAND_TIMEOUTS["digest"]),
-                ([python, str(SKILL_DIR / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
+                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind == "full":
             goal = str(body.get("goal") or "当前任务").strip()[:120]
@@ -540,7 +809,7 @@ class FactoryStore:
             return [
                 ([python, immortal, "run"], COMMAND_TIMEOUTS["collect"]),
                 ([python, immortal, "task-compile", goal, "--mode", mode], COMMAND_TIMEOUTS["task_compile"]),
-                ([python, str(SKILL_DIR / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
+                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind in {"role", "session"}:
             goal = str(body.get("goal") or "").strip()
@@ -553,7 +822,66 @@ class FactoryStore:
             return [(cmd, COMMAND_TIMEOUTS["task_compile"])]
         if kind == "health":
             return [([python, immortal, "health", "--max-age-hours", "30"], COMMAND_TIMEOUTS["health"])]
+        if kind == "run":
+            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
+        if kind == "backup_verify":
+            return [
+                (
+                    [python, immortal, "backup-status", "--verify", "--max-age-hours", "168"],
+                    COMMAND_TIMEOUTS["health"],
+                )
+            ]
+        if kind == "profile_refresh":
+            return [
+                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
+                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
+            ]
         raise ValueError("unknown factory job kind")
+
+    def _orchestrator_is_active(self) -> bool:
+        return live_pid_lock(self.immortal_dir / "orchestrator.lock")
+
+    def request_cancel(self, job_id: str) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError("job not found")
+        if job.get("status") not in {"queued", "running"}:
+            raise ValueError("job is not cancellable")
+        self._update_job(job_id, status="cancel_requested")
+        write_json_atomic(
+            self._cancel_marker(job_id),
+            {"job_id": job_id, "requested_at": now_local()},
+        )
+        return self.get_job(job_id) or {}
+
+    def _cancel_marker(self, job_id: str) -> Path:
+        return self.immortal_dir / "runtime" / "cancel_requests" / f"{job_id}.json"
+
+    def retry_job(self, job_id: str) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError("job not found")
+        if job.get("status") not in {"failed", "canceled", "interrupted", "attention"}:
+            raise ValueError("job is not retryable")
+        return self.start_job(str(job.get("kind") or ""), dict(job.get("body") or {}))
+
+    def job_logs(self, job_id: str, *, offset: int = 0, limit: int = 8000) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        if not job:
+            raise KeyError("job not found")
+        text = "\n".join(
+            part for part in (str(job.get("stdout") or ""), str(job.get("stderr") or "")) if part
+        )
+        safe_offset = max(0, int(offset))
+        safe_limit = min(8000, max(1, int(limit)))
+        return {
+            "job_id": job_id,
+            "offset": safe_offset,
+            "next_offset": min(len(text), safe_offset + safe_limit),
+            "total": len(text),
+            "text": text[safe_offset : safe_offset + safe_limit],
+        }
 
     def _success_summary(self, kind: str, body: dict[str, Any]) -> str:
         if kind == "collect":
@@ -566,6 +894,12 @@ class FactoryStore:
             return "一键采集、清洗和任务上下文生成已完成。"
         if kind == "health":
             return "健康检查已完成。"
+        if kind == "run":
+            return "Immortal 全流程已完成。"
+        if kind == "backup_verify":
+            return "最新便携备份校验已完成。"
+        if kind == "profile_refresh":
+            return "长期画像和质量报告已刷新。"
         return "任务完成。"
 
     @staticmethod
@@ -583,6 +917,17 @@ def shlex_quote(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9_./:=@+-]+", value):
         return value
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def is_allowed_local_origin(value: str) -> bool:
+    if not value:
+        return True
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and parsed.username is None and parsed.password is None and parsed.hostname in {
+        "127.0.0.1",
+        "localhost",
+        "::1",
+    }
 
 
 def page_html(title: str) -> str:
@@ -1421,8 +1766,44 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def factory(self) -> FactoryStore:
         return self.server.factory  # type: ignore[attr-defined]
 
+    @property
+    def control_center(self) -> ControlCenter:
+        return self.server.control_center  # type: ignore[attr-defined]
+
+    @property
+    def control_data(self) -> ControlData:
+        value = getattr(self.server, "control_data", None)
+        if value is None:
+            value = ControlData(
+                self.control_center.immortal_dir,
+                skill_dir=self.control_center.skill_dir,
+                listen_address=str(self.server.server_address[0]),
+                listen_port=int(self.server.server_address[1]),
+            )
+            self.server.control_data = value  # type: ignore[attr-defined]
+        return value
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def end_headers(self) -> None:
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        super().end_headers()
+
+    def host_is_allowed(self) -> bool:
+        port = int(self.server.server_address[1])
+        if is_allowed_host(self.headers.get("Host") or "", port):
+            return True
+        self.send_json(
+            error_payload(
+                "host_not_allowed",
+                "请求 Host 不在本机控制中心允许范围内。",
+                detail="只允许当前端口上的 loopback Host。",
+            ),
+            status=HTTPStatus.FORBIDDEN,
+        )
+        return False
 
     def send_json(self, value: Any, status: int = 200) -> None:
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -1430,7 +1811,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def send_html(self, value: str, status: int = 200) -> None:
+        payload = value.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or "0")
@@ -1446,8 +1841,122 @@ class ReviewHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:
+        if not self.host_is_allowed():
+            return
         parsed = urlparse(self.path)
+        if parsed.path == "/healthz":
+            self.send_json({"status": "ok"})
+            return
+        if parsed.path == "/readyz":
+            status, payload = self.control_data.readiness()
+            self.send_json(payload, status=status)
+            return
+        if parsed.path == "/api/v1/capabilities":
+            self.send_json(self.control_data.capabilities())
+            return
+        if parsed.path == "/api/v1/overview":
+            self.send_json(self.control_center.build_snapshot(jobs=self.factory.list_jobs()))
+            return
+        if parsed.path == "/api/v1/sources":
+            self.send_json(self.control_data.sources())
+            return
+        if parsed.path == "/api/v1/memories":
+            try:
+                self.send_json(self.control_data.memories(parse_qs(parsed.query)))
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_request", str(exc)), status=400)
+            return
+        if parsed.path.startswith("/api/v1/memories/"):
+            memory_id = parsed.path.removeprefix("/api/v1/memories/")
+            try:
+                self.send_json(self.control_data.memory_detail(memory_id))
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_memory_id", str(exc)), status=400)
+            except KeyError:
+                self.send_json(error_payload("memory_not_found", "记忆不存在。"), status=404)
+            return
+        if parsed.path in {"/api/v1/profile", "/api/v1/profile/candidates"}:
+            query = parse_qs(parsed.query)
+            try:
+                self.send_json(
+                    self.store.list_candidates(
+                        limit=int(query.get("limit", ["20"])[0]),
+                        offset=int(query.get("offset", ["0"])[0]),
+                        review_state=str(query.get("state", [""])[0]),
+                        focus=str(query.get("focus", [""])[0]),
+                        memory_type=str(query.get("type", [""])[0]),
+                        sensitivity=str(query.get("sensitivity", [""])[0]),
+                        query=str(query.get("q", [""])[0]),
+                        sort=str(query.get("sort", ["priority"])[0]),
+                    )
+                )
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_request", str(exc)), status=400)
+            return
+        if parsed.path.startswith("/api/v1/profile/candidates/"):
+            candidate_id = parsed.path.removeprefix("/api/v1/profile/candidates/")
+            try:
+                self.send_json(self.store.candidate_detail(candidate_id))
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_candidate_id", str(exc)), status=400)
+            except KeyError:
+                self.send_json(error_payload("candidate_not_found", "画像候选不存在。"), status=404)
+            return
+        if parsed.path == "/api/v1/agent":
+            self.send_json(self.control_data.agent_status())
+            return
+        if parsed.path.startswith("/api/v1/agent/contexts/"):
+            context_id = parsed.path.removeprefix("/api/v1/agent/contexts/")
+            try:
+                self.send_json(self.control_data.agent_context_detail(context_id))
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_context_id", str(exc)), status=400)
+            except KeyError:
+                self.send_json(error_payload("context_not_found", "Agent 上下文不存在。"), status=404)
+            return
+        if parsed.path == "/api/v1/backups":
+            self.send_json(self.control_data.backups())
+            return
+        if parsed.path == "/api/v1/diagnostics":
+            self.send_json(self.control_data.diagnostics())
+            return
+        if parsed.path == "/api/v1/jobs":
+            self.send_json({"items": self.factory.list_jobs()})
+            return
+        if parsed.path.startswith("/api/v1/jobs/"):
+            suffix = parsed.path.removeprefix("/api/v1/jobs/")
+            job_id, _, child = suffix.partition("/")
+            try:
+                if child == "logs":
+                    query = parse_qs(parsed.query)
+                    self.send_json(
+                        self.factory.job_logs(
+                            job_id,
+                            offset=int(query.get("offset", ["0"])[0]),
+                            limit=int(query.get("limit", ["8000"])[0]),
+                        )
+                    )
+                    return
+                if child:
+                    self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
+                    return
+                job = self.factory.get_job(job_id)
+                if not job:
+                    self.send_json(error_payload("job_not_found", "任务不存在。"), status=404)
+                else:
+                    self.send_json(job)
+            except (KeyError, ValueError) as exc:
+                self.send_json(error_payload("job_not_found", str(exc)), status=404)
+            return
         if parsed.path == "/":
+            payload = control_center_page_html("Immortal Control Center").encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        if parsed.path == "/snapshot":
             if DEFAULT_DASHBOARD.exists():
                 payload = DEFAULT_DASHBOARD.read_bytes()
                 self.send_response(HTTPStatus.OK)
@@ -1456,6 +1965,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(payload)
                 return
+            self.send_html(
+                error_page(
+                    "Legacy Snapshot 已停用",
+                    "旧静态看板已永久退出正式产品，请使用实时控制中心。",
+                ),
+                status=HTTPStatus.GONE,
+            )
+            return
         if parsed.path == "/review":
             payload = page_html("长期画像审阅台").encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -1475,8 +1992,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/agent-entry":
             if not DEFAULT_AGENT_ENTRY.exists():
-                subprocess.run([sys.executable, str(SKILL_DIR / "agent_bridge.py"), "entry"], cwd=str(SKILL_DIR), timeout=30)
-            text = DEFAULT_AGENT_ENTRY.read_text(encoding="utf-8", errors="ignore") if DEFAULT_AGENT_ENTRY.exists() else "Agent entry is missing."
+                self.send_html(
+                    error_page(
+                        "Agent Entry 尚未生成",
+                        "请通过 Agent 模块或受控 CLI 生成入口，读取页面不会自动执行命令。",
+                    ),
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            text = DEFAULT_AGENT_ENTRY.read_text(encoding="utf-8", errors="ignore")
             payload = (
                 "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -1494,28 +2018,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if parsed.path == "/timeline":
-            if DEFAULT_TIMELINE.exists():
-                payload_text = DEFAULT_TIMELINE.read_text(encoding="utf-8", errors="replace")
-                if parse_qs(parsed.query).get("embed", ["0"])[0] == "1":
-                    payload_text = payload_text.replace("<body>", '<body class="embedded">', 1)
-                payload = payload_text.encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-                return
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/?view=memories&mode=timeline")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if parsed.path == "/api/state":
             self.send_json(self.store.build_state())
             return
         if parsed.path == "/api/factory/state":
             self.send_json(self.factory.snapshot())
             return
+        if parsed.path == "/api/control-center/state":
+            self.send_json(self.control_center.build_snapshot(jobs=self.factory.list_jobs()))
+            return
         if parsed.path.startswith("/api/factory/jobs/"):
             job_id = parsed.path.rsplit("/", 1)[-1]
             job = self.factory.get_job(job_id)
             if not job:
-                self.send_json({"error": "job not found"}, status=404)
+                self.send_json(error_payload("job_not_found", "任务不存在。"), status=404)
             else:
                 self.send_json(job)
             return
@@ -1523,12 +2044,68 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.NO_CONTENT)
             self.end_headers()
             return
-        self.send_json({"error": "not found"}, status=404)
+        self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
 
     def do_POST(self) -> None:
+        if not self.host_is_allowed():
+            return
         parsed = urlparse(self.path)
         try:
+            if not is_allowed_local_origin(self.headers.get("Origin") or ""):
+                self.send_json(error_payload("origin_not_allowed", "请求来源不被允许。"), status=403)
+                return
             body = self.read_body()
+            if parsed.path == "/api/v1/jobs":
+                kind = str(body.get("kind") or "")
+                self.send_json(self.factory.start_job(kind, body.get("params") or {}), status=202)
+                return
+            if parsed.path.startswith("/api/v1/jobs/"):
+                suffix = parsed.path.removeprefix("/api/v1/jobs/")
+                job_id, _, action = suffix.partition("/")
+                if action == "cancel":
+                    self.send_json(self.factory.request_cancel(job_id), status=202)
+                    return
+                if action == "retry":
+                    self.send_json(self.factory.retry_job(job_id), status=202)
+                    return
+                self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
+                return
+            if parsed.path == "/api/v1/profile/merge":
+                result = self.store.merge()
+                self.send_json(result, status=200 if result.get("ok") else 500)
+                return
+            if (
+                parsed.path.startswith("/api/v1/profile/candidates/")
+                and parsed.path.endswith("/actions")
+            ):
+                candidate_id = parsed.path.removeprefix("/api/v1/profile/candidates/").removesuffix("/actions")
+                action = str(body.get("action") or "")
+                self.send_json(self.store.update_review(candidate_id, action))
+                return
+            if parsed.path == "/api/v1/agent/contexts":
+                unknown = set(body) - {"goal", "mode"}
+                if unknown:
+                    raise ValueError(f"unsupported field: {sorted(unknown)[0]}")
+                goal = str(body.get("goal") or "").strip()
+                if not goal:
+                    raise ValueError("goal is required")
+                mode = str(body.get("mode") or "auto")
+                self.send_json(
+                    self.factory.start_job(
+                        "session",
+                        {"goal": goal[:160], "mode": mode},
+                    ),
+                    status=202,
+                )
+                return
+            if parsed.path == "/api/v1/backups/verify":
+                if body:
+                    raise ValueError("backup verify does not accept parameters")
+                self.send_json(
+                    self.factory.start_job("backup_verify", {}),
+                    status=202,
+                )
+                return
             if parsed.path == "/api/review":
                 memory_id = str(body.get("id") or "")
                 action = str(body.get("action") or "")
@@ -1541,9 +2118,23 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 kind = str(body.get("kind") or "")
                 self.send_json(self.factory.start_job(kind, body), status=202)
                 return
-            self.send_json({"error": "not found"}, status=404)
+            if parsed.path == "/api/control-center/actions":
+                action = str(body.get("action") or "")
+                if action not in {"run", "health", "backup_verify", "profile_refresh"}:
+                    raise ValueError("unknown control action")
+                active = self.factory.list_jobs()
+                if action == "run" and any(
+                    item.get("kind") == "run" and item.get("status") in {"queued", "running"}
+                    for item in active
+                ):
+                    raise ValueError("Immortal is already running")
+                self.send_json(self.factory.start_job(action, {}), status=202)
+                return
+            self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
+        except JobConflict as exc:
+            self.send_json(error_payload("job_conflict", str(exc), retryable=True), status=409)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, status=400)
+            self.send_json(error_payload("invalid_request", str(exc)), status=400)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1562,9 +2153,17 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = ReviewStore(args.proposal, args.memories, args.reviewed, args.review_state)
     factory = FactoryStore()
+    control_center = ControlCenter(IMMORTAL_DIR, skill_dir=SKILL_DIR, service_reachable=True)
     server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
     server.store = store  # type: ignore[attr-defined]
     server.factory = factory  # type: ignore[attr-defined]
+    server.control_center = control_center  # type: ignore[attr-defined]
+    server.control_data = ControlData(  # type: ignore[attr-defined]
+        IMMORTAL_DIR,
+        skill_dir=SKILL_DIR,
+        listen_address=args.host,
+        listen_port=args.port,
+    )
     url = f"http://{args.host}:{args.port}/"
     print(f"Immortal dashboard: {url}")
     print(f"Task context compiler: {url}agent-factory")

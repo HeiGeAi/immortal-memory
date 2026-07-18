@@ -17,16 +17,38 @@
 
 import json
 import re
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timezone
+
+# 实体/人名/persona 从配置读取（标品化：代码不写死某个人），空值回退中性默认。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config as _config
+
+_DEFAULT_TOPIC_KEYWORDS = [
+    "AI", "Agent", "Skill", "MCP", "Cursor", "GitHub",
+    "公众号", "文章", "视频", "客户", "项目",
+    "蒸馏", "记忆", "上下文", "Context", "embedding",
+    "招聘", "助理", "团队",
+]
+try:
+    _CFG = _config.load_config()
+    _DCFG = _CFG.get("distill") or {}
+    PROJECT_KEYWORDS = _DCFG.get("project_keywords") or []
+    TOPIC_KEYWORDS = _DCFG.get("topic_keywords") or _DEFAULT_TOPIC_KEYWORDS
+    _PEOPLE_NAMES = _DCFG.get("people") or []
+    PERSONA = (_DCFG.get("persona") or _config.owner_display_name(_CFG) or "记忆库主人").strip()
+except Exception:
+    PROJECT_KEYWORDS, TOPIC_KEYWORDS, _PEOPLE_NAMES, PERSONA = [], _DEFAULT_TOPIC_KEYWORDS, [], "记忆库主人"
+PEOPLE_PATTERN = re.compile("(" + "|".join(re.escape(n) for n in _PEOPLE_NAMES) + ")") if _PEOPLE_NAMES else None
 
 
 SKILL_DIR = Path(__file__).resolve().parent
 MEMORY_DIRS = [
     SKILL_DIR / "references" / "memory",
     Path.home() / ".codex/memories",
-    Path.home() / ".claude/projects/-Users-user/memory",
+    Path.home() / ".claude/projects/-Users-blakexu/memory",
 ]
 INDEX_FILE = Path.home() / ".immortal/index.jsonl"
 OUTPUT_FILE = Path.home() / ".immortal/digital-soul.md"
@@ -203,7 +225,7 @@ def load_l3_memories() -> dict:
                     if len(parts) >= 3:
                         content = parts[2]
                 memories[f.stem] = content.strip()
-            except:
+            except (OSError, UnicodeDecodeError):
                 continue
     return memories
 
@@ -226,27 +248,15 @@ def scan_index() -> dict:
     earliest_ts = None
     latest_ts = None
 
-    project_keywords = [
-        "项目A", "主账号", "数据大屏", "飞书", "排版工具",
-        "账号边界A", "sitec", "siteb", "数据看板", "公众号",
-        "自媒体", "OpenClaw", "Claude Code", "Codex",
-        "Hermes", "永生记忆库", "immortal", "graphify",
-        "OPC", "linux.do",
-    ]
-
-    people_pattern = re.compile(r'(鸭哥|协作账号|老胡|半佛|刘润|小蔓|小戈杵|周鸿祎|王路|马斯克|奥特曼|Sam Altman)')
-
-    topic_keywords = [
-        "AI", "Agent", "Skill", "MCP", "Cursor", "GitHub",
-        "公众号", "文章", "视频", "客户", "项目",
-        "蒸馏", "记忆", "上下文", "Context", "embedding",
-        "招聘", "助理", "团队",
-    ]
+    # 实体/人名/话题词来自配置（标品化），空配置回退中性默认；见模块顶部
+    project_keywords = PROJECT_KEYWORDS
+    topic_keywords = TOPIC_KEYWORDS
+    people_pattern = PEOPLE_PATTERN
 
     for line in open(INDEX_FILE, encoding="utf-8"):
         try:
             record = json.loads(line.strip())
-        except:
+        except json.JSONDecodeError:
             continue
 
         total_records += 1
@@ -280,12 +290,13 @@ def scan_index() -> dict:
         for kw in topic_keywords:
             if kw in content:
                 topic_mentions[kw] += 1
-        m = people_pattern.search(content)
-        if m:
-            people_mentions[m.group()] += 1
+        if people_pattern is not None:
+            m = people_pattern.search(content)
+            if m:
+                people_mentions[m.group()] += 1
         for tool in ["graphify", "immortal", "frontend-design", "context7",
                       "playwright", "minimax", "zai-vision", "khazix-writer",
-                      "writing-skill", "lark-base", "lark-doc"]:
+                      "heige-chuangzuo-skill", "lark-base", "lark-doc"]:
             if tool in content:
                 tool_mentions[tool] += 1
 
@@ -363,8 +374,8 @@ def build_soul():
     lines.append(f"> 活跃时段 {stats.get('earliest_ts', '?')} → {stats.get('latest_ts', '?')}")
     lines.append(f"> 生成时间 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("")
-    lines.append("你是用户本人（Configured User / 用户本人）的数字分身。以下信息构成你的核心人格。")
-    lines.append("回答问题时，始终以用户本人的视角、思维方式和价值观出发，用用户本人的口吻说话。")
+    lines.append(f"你是{PERSONA}的数字分身。以下信息构成你的核心人格。")
+    lines.append(f"回答问题时，始终以{PERSONA}的视角、思维方式和价值观出发，用{PERSONA}的口吻说话。")
     lines.append("")
 
     # ===== 一、核心身份（来自 L3 已蒸馏记忆，最权威）=====
@@ -485,7 +496,7 @@ def build_soul():
     lines.append("1. **优先级**：第三章（决策原则）> 第五章（真实信号）> 其他章节")
     lines.append("2. **冲突处理**：当不同来源冲突时，以已蒸馏的 L3 记忆为准")
     lines.append("3. **不知道就说不知道**：不在记忆库里的事情不要编造")
-    lines.append("4. **风格**：用用户本人的口吻，短句、直接、不用破折号、不用中文书名号式引号、不用 emoji")
+    lines.append(f"4. **风格**：用{PERSONA}的口吻，短句、直接、不用破折号、不用中文书名号式引号、不用 emoji")
     lines.append("5. **思维**：从人的惰性出发，而非 Agent 能力出发；技术服务业务")
     lines.append("6. **检索**：回答前先调用 `~/.codex/skills/immortal/immortal.py recall <关键词>` 检索原始记录")
     lines.append("")

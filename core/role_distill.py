@@ -81,7 +81,7 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
             "选题",
             "内容",
             "排版",
-            "主账号",
+            "内容账号B",
             "商业杂文",
             "小红书",
             "口播",
@@ -91,14 +91,14 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
         ],
         "scenarios": ["选题切口", "文章初稿", "标题重做", "审稿挑错", "事实校准", "账号风格统一"],
         "must_do": [
-            "先确认使用哪个账号视角，默认优先主账号，避免人设串台。",
+            "先确认使用哪个账号视角，默认优先内容账号B，避免人设串台。",
             "先抓普通读者利益点和商业判断，再进入文字润色。",
             "审稿时优先指出事实风险、结构问题、缺少高潮、账号风格偏差。",
             "写作时输出可直接使用的正文，而不是只给大纲。",
             "把用户已验证的排版偏好应用到结果：短段落、直接小标题、适度加粗判断。",
         ],
         "must_not": [
-            "不要混用外部参考账号、账号边界A、协作账号和主账号 的身份。",
+            "不要混用卡兹克、技术账号A、内容账号A和内容账号B 的身份。",
             "不要生成通用 AI 腔行业分析。",
             "不要把未经核实的事实写成确定结论。",
             "不要让用户反复做清洗式审阅；常规判断由 Agent 自动完成。",
@@ -137,7 +137,7 @@ MODE_SPECS: dict[str, dict[str, Any]] = {
     "business": {
         "label": "商业判断 Agent",
         "purpose": "基于用户业务现实和历史判断，辅助客户、产品、报价、团队和交付策略判断。",
-        "keywords": ["商业", "客户", "报价", "成交", "合作", "产品", "MVP", "交付", "团队", "项目A", "飞书", "代理"],
+        "keywords": ["商业", "客户", "报价", "成交", "合作", "产品", "MVP", "交付", "团队", "天宫", "飞书", "代理"],
         "scenarios": ["客户要不要接", "方案怎么报", "MVP 怎么落", "团队怎么分工", "业务风险"],
         "must_do": [
             "优先使用用户真实业务阶段：早期、精简团队、先找付费客户。",
@@ -292,20 +292,26 @@ def load_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def redact(text: str) -> str:
-    patterns = [
-        (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-        (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(apikey\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"(?i)(密码\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-        (r"(?i)(authorization\s*[:：]\s*bearer\s+)\S+", r"\1[REDACTED]"),
-    ]
-    value = str(text or "")
-    for pattern, replacement in patterns:
-        value = re.sub(pattern, replacement, value)
-    return value
+    """统一走 redact_common（单一真源，覆盖 ghp_/AKIA/gk_live_/JWT/URL 内嵌凭证）。
+    导入失败时回退内联硬化集，绝不裸奔。"""
+    try:
+        from redact_common import redact as _r
+        return _r(str(text or ""))
+    except Exception:
+        patterns = [
+            (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+            (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
+            (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+            (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+            (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+            (r"(?i)(authorization\s*[:：]\s*bearer\s+)\S+", r"\1[REDACTED]"),
+        ]
+        value = str(text or "")
+        for pattern, replacement in patterns:
+            value = re.sub(pattern, replacement, value)
+        return value
 
 
 def compact(text: Any, limit: int = 240) -> str:

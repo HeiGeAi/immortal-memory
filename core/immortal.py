@@ -36,10 +36,13 @@ from config import (
     save_config,
     slug_prefix,
 )
+from command_hints import cli_command
 from export_restore import create_export, get_backup_status, restore_check
+from state_store import mutate_state_atomic, update_state_atomic
 
 
 SKILL_DIR = Path(__file__).resolve().parent
+VERSION = (SKILL_DIR / "VERSION").read_text(encoding="utf-8").strip()
 IMMORTAL_DIR = configured_vault_dir()
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DAILY_DIR = IMMORTAL_DIR / "daily"
@@ -62,6 +65,7 @@ QUALITY_JSON = IMMORTAL_DIR / "quality" / "latest.json"
 QUALITY_MD = IMMORTAL_DIR / "quality" / "latest.md"
 DIGEST_JSON = IMMORTAL_DIR / "digests" / "latest.json"
 DIGEST_MD = IMMORTAL_DIR / "digests" / "latest.md"
+CARDS_COMPACT_MD = IMMORTAL_DIR / "cards" / "cards_compact.md"
 PRODUCT_GOAL_JSON = IMMORTAL_DIR / "product" / "goal.json"
 PRODUCT_GOAL_MD = IMMORTAL_DIR / "product" / "goal.md"
 DASHBOARD_HTML = IMMORTAL_DIR / "dashboard.html"
@@ -77,6 +81,9 @@ AGENT_ENTRY_JSON = IMMORTAL_DIR / "agent" / "entry.json"
 GETNOTE_STATE_JSON = IMMORTAL_DIR / "getnote" / "diary_sync_state.json"
 GETNOTE_LATEST_JSON = IMMORTAL_DIR / "getnote" / "latest.json"
 GETNOTE_CONFIG = Path.home() / ".getnote" / "config.json"
+WEB_STATE_JSON = IMMORTAL_DIR / "web" / "state.json"
+WEB_LATEST_JSON = IMMORTAL_DIR / "web" / "latest.json"
+OBSIDIAN_STATUS_JSON = IMMORTAL_DIR / "obsidian" / "status.json"
 OFFSITE_MARKERS = [
     IMMORTAL_DIR / "backups",
     IMMORTAL_DIR / "exports",
@@ -172,10 +179,16 @@ def portable_backup_detail(status: dict, *, max_age_hours: float | None = None) 
 
 
 def write_state_key(key: str, value) -> None:
-    state = read_json(STATE_FILE, {})
-    state[key] = value
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    update_state_atomic(STATE_FILE, {key: value})
+
+
+def clear_state_error(message: str) -> None:
+    def clear(state):
+        errors = state.get("errors") if isinstance(state.get("errors"), list) else []
+        state["errors"] = [item for item in errors if str(item) != message]
+        return state
+
+    mutate_state_atomic(STATE_FILE, clear)
 
 
 def getnote_credentials_present() -> bool:
@@ -199,7 +212,8 @@ def run_script(script: str, args: list[str] | None = None) -> int:
 def iter_daily_files(days: int = 2) -> Iterable[Path]:
     if not DAILY_DIR.exists():
         return []
-    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days - 1)
+    # 本地日期口径（与 daily 文件名一致，2026-07-18 统一）；UTC 会在本地凌晨错位一天
+    cutoff = datetime.now().astimezone().date() - timedelta(days=days - 1)
     files = []
     for path in DAILY_DIR.glob("*.jsonl*"):
         date_part = path.name.split(".jsonl")[0]
@@ -219,8 +233,10 @@ def open_text(path: Path):
 
 
 def iter_recent_records(days: int = 2, limit: int = 3000) -> Iterable[dict]:
+    # 新→旧倒序读：配额有限时优先保留最近记录，避免最旧文件吃满 limit 把当天整天挤掉。
+    # 单个大文件（一天上万条）仍可能吃满配额，但那也是当天的记录，符合 brief「最近动向」语义。
     count = 0
-    for path in iter_daily_files(days):
+    for path in reversed(list(iter_daily_files(days))):
         with open_text(path) as f:
             for line in f:
                 if count >= limit:
@@ -252,19 +268,28 @@ def compact(text: str, n: int = 180) -> str:
 
 
 def redact(text: str) -> str:
-    """Redact obvious secrets before printing raw memory previews."""
-    patterns = [
-        (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-        (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(apikey\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"(?i)(密码\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    return text
+    """Redact obvious secrets before printing raw memory previews.
+
+    统一走 redact_common（单一真源，覆盖 ghp_/AKIA/gk_live_/JWT/URL 内嵌凭证等）。
+    导入失败时回退到内联最小集，绝不裸奔。
+    """
+    try:
+        from redact_common import redact as _r
+        return _r(text)
+    except Exception:
+        patterns = [
+            (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+            (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
+            (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+            (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+            (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+        ]
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text)
+        return text
 
 
 def is_human_action_text(text: str) -> bool:
@@ -293,6 +318,13 @@ def command_status(_args) -> int:
         relationship_summary = {}
     print("Immortal Skill status")
     print()
+    from preflight import gather_preflight
+
+    preflight = gather_preflight()
+    readiness = f"{preflight['vault_status']} / context {preflight['context_status']} / {preflight['loss_protection']}"
+    if preflight["vault_status"] == "smoke_only":
+        readiness += "　⚠️ DEMO ONLY：尚未接入真实数据"
+    print(f"Readiness: {readiness}")
     print(f"Storage: {IMMORTAL_DIR}")
     print(f"Index: {fmt_size(INDEX_FILE)}")
     print(f"Digital soul: {fmt_size(SOUL_FILE)}")
@@ -331,6 +363,11 @@ def candidate_daily_launch_agent_labels() -> list[str]:
     labels = [daily_launch_agent_label()]
     if LEGACY_DAILY_LAUNCH_AGENT_LABEL not in labels:
         labels.append(LEGACY_DAILY_LAUNCH_AGENT_LABEL)
+    # 兼容历史上使用过的命名空间
+    for prefix in ("blake", "blakexu", "user"):
+        label = f"com.{prefix}.immortal.daily-backup" if prefix != "user" else "com.immortal.daily-backup"
+        if label not in labels:
+            labels.append(label)
     return labels
 
 
@@ -372,6 +409,31 @@ def check_crontab() -> tuple[bool, list[str]]:
             )
         except Exception as exc:
             scheduler_lines.append(f"launchd: {label} invalid ({exc})")
+
+    # 额外扫描所有含 immortal 的 LaunchAgent（health-check、profile-review、feishu-mirror-worker 等）
+    launch_agents_dir = Path.home() / "Library" / "LaunchAgents"
+    seen_labels = {label for label in candidate_daily_launch_agent_labels()}
+    try:
+        for plist_path in sorted(launch_agents_dir.glob("*.plist")):
+            label = plist_path.stem
+            if "immortal" not in label.lower() or label in seen_labels:
+                continue
+            try:
+                with plist_path.open("rb") as handle:
+                    plist = plistlib.load(handle)
+                intervals = plist.get("StartCalendarInterval") or []
+                if isinstance(intervals, dict):
+                    intervals = [intervals]
+                launch_intervals = len(intervals) if isinstance(intervals, list) else 0
+                loaded = label in launchctl
+                loaded_any = loaded_any or loaded
+                scheduler_lines.append(
+                    f"launchd: {label} ({'loaded' if loaded else 'not loaded'}, {launch_intervals} schedules)"
+                )
+            except Exception as exc:
+                scheduler_lines.append(f"launchd: {label} invalid ({exc})")
+    except Exception:
+        pass
 
     ok = len(cron_lines) >= 4 or (loaded_any and launch_intervals_max >= 4)
     return ok, scheduler_lines
@@ -471,6 +533,8 @@ def command_health(args) -> int:
     state = read_json(STATE_FILE, {})
     digest = read_json(DIGEST_JSON, {})
     quality = read_json(QUALITY_JSON, {})
+    web_state = read_json(WEB_STATE_JSON, {})
+    obsidian_status = read_json(OBSIDIAN_STATUS_JSON, {})
     relationship_data = read_json(RELATIONSHIP_JSON, {})
     relationship_summary = relationship_data.get("summary") if isinstance(relationship_data, dict) else {}
     if not isinstance(relationship_summary, dict):
@@ -491,6 +555,14 @@ def command_health(args) -> int:
         ok = path.exists() and path.stat().st_size >= min_size and age is not None and age <= max_age
         checks.append((label, ok, f"{fmt_size(path)} · {age_detail(dt)}"))
 
+    def add_obsidian_state(label: str, key: str):
+        dt = state_time(state, key)
+        age = age_hours_from_dt(dt)
+        status = state.get("last_obsidian_sync_status")
+        time_ok = bool(dt and age is not None and age <= max_age)
+        ok = time_ok and status in {"ok", "disabled"}
+        checks.append((label, ok, f"{age_detail(dt)} (status={status})"))
+
     add_state("采集状态", "last_collect")
     add_state("飞书采集", "last_feishu_collect")
     add_state("飞书清洗", "last_feishu_clean")
@@ -500,27 +572,24 @@ def command_health(args) -> int:
     add_state("人物索引", "last_people_index")
     add_state("关联证据", "last_relationship_index")
     add_state("质量报告", "last_quality")
-    add_state("产品目标", "last_product_brief")
     add_state("画像归因审计", "last_profile_attribution_audit")
     add_state("飞书云文档清单镜像", "last_feishu_mirror_inventory")
     add_state("飞书云文档限量导出", "last_feishu_mirror_download")
     add_state("Agent Entry", "last_agent_entry")
-    getnote_enabled = getnote_credentials_present() or GETNOTE_LATEST_JSON.exists()
-    if getnote_enabled:
-        add_state("Get 笔记日记同步", "last_getnote_diary_sync")
+    add_state("网页收录", "last_web_collect")
+    add_obsidian_state("Obsidian 阅读层", "last_obsidian_sync")
+    getnote_enabled = False  # Get 笔记日记同步已暂停（2026-06-14），不做健康检查以免误报
     add_file("Quality JSON", QUALITY_JSON)
     add_file("Quality MD", QUALITY_MD)
     add_file("Profile Attribution Audit", PROFILE_ATTRIBUTION_AUDIT_JSON)
-    add_file("Product Goal JSON", PRODUCT_GOAL_JSON)
-    add_file("Product Goal MD", PRODUCT_GOAL_MD)
     add_file("Nuwa Profile JSON", PROFILE_NUWA_JSON)
     add_file("Nuwa Profile MD", PROFILE_NUWA_MD)
-    add_file("Digest JSON", DIGEST_JSON)
-    add_file("Digest MD", DIGEST_MD)
-    add_file("主看板", DASHBOARD_HTML, min_size=1024)
-    add_file("时间线", TIMELINE_HTML, min_size=1024)
+    # 2026-06-14：Product Goal / Digest / 主看板 / 时间线 已停用，改为校验判断力卡片盒
+    add_file("判断力卡片盒", CARDS_COMPACT_MD, min_size=64)
     add_file("Agent Entry MD", AGENT_ENTRY_MD, min_size=1024)
     add_file("Agent Entry JSON", AGENT_ENTRY_JSON)
+    add_file("网页收录状态", WEB_STATE_JSON)
+    add_file("Obsidian 状态", OBSIDIAN_STATUS_JSON)
     if getnote_enabled:
         add_file("Get 笔记同步状态", GETNOTE_LATEST_JSON)
     backup_ok, backup_detail = portable_backup_detail(get_backup_status(IMMORTAL_DIR), max_age_hours=168)
@@ -557,8 +626,26 @@ def command_health(args) -> int:
         quality_ok,
         f"{quality_status or 'missing'} · score {quality.get('score', '-') if isinstance(quality, dict) else '-'} · issues {quality.get('issue_count', '-') if isinstance(quality, dict) else '-'}",
     ))
-    digest_status = ((digest.get("errors") or {}).get("status") if isinstance(digest, dict) else "") or "missing"
-    checks.append(("Digest 状态", digest_status == "ok", str(digest_status)))
+    # Digest 健康检查已移除（2026-06-14：每日 digest 已停用，改由判断力卡片盒承担消费侧）
+    web_totals = web_state.get("totals") if isinstance(web_state, dict) else {}
+    web_status = str(web_state.get("status") or "missing") if isinstance(web_state, dict) else "missing"
+    web_errors = int((web_totals or {}).get("errors") or 0)
+    checks.append((
+        "网页收录结果",
+        web_status in {"ok", "disabled"} and web_errors == 0,
+        (
+            f"{web_status} · total {(web_totals or {}).get('total_web_history_records', 0)} · "
+            f"last {(web_totals or {}).get('records_written', 0)} · "
+            f"filtered {(web_totals or {}).get('visits_filtered', 0)} · errors {web_errors}"
+        ),
+    ))
+    obsidian_state = str(obsidian_status.get("status") or "missing") if isinstance(obsidian_status, dict) else "missing"
+    broken_links = int(obsidian_status.get("broken_links_count") or 0) if isinstance(obsidian_status, dict) else 0
+    checks.append((
+        "Obsidian 链接健康",
+        obsidian_state in {"ok", "disabled"} and broken_links == 0,
+        f"{obsidian_state} · broken_links {broken_links} · {obsidian_status.get('vault_path', '') if isinstance(obsidian_status, dict) else ''}",
+    ))
     if getnote_enabled:
         getnote_latest = read_json(GETNOTE_LATEST_JSON, {})
         getnote_results = getnote_latest.get("results") if isinstance(getnote_latest, dict) else []
@@ -678,7 +765,53 @@ def command_brief(args) -> int:
     return 0
 
 
+def _recall_json(args) -> int:
+    """recall 的 --json 输出分支:检索逻辑完全复用 search.unified_search,只在输出层分叉。"""
+    import time
+
+    sys.path.insert(0, str(SKILL_DIR))
+    import search as search_engine
+
+    # --source 别名映射与 search.py 的 main 保持一致
+    source = None
+    source_prefix = None
+    if args.source == "claude":
+        source_prefix = "claude-code"
+    elif args.source in ("codex", "hermes"):
+        source_prefix = args.source
+    elif args.source:
+        source = args.source
+
+    started = time.perf_counter()
+    mode, results = search_engine.unified_search(
+        args.query, limit=20, source=source,
+        source_prefix=source_prefix, since=args.since)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    engine = "fusion" if mode.startswith("fusion") else "tfidf"
+    hits = []
+    for score, record in results:
+        content = (record.get("content") or record.get("content_preview") or "")
+        snippet = search_engine.redact(content[:250].replace("\n", " "))
+        hits.append({
+            "ts": record.get("timestamp", ""),
+            "source": record.get("source", ""),
+            "role": record.get("role", ""),
+            "snippet": snippet,
+            "score": round(float(score), 4),
+        })
+    print(json.dumps({
+        "ok": True,
+        "engine": engine,
+        "elapsed_ms": elapsed_ms,
+        "hits": hits,
+    }, ensure_ascii=False))
+    return 0
+
+
 def command_recall(args) -> int:
+    if getattr(args, "json", False):
+        return _recall_json(args)
     search_args = [args.query, "--since", args.since] if args.since else [args.query]
     if args.source:
         search_args.extend(["--source", args.source])
@@ -692,13 +825,14 @@ def command_context(args) -> int:
     print("Use this as task-local context, not as a permanent system prompt.")
     print()
     print("Profile baseline:")
+    # 注入端统一脱敏：所有原始记忆文本 print 前过一遍 redact()，绝不裸奔凭证
     profile_path = PROFILE_COMPACT_MD if PROFILE_COMPACT_MD.exists() else PROFILE_MD
     if profile_path.exists():
-        text = profile_path.read_text(encoding="utf-8", errors="ignore")
+        text = redact(profile_path.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[: args.profile_lines]:
             print(line)
     elif SOUL_FILE.exists():
-        text = SOUL_FILE.read_text(encoding="utf-8", errors="ignore")
+        text = redact(SOUL_FILE.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[:80]:
             print(line)
     else:
@@ -710,20 +844,21 @@ def command_context(args) -> int:
     print()
     if PROFILE_NUWA_MD.exists():
         print("Nuwa thinking profile excerpt:")
-        text = PROFILE_NUWA_MD.read_text(encoding="utf-8", errors="ignore")
+        text = redact(PROFILE_NUWA_MD.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[: args.nuwa_lines]:
             print(line)
         print()
-    if DIGEST_MD.exists():
-        print("Recent digest excerpt:")
-        text = DIGEST_MD.read_text(encoding="utf-8", errors="ignore")
+    # 判断力卡片盒（纠正即记忆）取代旧的 digest 遥测摘要注入：高信号、低噪音
+    if CARDS_COMPACT_MD.exists():
+        print("Judgment cards excerpt (纠正即记忆，代表你纠正 AI 时表达的判断):")
+        text = redact(CARDS_COMPACT_MD.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[: args.digest_lines]:
             print(line)
         print()
     if PEOPLE_MD.exists():
         print("People index entrypoint:")
         print(f"- Full file: {PEOPLE_MD}")
-        text = PEOPLE_MD.read_text(encoding="utf-8", errors="ignore")
+        text = redact(PEOPLE_MD.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[: args.people_lines]:
             print(line)
         print()
@@ -860,7 +995,21 @@ def command_feishu_mirror(args) -> int:
     has_guard = any(part in guard_flags or any(part.startswith(flag + "=") for flag in guard_flags) for part in forwarded)
     if not has_guard:
         forwarded = [*feishu_guard_args(load_config()), *forwarded]
-    return run_script("feishu_drive_mirror.py", forwarded)
+    code = run_script("feishu_drive_mirror.py", forwarded)
+    if code == 0:
+        mode = ""
+        for index, item in enumerate(forwarded):
+            if item == "--mode" and index + 1 < len(forwarded):
+                mode = forwarded[index + 1]
+            elif item.startswith("--mode="):
+                mode = item.split("=", 1)[1]
+        if mode == "inventory":
+            write_state_key("last_feishu_mirror_inventory", datetime.now(timezone.utc).isoformat())
+            clear_state_error("feishu mirror inventory failed")
+        elif mode == "download":
+            write_state_key("last_feishu_mirror_download", datetime.now(timezone.utc).isoformat())
+            clear_state_error("feishu mirror download failed")
+    return code
 
 
 def command_feishu_mirror_status(args) -> int:
@@ -1000,8 +1149,8 @@ def command_init(args) -> int:
     print(f"Feishu guard: {'configured' if guards else 'not configured'}")
     print()
     print("Next:")
-    print("  python3 ~/.codex/skills/immortal/immortal.py train --smoke")
-    print("  python3 ~/.codex/skills/immortal/immortal.py agent-factory")
+    print(f"  {cli_command('train', '--smoke')}")
+    print(f"  {cli_command('agent-factory')}")
     return 0
 
 
@@ -1132,9 +1281,7 @@ def command_train(args) -> int:
         attention.append(name)
 
     print()
-    state["errors"] = failures[-10:]
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    update_state_atomic(STATE_FILE, {"errors": failures[-10:]})
 
     if failures:
         print(f"Training failed at: {', '.join(failures)}")
@@ -1143,14 +1290,73 @@ def command_train(args) -> int:
         print(f"Training completed with attention: {', '.join(attention)}")
         if args.smoke:
             print("Smoke mode treats attention as expected because the vault has almost no real user data yet.")
+            print_demo_banner()
             return 0
         return 2
     print("Training completed")
+    if args.smoke:
+        print_demo_banner()
     return 0
 
 
-def command_package(args) -> int:
-    return run_script("package_tool.py", args.package_args)
+def command_web_collect(args) -> int:
+    code = run_script("web_capture.py", ["collect", *args.web_args])
+    if code == 0 and "--dry-run" not in args.web_args:
+        write_state_key("last_web_collect", datetime.now(timezone.utc).isoformat())
+        latest = read_json(WEB_STATE_JSON, {})
+        totals = latest.get("totals") if isinstance(latest, dict) else {}
+        if isinstance(totals, dict):
+            write_state_key("last_run_web_new_records", int(totals.get("records_written") or 0))
+        clear_state_error("web collect failed")
+    return code
+
+
+def command_web_save(args) -> int:
+    return run_script("web_capture.py", ["save", args.url, *args.web_save_args])
+
+
+def command_web_status(args) -> int:
+    return run_script("web_capture.py", ["status", *args.web_status_args])
+
+
+def command_notes_sync(args) -> int:
+    return run_script("obsidian_notes_sync.py", ["sync", *args.notes_sync_args])
+
+
+def command_notes_status(args) -> int:
+    return run_script("obsidian_notes_sync.py", ["status", *args.notes_status_args])
+
+
+def command_obsidian_sync(args) -> int:
+    code = run_script("obsidian_sync.py", ["sync", *args.obsidian_args])
+    if code == 0 and "--dry-run" not in args.obsidian_args:
+        write_state_key("last_obsidian_sync", datetime.now(timezone.utc).isoformat())
+        latest = read_json(OBSIDIAN_STATUS_JSON, {})
+        write_state_key("last_obsidian_sync_status", latest.get("status") if isinstance(latest, dict) else "ok")
+        write_state_key("last_obsidian_broken_links", int(latest.get("broken_links_count") or 0) if isinstance(latest, dict) else 0)
+        clear_state_error("obsidian sync failed")
+    return code
+
+
+def command_obsidian_status(args) -> int:
+    return run_script("obsidian_sync.py", ["status", *args.obsidian_status_args])
+
+
+def print_demo_banner() -> None:
+    print()
+    print("=" * 56)
+    print("  ⚠️  DEMO ONLY — 尚未受到真实记忆保护")
+    print("=" * 56)
+    print("冒烟训练只写入了一条测试记录，没有接入任何真实来源。")
+    print("此时生成的画像、Entry 和看板都只是演示，不代表系统已在工作。")
+    print()
+    print("生产就绪三步：")
+    print(f"  1. 接入真实来源并完成一次真实采集：{cli_command('run')}")
+    print(f"  2. 启用每日自动采集：{cli_command('daily-install')}")
+    print(f"  3. 备份到外部介质并校验：{cli_command('backup', '--output-dir', '<外置盘或同步目录>')}")
+    print()
+    print(f"随时用 `{cli_command('preflight')}` 查看是否已真正受到保护。")
+    print("=" * 56)
 
 
 def command_profile_merge(args) -> int:
@@ -1164,30 +1370,21 @@ def command_profile_auto_review(args) -> int:
 def command_profile_nuwa(args) -> int:
     code = run_script("profile_nuwa.py", args.profile_nuwa_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_profile_nuwa"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_profile_nuwa", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_role_distill(args) -> int:
     code = run_script("role_distill.py", args.role_distill_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_role_distill"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_role_distill", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_task_compile(args) -> int:
     code = run_script("task_compile.py", args.task_compile_args)
     if code in {0, 2}:
-        state = read_json(STATE_FILE, {})
-        state["last_task_compile"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_task_compile", datetime.now(timezone.utc).isoformat())
     return code
 
 
@@ -1215,7 +1412,23 @@ def command_agent_context(args) -> int:
         bridge_args.extend(["--output", args.output])
     if args.print:
         bridge_args.append("--print")
+    if args.force:
+        bridge_args.append("--force")
     return run_script("agent_bridge.py", bridge_args)
+
+
+def command_preflight(args) -> int:
+    preflight_args = []
+    if args.query:
+        preflight_args.append(args.query)
+    if args.since:
+        preflight_args.extend(["--since", args.since])
+    preflight_args.extend(["--max-age-hours", str(args.max_age_hours)])
+    if args.vault_dir:
+        preflight_args.extend(["--vault-dir", args.vault_dir])
+    if args.json:
+        preflight_args.append("--json")
+    return run_script("preflight.py", preflight_args)
 
 
 def command_agent_http(args) -> int:
@@ -1248,20 +1461,14 @@ def command_people(args) -> int:
 def command_relationships(args) -> int:
     code = run_script("relationship_index.py", args.relationship_args)
     if code == 0:
-        state = read_json(STATE_FILE, {})
-        state["last_relationship_index"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_relationship_index", datetime.now(timezone.utc).isoformat())
     return code
 
 
 def command_quality(args) -> int:
     code = run_script("quality_report.py", args.quality_args)
     if code == 0:
-        state = read_json(STATE_FILE, {})
-        state["last_quality"] = datetime.now(timezone.utc).isoformat()
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_state_key("last_quality", datetime.now(timezone.utc).isoformat())
     return code
 
 
@@ -1310,16 +1517,16 @@ def command_getnote_diary(args) -> int:
     code = run_script("getnote_sync.py", sync_args)
     if code == 0:
         latest = read_json(GETNOTE_LATEST_JSON, {})
-        state = read_json(STATE_FILE, {})
         now_iso = datetime.now(timezone.utc).isoformat()
-        state["last_getnote_diary_sync"] = latest.get("generated_at") or now_iso
-        state["last_getnote_diary_status"] = latest.get("status") or "ok"
-        state["last_getnote_diary_date"] = latest.get("latest_date") or ""
+        updates = {
+            "last_getnote_diary_sync": latest.get("generated_at") or now_iso,
+            "last_getnote_diary_status": latest.get("status") or "ok",
+            "last_getnote_diary_date": latest.get("latest_date") or "",
+        }
         results = latest.get("results") if isinstance(latest.get("results"), list) else []
         if results:
-            state["last_getnote_diary_note_id"] = results[-1].get("note_id") or ""
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            updates["last_getnote_diary_note_id"] = results[-1].get("note_id") or ""
+        update_state_atomic(STATE_FILE, updates)
     return code
 
 
@@ -1391,8 +1598,21 @@ def command_export(args) -> int:
     write_state_key("last_portable_export_dir", manifest.get("export_dir"))
     write_state_key("last_portable_export_files", totals.get("files"))
     write_state_key("last_portable_export_bytes", totals.get("bytes"))
+    write_state_key("last_portable_export_location", manifest.get("storage_location"))
     print("Immortal portable export")
     print()
+    location = manifest.get("storage_location")
+    if location in {"internal_vault", "same_disk"}:
+        print("!" * 56)
+        print("  WARNING: 此导出不具备灾难恢复能力")
+        if location == "internal_vault":
+            print("  导出落在 vault 内部，vault 被误删时备份会一起消失。")
+        else:
+            print("  导出与 vault 在同一块磁盘上，无法抵御磁盘损坏。")
+        print("  真正的防丢备份请用 --output-dir 指向外置盘或同步目录。")
+        print("!" * 56)
+        print()
+    print(f"Storage location: {location}")
     print(f"Export: {manifest.get('export_dir')}")
     print(f"Manifest: {Path(str(manifest.get('export_dir'))) / 'manifest.json'}")
     print(f"Files: {int(totals.get('files') or 0):,}")
@@ -1404,16 +1624,40 @@ def command_export(args) -> int:
     if len(warnings) > 12:
         print(f"  - ... {len(warnings) - 12} more")
     print()
-    print("Next: run `python3 ~/.codex/skills/immortal/immortal.py restore-check \"<export-path>\"` before trusting a restore.")
+    restore_command = cli_command("restore-check", "<export-path>")
+    print(f"Next: run `{restore_command}` before trusting a restore.")
     return 0
+
+
+def command_backup(args) -> int:
+    """Real backup: export, then verify the export before calling it done."""
+    export_code = command_export(args)
+    if export_code != 0:
+        return export_code
+    state = read_json(STATE_FILE, {})
+    export_dir = state.get("last_portable_export_dir")
+    if not export_dir:
+        print("Backup created an export but could not locate it in state; run restore-check manually.")
+        return 1
+    print()
+
+    class _RestoreArgs:
+        export_path = export_dir
+        strict = False
+        json = False
+
+    return command_restore_check(_RestoreArgs())
 
 
 def command_backup_status(args) -> int:
     status = get_backup_status(args.vault_dir, verify=bool(args.verify))
-    if args.json:
-        print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0 if status.get("ok") else 1
     ok, detail = portable_backup_detail(status, max_age_hours=args.max_age_hours)
+    if args.json:
+        # 退出码与文本分支同口径：机器消费也必须看新鲜度，不能只看 manifest 存在
+        status["freshness_ok"] = ok
+        status["freshness_detail"] = detail
+        print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0 if ok else 1
     latest = status.get("latest_export") or {}
     totals = latest.get("totals") or {}
     print("Immortal Backup Status")
@@ -1440,24 +1684,31 @@ def command_restore_guide(args) -> int:
     print("1. Copy or mount the export directory on the new machine.")
     print(f"   Latest known export: {export_dir}")
     print()
-    print("2. Install the Immortal Codex skill.")
-    print("   python3 install.py --owner-display-name \"Your Name\" --alias \"Your Alias\"")
+    print("2. Install Immortal Memory from a repository checkout or wheel, then initialize it.")
+    print('   python3 -m pip install "/path/to/immortal-memory"')
+    init_command = cli_command("init", "--owner-display-name", "Your Name", "--alias", "Your Alias")
+    print(f"   {init_command}")
     print()
     print("3. Verify the export before trusting it.")
-    print(f"   python3 ~/.codex/skills/immortal/immortal.py restore-check {json.dumps(str(export_dir), ensure_ascii=False)}")
+    print(f"   {cli_command('restore-check', str(export_dir))}")
     print()
     print("4. Restore the vault files to ~/.immortal, then rebuild derived views.")
-    print("   python3 ~/.codex/skills/immortal/immortal.py train")
-    print("   python3 ~/.codex/skills/immortal/immortal.py health")
+    print(f"   {cli_command('train')}")
+    print(f"   {cli_command('health')}")
     print()
     print("5. Reinstall local automation on the new machine.")
-    print("   python3 ~/.codex/skills/immortal/immortal.py daily-install")
-    print("   python3 ~/.codex/skills/immortal/immortal.py daily-status")
+    print(f"   {cli_command('daily-install')}")
+    print(f"   {cli_command('daily-status')}")
     return 0
 
 
 def command_restore_check(args) -> int:
     result = restore_check(args.export_path, strict=bool(args.strict))
+    if result.get("ok"):
+        write_state_key("last_portable_restore_check", datetime.now(timezone.utc).isoformat())
+    write_state_key("last_portable_restore_check_dir", result.get("export_dir"))
+    write_state_key("last_portable_restore_check_files", result.get("checked_files", 0))
+    write_state_key("last_portable_restore_check_status", "ok" if result.get("ok") else "failed")
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0 if result.get("ok") else 1
@@ -1484,6 +1735,7 @@ def command_restore_check(args) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="immortal", description="Codex entry for the Immortal Skill")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show current memory library state").set_defaults(func=command_status)
@@ -1527,7 +1779,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="Run capture, summary, dashboard, distill, and cleanup orchestration").set_defaults(
         func=lambda args: run_script("orchestrator.py")
     )
-    sub.add_parser("backup", help="Alias for run").set_defaults(func=lambda args: run_script("orchestrator.py"))
+    backup = sub.add_parser("backup", help="Create a portable export and verify it immediately (real backup; no longer an alias for run)")
+    backup.add_argument("--vault-dir", default=None)
+    backup.add_argument("--output-dir", default=None, help="Export target; use an external disk or synced folder for real loss protection")
+    backup.add_argument("--include-raw", action="store_true")
+    backup.set_defaults(func=command_backup)
     sub.add_parser("distill", help="Regenerate digital soul").set_defaults(func=lambda args: run_script("distill.py"))
     sub.add_parser("profile", help="Build structured owner profile from distilled memories and raw evidence").set_defaults(
         func=lambda args: run_script("profile.py")
@@ -1591,9 +1847,34 @@ def build_parser() -> argparse.ArgumentParser:
     cc_worker.add_argument("cc_worker_args", nargs=argparse.REMAINDER)
     cc_worker.set_defaults(func=command_cc_worker)
 
-    package = sub.add_parser("package", help="Build a sanitized installable zip for another Codex user")
-    package.add_argument("package_args", nargs=argparse.REMAINDER)
-    package.set_defaults(func=command_package)
+    web_collect = sub.add_parser("web-collect", help="Collect Chrome and Edge history metadata into the local vault")
+    web_collect.add_argument("web_args", nargs=argparse.REMAINDER)
+    web_collect.set_defaults(func=command_web_collect)
+
+    web_save = sub.add_parser("web-save", help="Manually save one web page snapshot into the local vault")
+    web_save.add_argument("url")
+    web_save.add_argument("web_save_args", nargs=argparse.REMAINDER)
+    web_save.set_defaults(func=command_web_save)
+
+    web_status = sub.add_parser("web-status", help="Show latest web capture status")
+    web_status.add_argument("web_status_args", nargs=argparse.REMAINDER)
+    web_status.set_defaults(func=command_web_status)
+
+    notes_sync = sub.add_parser("notes-sync", help="Ingest hand-written Obsidian notes (笔记/) into the local vault")
+    notes_sync.add_argument("notes_sync_args", nargs=argparse.REMAINDER)
+    notes_sync.set_defaults(func=command_notes_sync)
+
+    notes_status = sub.add_parser("notes-status", help="Show latest Obsidian notes ingestion status")
+    notes_status.add_argument("notes_status_args", nargs=argparse.REMAINDER)
+    notes_status.set_defaults(func=command_notes_status)
+
+    obsidian_sync = sub.add_parser("obsidian-sync", help="Generate Obsidian reading-layer indexes and link health")
+    obsidian_sync.add_argument("obsidian_args", nargs=argparse.REMAINDER)
+    obsidian_sync.set_defaults(func=command_obsidian_sync)
+
+    obsidian_status = sub.add_parser("obsidian-status", help="Show latest Obsidian sync status")
+    obsidian_status.add_argument("obsidian_status_args", nargs=argparse.REMAINDER)
+    obsidian_status.set_defaults(func=command_obsidian_status)
 
     profile_merge = sub.add_parser("profile-merge", help="Merge checked profile candidates into reviewed long-term memory")
     profile_merge.add_argument("profile_merge_args", nargs=argparse.REMAINDER)
@@ -1667,7 +1948,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_context.add_argument("--output", default="")
     agent_context.add_argument("--timeout", type=int, default=240)
     agent_context.add_argument("--print", action="store_true")
+    agent_context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     agent_context.set_defaults(func=command_agent_context)
+
+    preflight = sub.add_parser("preflight", help="Read-only readiness check: is the memory actually usable, protected, and current?")
+    preflight.add_argument("query", nargs="?", default="")
+    preflight.add_argument("--since", default=None)
+    preflight.add_argument("--max-age-hours", type=float, default=72)
+    preflight.add_argument("--vault-dir", default=None)
+    preflight.add_argument("--json", action="store_true")
+    preflight.set_defaults(func=command_preflight)
 
     agent_http = sub.add_parser("agent-http", help="Start the local HTTP Agent Bridge")
     agent_http.add_argument("--host", default="127.0.0.1")
@@ -1720,6 +2010,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("product", help="Generate the product-level operating brief").set_defaults(func=command_product)
     sub.add_parser("goal", help="Alias for product; show what this system is becoming").set_defaults(func=command_product)
 
+    cards_p = sub.add_parser("cards", help="判断力卡片盒（纠正即记忆）：build / list [n] / stats")
+    cards_p.add_argument("action", nargs="?", default="build", choices=["build", "list", "stats"])
+    cards_p.add_argument("extra", nargs="?", default=None)
+    cards_p.set_defaults(func=lambda args: run_script(
+        "cards.py", [args.action] + ([args.extra] if args.extra else [])))
+
+    project_p = sub.add_parser("project", help="项目立项与 Obsidian 可视化项目管理：new / build / list / build-all")
+    project_p.add_argument("project_args", nargs=argparse.REMAINDER,
+                           help="转发给 project.py，如：new \"项目名\" --terms a,b --people p1 --client 名")
+    project_p.set_defaults(func=lambda args: run_script("project.py", args.project_args))
+
     brief = sub.add_parser("brief", help="Generate a local daily brief from recent records")
     brief.add_argument("--days", type=int, default=2)
     brief.add_argument("--limit", type=int, default=8)
@@ -1729,12 +2030,14 @@ def build_parser() -> argparse.ArgumentParser:
     recall.add_argument("query")
     recall.add_argument("--source", default=None)
     recall.add_argument("--since", default=None)
+    recall.add_argument("--json", action="store_true", help="Print one JSON object instead of text output")
     recall.set_defaults(func=command_recall)
 
     search = sub.add_parser("search", help="Alias for recall")
     search.add_argument("query")
     search.add_argument("--source", default=None)
     search.add_argument("--since", default=None)
+    search.add_argument("--json", action="store_true", help="Print one JSON object instead of text output")
     search.set_defaults(func=command_recall)
 
     context = sub.add_parser("context", help="Build a compact task-local context pack")
@@ -1765,15 +2068,27 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "feishu-distill":
         return run_script("feishu_distill.py", argv[1:])
     if argv and argv[0] == "feishu-mirror":
-        return run_script("feishu_drive_mirror.py", argv[1:])
+        return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[1:]))
     if argv and argv[0] == "feishu-mirror-status":
         return command_feishu_mirror_status(argparse.Namespace(json="--json" in argv[1:]))
     if argv and argv[0] == "feishu-mirror-worker":
         return run_script("feishu_mirror_worker.py", argv[1:])
     if argv and argv[0] == "cc-worker":
         return run_script("cc_worker.py", argv[1:])
-    if argv and argv[0] == "package":
-        return run_script("package_tool.py", argv[1:])
+    if argv and argv[0] == "web-collect":
+        return command_web_collect(argparse.Namespace(web_args=argv[1:]))
+    if argv and argv[0] == "web-save":
+        return run_script("web_capture.py", ["save", *argv[1:]])
+    if argv and argv[0] == "web-status":
+        return run_script("web_capture.py", ["status", *argv[1:]])
+    if argv and argv[0] == "notes-sync":
+        return run_script("obsidian_notes_sync.py", ["sync", *argv[1:]])
+    if argv and argv[0] == "notes-status":
+        return run_script("obsidian_notes_sync.py", ["status", *argv[1:]])
+    if argv and argv[0] == "obsidian-sync":
+        return command_obsidian_sync(argparse.Namespace(obsidian_args=argv[1:]))
+    if argv and argv[0] == "obsidian-status":
+        return run_script("obsidian_sync.py", ["status", *argv[1:]])
     if argv and argv[0] == "profile-merge":
         return run_script("profile_merge.py", argv[1:])
     if argv and argv[0] == "profile-auto-review":
@@ -1799,7 +2114,9 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "distill":
         return run_script("feishu_distill.py", argv[2:])
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror":
-        return run_script("feishu_drive_mirror.py", argv[2:])
+        # 必须走 command_feishu_mirror 注入账号隔离守卫（红线）；直接 run_script 会绕过守卫，
+        # 空守卫参数下 verify_account 短路通过，可镜像任意登录账号——与连字符形保持一致
+        return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[2:]))
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror-status":
         return command_feishu_mirror_status(argparse.Namespace(json="--json" in argv[2:]))
     if len(argv) >= 2 and argv[0] == "feishu" and argv[1] == "mirror-worker":

@@ -13,6 +13,20 @@ DEFAULT_REGEXES = [
     ("private_key_block", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 ]
 
+DEFAULT_PRIVATE_LITERALS = [
+    "Blake Xu",
+    "小黑子",
+    "徐将",
+    "晓舟",
+    "酱油",
+    "小声比比",
+    "田洋",
+    "曹嵘",
+    "com.blakexu.",
+    "~/Desktop/claudecode",
+    "heige-workbench",
+]
+
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".sh", ".example"}
 
@@ -34,6 +48,10 @@ def main() -> int:
         for name, pattern in DEFAULT_REGEXES:
             if re.search(pattern, text):
                 hits.append(f"{path.relative_to(root)}: {name}")
+        if path.resolve() != Path(__file__).resolve():
+            for marker in DEFAULT_PRIVATE_LITERALS:
+                if marker in text:
+                    hits.append(f"{path.relative_to(root)}: private_identity_marker")
         for pattern in extra:
             if pattern in text:
                 hits.append(f"{path.relative_to(root)}: {pattern}")

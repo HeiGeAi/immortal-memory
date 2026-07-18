@@ -16,26 +16,12 @@ from typing import Optional
 from pathlib import Path
 from collections import Counter
 
-
-# 时间衰减：相关性仍是主轴，但越新的记录得分越高，避免旧内容长期压住新进展。
-# 今天≈2.0x，120天≈1.37x，一年≈1.05x。
-RECENCY_TAU_DAYS = 120.0
-RECENCY_BOOST = 1.0
+# 让子进程方式启动时也能 import 同目录的 index_db（防御性）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
-def recency_multiplier(ts: str) -> float:
-    if not ts:
-        return 1.0
-    try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except Exception:
-        return 1.0
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0
-    if age_days < 0:
-        age_days = 0.0
-    return 1.0 + RECENCY_BOOST * math.exp(-age_days / RECENCY_TAU_DAYS)
+# 时间衰减收敛到 ranking_common（单一真源），与 index_db 共用，避免两通道打分口径漂移。
+from ranking_common import RECENCY_TAU_DAYS, RECENCY_BOOST, local_date, recency_multiplier  # noqa: E402,F401
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -45,18 +31,23 @@ EMBEDDINGS_DIR = IMMORTAL_DIR / "embeddings"
 
 
 def redact(text: str) -> str:
-    patterns = [
-        (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-        (r"(?i)(app secret\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(apikey\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-        (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"(?i)(密码\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
-        (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    ]
-    for pattern, replacement in patterns:
-        text = re.sub(pattern, replacement, text)
-    return text
+    """统一走 redact_common（单一真源）。导入失败回退内联最小集，绝不裸奔。"""
+    try:
+        from redact_common import redact as _r
+        return _r(text)
+    except Exception:
+        patterns = [
+            (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+            (r"(?i)(api\s*key\s*[:：]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+            (r"(?i)(password\s*[:：]?\s*)\S+", r"\1[REDACTED]"),
+            (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+            (r"\bgh[posru]_[A-Za-z0-9]{20,}\b", "gh_[REDACTED]"),
+            (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+            (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+        ]
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text)
+        return text
 
 
 # ============================================================
@@ -206,7 +197,8 @@ def _cosine_similarity(a: list, b: list) -> float:
 
 
 def embedding_search(query: str, limit: int = 20, source: Optional[str] = None,
-                     since: Optional[str] = None, source_prefix: Optional[str] = None) -> list:
+                     since: Optional[str] = None, source_prefix: Optional[str] = None,
+                     until: Optional[str] = None) -> list:
     """使用 embedding 向量搜索。"""
     client = _get_embedding_client()
     if client is None:
@@ -234,8 +226,10 @@ def embedding_search(query: str, limit: int = 20, source: Optional[str] = None,
                 if source_prefix and not entry.get("source", "").startswith(source_prefix):
                     continue
                 ts = entry.get("timestamp", "")
-                date = ts[:10] if ts else ""
+                date = local_date(ts)
                 if since and date < since:
+                    continue
+                if until and date > until:
                     continue
 
                 similarity = _cosine_similarity(query_vec, entry["embedding"])
@@ -312,7 +306,7 @@ class TFIDFEngine:
             if source_prefix and not doc.get("source", "").startswith(source_prefix):
                 continue
             ts = doc.get("timestamp", "")
-            date = ts[:10] if ts else ""
+            date = local_date(ts)
             if since and date < since:
                 continue
             if until and date > until:
@@ -342,35 +336,179 @@ class TFIDFEngine:
 
 
 # ============================================================
-# 统一搜索入口
+# 短语精确匹配通道（零依赖，高精度）
 # ============================================================
+
+def phrase_search(engine: "TFIDFEngine", query: str, limit: int = 20,
+                  source: Optional[str] = None, source_prefix: Optional[str] = None,
+                  since: Optional[str] = None, until: Optional[str] = None) -> list:
+    """在已加载的 TF-IDF 引擎语料上做整串精确匹配。
+
+    与 TF-IDF（打散 token 命中）互补：奖励把整个查询作为连续子串出现的记录，
+    高精度，可在无 OPENAI_API_KEY 时运行。复用 engine 已加载的 docs，避免二次全量读盘。
+    """
+    engine.load()
+    ql = query.lower().strip()
+    if len(ql) < 2 or engine.total_docs == 0:
+        return []
+
+    scored = []
+    for doc in engine.docs:
+        if source and doc.get("source") != source:
+            continue
+        if source_prefix and not doc.get("source", "").startswith(source_prefix):
+            continue
+        ts = doc.get("timestamp", "")
+        date = local_date(ts)
+        if since and date < since:
+            continue
+        if until and date > until:
+            continue
+
+        content = doc.get("content", "")
+        cnt = content.lower().count(ql)
+        if cnt > 0:
+            score = cnt * recency_multiplier(doc.get("timestamp", ""))
+            scored.append((score, {k: v for k, v in doc.items() if k != "_tokens"}))
+
+    scored.sort(key=lambda x: -x[0])
+    return scored[:limit]
+
+
+# ============================================================
+# 统一搜索入口（RRF 多通道融合）
+# ============================================================
+
+def _record_key(record: dict) -> str:
+    """记录唯一键：优先 id，回退 时间戳+内容前缀 的哈希。"""
+    rid = record.get("id")
+    if rid:
+        return str(rid)
+    basis = record.get("timestamp", "") + "|" + (record.get("content") or record.get("content_preview") or "")[:80]
+    return "k:" + str(hash(basis))
+
+
+def _content_len(record: dict) -> int:
+    return len(record.get("content") or record.get("content_preview") or "")
+
+
+def _rrf_fuse(rankings: list, k: int = 60) -> list:
+    """倒数排名融合（Reciprocal Rank Fusion）。
+
+    rankings: 多个已排序的 [(score, record), ...] 列表（每路各自 best-first）。
+    用排名而非分数融合，天然兼容不同通道的分数量纲与不完全重叠的语料；
+    同一记录被多路命中会自然加权上浮。返回 [(rrf_score, record), ...]。
+    """
+    fused = {}  # key -> [rrf_score, best_record]
+    for ranking in rankings:
+        for rank, (_score, rec) in enumerate(ranking, start=1):
+            key = _record_key(rec)
+            if key not in fused:
+                fused[key] = [0.0, rec]
+            fused[key][0] += 1.0 / (k + rank)
+            # 保留内容更全的那条（embedding 通道只带 200 字预览）
+            if _content_len(rec) > _content_len(fused[key][1]):
+                fused[key][1] = rec
+    out = [(v[0], v[1]) for v in fused.values()]
+    out.sort(key=lambda x: -x[0])
+    return out
+
+
+def _embedding_channel(query: str, candidates: int, source, source_prefix, since, until):
+    """向量通道：仅在有 OPENAI_API_KEY 且已构建 embedding 时返回结果，否则 []。"""
+    client = _get_embedding_client()
+    if not (client and EMBEDDINGS_DIR.exists() and list(EMBEDDINGS_DIR.glob("*.jsonl"))):
+        return []
+    emb_results = embedding_search(query, limit=candidates, source=source,
+                                   source_prefix=source_prefix, since=since, until=until)
+    emb_norm = []
+    for score, entry in emb_results:
+        rec = {kk: vv for kk, vv in entry.items() if kk != "embedding"}
+        if not rec.get("content") and rec.get("content_preview"):
+            rec["content"] = rec["content_preview"]
+        emb_norm.append((score, rec))
+    return emb_norm
+
+
+def _inmemory_search(query, limit, source, source_prefix, since, until):
+    """内存引擎回退路径：TF-IDF + 短语 +(可选)向量，全量读盘。
+
+    仅在持久化 SQLite 索引不可用/异常时使用，保证 recall 始终可用。
+    """
+    candidates = max(limit * 3, 30)
+    rankings = []
+    labels = []
+
+    engine = TFIDFEngine()
+    tfidf_results = engine.search(query, limit=candidates, source=source,
+                                  source_prefix=source_prefix, since=since, until=until)
+    if tfidf_results:
+        rankings.append(tfidf_results)
+        labels.append("tfidf")
+
+    phrase_results = phrase_search(engine, query, limit=candidates, source=source,
+                                   source_prefix=source_prefix, since=since, until=until)
+    if phrase_results:
+        rankings.append(phrase_results)
+        labels.append("phrase")
+
+    emb = _embedding_channel(query, candidates, source, source_prefix, since, until)
+    if emb:
+        rankings.append(emb)
+        labels.append("embedding")
+
+    if not rankings:
+        return ("none", [])
+    if len(rankings) == 1:
+        return (labels[0], rankings[0][:limit])
+    fused = _rrf_fuse(rankings)
+    return ("fusion(" + "+".join(labels) + ")", fused[:limit])
+
 
 def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
                    source_prefix: Optional[str] = None, since: Optional[str] = None,
                    until: Optional[str] = None) -> tuple:
-    """自动选择最佳搜索引擎。
+    """多通道 RRF 融合检索（持久化索引快路径 + 内存引擎回退）。
 
-    Returns: (mode, results)
-        mode: "embedding" 或 "tfidf"
-        results: list of (score, record)
+    快路径：SQLite 持久化索引(index_db) 提供关键词(bm25/LIKE) + 短语两通道，亚秒级。
+    叠加 embedding 通道（有 key 时），RRF 融合。
+    DB 未构建或任何异常 -> 回退到内存 TF-IDF 引擎，保证 recall 永不失效。
+
+    Returns: (mode, results)，mode 形如 "fusion(bm25+phrase)" / "fusion(like+phrase+embedding)"
     """
-    # 优先尝试 embedding
-    client = _get_embedding_client()
-    if client and EMBEDDINGS_DIR.exists() and list(EMBEDDINGS_DIR.glob("*.jsonl")):
-        results = embedding_search(query, limit=limit, source=source,
-                                   source_prefix=source_prefix, since=since)
-        if results:
-            return ("embedding", results)
+    candidates = max(limit * 3, 30)
 
-    # 回退到 TF-IDF
-    engine = TFIDFEngine()
-    results = engine.search(query, limit=limit, source=source,
-                            source_prefix=source_prefix, since=since, until=until)
-    return ("tfidf", results)
+    # ---- 快路径：持久化 SQLite 索引 ----
+    try:
+        import index_db
+        index_db.sync()  # 增量同步，首次构建后基本零成本
+        labels, rankings = index_db.channels(
+            query, limit=limit, source=source, source_prefix=source_prefix,
+            since=since, until=until)
+    except Exception:
+        labels, rankings = [], []
+
+    if rankings:
+        emb = _embedding_channel(query, candidates, source, source_prefix, since, until)
+        if emb:
+            rankings.append(emb)
+            labels.append("embedding")
+        if len(rankings) == 1:
+            return (labels[0], rankings[0][:limit])
+        fused = _rrf_fuse(rankings)
+        return ("fusion(" + "+".join(labels) + ")", fused[:limit])
+
+    # ---- 回退：内存引擎 ----
+    return _inmemory_search(query, limit, source, source_prefix, since, until)
 
 
 def format_results(results: list, query: str, mode: str) -> str:
-    mode_label = "Embedding向量" if mode == "embedding" else "TF-IDF关键词"
+    mode_label = {
+        "embedding": "Embedding向量",
+        "tfidf": "TF-IDF关键词",
+        "phrase": "短语精确",
+        "none": "无",
+    }.get(mode, mode)
     if not results:
         return f"未找到与 {query} 相关的记录。（模式：{mode_label}）"
 

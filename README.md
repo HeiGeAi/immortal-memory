@@ -4,8 +4,8 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v0.1.0-111827.svg)
-![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/version-v1.0.0-111827.svg)
+![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
 
@@ -287,7 +287,3 @@ python3 -m py_compile $(find core -maxdepth 1 -name '*.py')
 ## License
 
 MIT. Change it before publishing if your project needs a different license.
-
-## 更多开源工具
-
-本项目属于黑哥 AI 的开源武器库。全部开源项目的清单、用途和协议,见 [heigeai.com/opensource](https://www.heigeai.com/opensource/)。

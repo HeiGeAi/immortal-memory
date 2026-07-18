@@ -34,131 +34,131 @@ MEMORY_SOURCES = [
     (DISTILLED_DIR / "memories.jsonl", "distilled_memory", 1.0),
 ]
 
-USER_ALIASES = {"用户本人", "用户本人", "Configured User", "用户本人"}
-USER_CANONICAL = "用户本人（用户本人 / Configured User）"
-TAOZI_CANONICAL = "协作者B（协作者B）"
-BIBI_CANONICAL = "协作账号（协作者A / 协作账号）"
-MAMA_CANONICAL = "协作者C（协作者C）"
+USER_ALIASES = {"用户本人", "用户本人", "Owner", "用户本人"}
+USER_CANONICAL = "用户本人（用户本人 / Owner）"
+TAOZI_CANONICAL = "协作者辛（协作者辛）"
+BIBI_CANONICAL = "内容创作者A（协作者己 / 内容账号A）"
+MAMA_CANONICAL = "协作者庚（协作者庚）"
 NON_PERSON_ENTITIES: set[str] = set()
-MAMA_ROLE_RE = re.compile(r"@?同事代理账号\s*协作者C|@?同事代理账号")
+MAMA_ROLE_RE = re.compile(r"@?协作者庚\s*协作者庚|@?协作者庚")
 BIBI_BRAND_CONTEXT_RE = re.compile(
-    r"(协作账号[-—_ ]?(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP)|"
-    r"协作账号[-—_ ]?(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP)|"
-    r"(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP).{0,8}协作账号)"
+    r"(内容账号A[-—_ ]?(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP)|"
+    r"内容创作者A[-—_ ]?(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP)|"
+    r"(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP).{0,8}内容账号A)"
 )
 BIBI_PERSON_CONTEXT_RE = re.compile(
-    r"(协作者A|协作账号(说|认为|负责|提醒|组织|审稿|反馈|要求|提到|提出|明确|提供|赋能|协助|主导|@)|"
-    r"协作账号(提供|赋能|负责|协助|主导|提出|明确)|@协作账号|协作账号@协作账号)"
+    r"(协作者己|内容创作者A(说|认为|负责|提醒|组织|审稿|反馈|要求|提到|提出|明确|提供|赋能|协助|主导|@)|"
+    r"内容账号A(提供|赋能|负责|协助|主导|提出|明确)|@内容创作者A|内容创作者A@内容账号A)"
 )
 
 ALIASES = {
     "用户本人": USER_CANONICAL,
     "用户本人": USER_CANONICAL,
-    "Configured User": USER_CANONICAL,
+    "Owner": USER_CANONICAL,
     "用户本人": USER_CANONICAL,
-    "协作者B": TAOZI_CANONICAL,
-    "协作者B": TAOZI_CANONICAL,
-    "协作账号": BIBI_CANONICAL,
-    "协作者A": BIBI_CANONICAL,
-    "协作账号": BIBI_CANONICAL,
-    "协作者C": MAMA_CANONICAL,
-    "协作者C": MAMA_CANONICAL,
-    "同事代理账号": MAMA_CANONICAL,
-    "同事代理账号 协作者C": MAMA_CANONICAL,
-    "错误账号": "错误账号",
-    "错误账号": "错误账号",
+    "协作者辛": TAOZI_CANONICAL,
+    "协作者辛": TAOZI_CANONICAL,
+    "内容创作者A": BIBI_CANONICAL,
+    "协作者己": BIBI_CANONICAL,
+    "内容账号A": BIBI_CANONICAL,
+    "协作者庚": MAMA_CANONICAL,
+    "协作者庚": MAMA_CANONICAL,
+    "协作者庚": MAMA_CANONICAL,
+    "协作者庚": MAMA_CANONICAL,
+    "协作者丑": "协作者丑",
+    "协作者丑": "协作者丑",
 }
 
 CANONICAL_ALIASES = {
-    USER_CANONICAL: ["用户本人", "用户本人", "Configured User", "用户本人"],
-    TAOZI_CANONICAL: ["协作者B", "协作者B"],
-    BIBI_CANONICAL: ["协作账号", "协作者A", "协作账号"],
-    MAMA_CANONICAL: ["协作者C", "协作者C", "同事代理账号"],
-    "错误账号": ["错误账号", "错误账号", "错误账号"],
+    USER_CANONICAL: ["用户本人", "用户本人", "Owner", "用户本人"],
+    TAOZI_CANONICAL: ["协作者辛", "协作者辛"],
+    BIBI_CANONICAL: ["内容创作者A", "协作者己", "内容账号A"],
+    MAMA_CANONICAL: ["协作者庚", "协作者庚", "协作者庚"],
+    "协作者丑": ["协作者丑", "协作者丑", "协作者丑"],
 }
 
 KNOWN_PERSON_HINTS = {
     USER_CANONICAL: "用户本人，也是这套记忆库默认服务的主体。记忆中与 AI 工具、内容业务、客户方案、团队协作、数据沉淀和长期画像高度相关。",
-    "协作者F": "团队协作成员，记忆中常出现在执行反馈、技术运维、员工场景观察、客户服务群和日常承接相关记录里。",
-    "协作者G": "团队协作成员，记忆中常与中台、客户服务器、技术承接、多 Agent 管理和新人培养相关。",
-    "协作者E": "商务协作成员，记忆中常与客户报价、筛客、商务流程、确权和销售沟通相关。",
-    "协作者D": "团队协作成员，记忆中常与投流、选题系统、数据中台、额度和内容运营协作相关。",
-    "协作者L": "内容与项目协作成员，记忆中常与审稿、内容项目、AI 工具反馈和文章生产流程相关。",
-    "外部客户A": "外部客户或项目方，记忆中常与某区域电商、中台方案、AI 应用规划、企业数据与本地部署诉求相关。",
-    BIBI_CANONICAL: "协作账号、协作者A和协作账号是同一个人。记忆中常与协作账号账号、内容标准、审稿、商务代理、飞书代理、客户确权和业务策略相关。",
-    MAMA_CANONICAL: "协作者C，本名协作者C，曾用飞书名“同事代理账号 协作者C”，是已经离职的同事。记忆中常与商务代理、客户对接、报价、合同、医美项目和送别材料相关。",
-    "协作者H": "团队协作成员，记忆中出现在内容、运营或项目协作相关记录里。",
-    TAOZI_CANONICAL: "协作者B和协作者B是同一个人。记忆中常出现在团队协作、招聘、绩效、内容运营、会议组织和业务沟通相关记录里。",
-    "协作者I": "团队协作成员，记忆中出现在项目协作和内容生产相关记录里。",
-    "协作者J": "团队协作成员，记忆中出现在内容生产、编辑协作和工具使用边界相关记录里。",
-    "错误账号": "团队协作成员，飞书显示名也可能是“错误账号”。此前曾被误判为非人物；现在按同事保留在人物档案中，等待更多高质量协作记录补充。",
-    "协作者K": "记忆库中的低频人物，需要更多证据后再形成稳定介绍。",
+    "协作者甲": "团队协作成员，记忆中常出现在执行反馈、技术运维、员工场景观察、客户服务群和日常承接相关记录里。",
+    "协作者乙": "团队协作成员，记忆中常与中台、客户服务器、技术承接、多 Agent 管理和新人培养相关。",
+    "协作者丙": "商务协作成员，记忆中常与客户报价、筛客、商务流程、确权和销售沟通相关。",
+    "Collaborator D": "团队协作成员，记忆中常与投流、选题系统、数据中台、额度和内容运营协作相关。",
+    "协作者戊": "内容与项目协作成员，记忆中常与审稿、内容项目、AI 工具反馈和文章生产流程相关。",
+    "客户甲": "外部客户或项目方，记忆中常与客户项目A、中台方案、AI 应用规划、企业数据与本地部署诉求相关。",
+    BIBI_CANONICAL: "内容创作者A、协作者己和内容账号A是同一个人。记忆中常与内容账号A账号、内容标准、审稿、商务代理、飞书代理、客户确权和业务策略相关。",
+    MAMA_CANONICAL: "协作者庚，本名协作者庚，曾用飞书名“协作者庚”，是已经离职的同事。记忆中常与商务代理、客户对接、报价、合同、医美项目和送别材料相关。",
+    "协作者壬": "团队协作成员，记忆中出现在内容、运营或项目协作相关记录里。",
+    TAOZI_CANONICAL: "协作者辛和协作者辛是同一个人。记忆中常出现在团队协作、招聘、绩效、内容运营、会议组织和业务沟通相关记录里。",
+    "协作者癸": "团队协作成员，记忆中出现在项目协作和内容生产相关记录里。",
+    "协作者子": "团队协作成员，记忆中出现在内容生产、编辑协作和工具使用边界相关记录里。",
+    "协作者丑": "团队协作成员，飞书显示名也可能是“协作者丑”。此前曾被误判为非人物；现在按同事保留在人物档案中，等待更多高质量协作记录补充。",
+    "协作者寅": "记忆库中的低频人物，需要更多证据后再形成稳定介绍。",
 }
 
 PROFILE_OVERRIDES = {
     USER_CANONICAL: {
         "role_summary": "记忆库主体与默认决策视角，负责把 AI 工具、内容业务、客户方案和团队协作沉淀成可复用能力。",
         "relationship_to_user": "这是用户本人；所有人物、项目和偏好都以他的视角归档。",
-        "work_context": "核心上下文集中在主账号、账号边界A、项目A、永生记忆库、商务交付和内容运营。",
+        "work_context": "核心上下文集中在内容账号B、技术账号A、业务项目A、永生记忆库、商务交付和内容运营。",
         "current_line": "当前判断：这个档案是长期画像的主轴，后续新增语料应优先区分“用户本人自己的话”和“他人对用户本人的描述”。",
     },
-    "协作者F": {
+    "协作者甲": {
         "role_summary": "日常执行、技术运维和员工场景反馈的承接者。",
         "relationship_to_user": "与用户本人是内部协作关系，经常承接 AI 技术运维、培训需求收集和客户服务群里的执行反馈。",
         "work_context": "常见场景包括 OpenClaw 支持、员工 AI 培训、客户服务群协同、日常运维和具体问题收集。",
         "current_line": "当前判断：这是高价值团队节点，适合持续沉淀成“执行反馈/运维承接/培训落地”的人物档案。",
     },
-    "协作者G": {
+    "协作者乙": {
         "role_summary": "技术承接和中台/客户服务器相关协作成员。",
         "relationship_to_user": "与用户本人围绕技术交付、客户环境、Agent 管理和新人培养协作。",
         "work_context": "常见场景包括客户服务器、中台方案、Mac mini 单点 Agent、OpenClaw/龙虾和技术问题承接。",
         "current_line": "当前判断：这是技术交付链路里的核心协作节点，后续应继续补足客户项目里的具体分工。",
     },
-    "协作者E": {
+    "协作者丙": {
         "role_summary": "商务协作成员，负责筛客、报价、确权和商务流程收口。",
         "relationship_to_user": "与用户本人在商务线索、客户沟通和成交流程上协作。",
         "work_context": "常见场景包括山东客户、新客户筛选、公众号商务码、报价和商务渠道管理。",
         "current_line": "当前判断：适合归入商务流程节点，重点追踪“谁筛客、谁成交、谁交付”的边界。",
     },
-    "协作者D": {
+    "Collaborator D": {
         "role_summary": "投流、选题系统和内容运营数据相关协作成员。",
         "relationship_to_user": "与用户本人围绕内容运营、投流、AB Test、数据中台和选题系统协作。",
         "work_context": "常见场景包括公众号/内容投流、选题判断、数据看板、额度和内容运营反馈。",
         "current_line": "当前判断：这是内容运营数据链路里的关键人物，后续应把投流和选题系统的职责继续结构化。",
     },
-    "协作者L": {
+    "协作者戊": {
         "role_summary": "内容生产、审稿和项目协作成员。",
         "relationship_to_user": "与用户本人围绕文章生产、审稿标准、选题流程和 AI 工具反馈协作。",
-        "work_context": "常见场景包括协作账号内容、编辑培养、审稿压力分解、文章生产流程和 AI 工具体验反馈。",
+        "work_context": "常见场景包括内容账号A内容、编辑培养、审稿压力分解、文章生产流程和 AI 工具体验反馈。",
         "current_line": "当前判断：这是内容生产链路里的高频节点，后续应区分“审稿标准输出”和“具体项目执行”。",
     },
     BIBI_CANONICAL: {
-        "role_summary": "协作账号相关 IP、内容标准、资源和业务策略的重要协作方。",
-        "relationship_to_user": "协作账号、协作者A和协作账号按同一人处理；与用户本人存在业务决策、IP 赋能、内容标准和客户资源协作。",
-        "work_context": "常见场景包括协作账号账号、内容审稿、商务代理、客户确权、选题标准、微信指数和业务策略。",
-        "current_line": "当前判断：这是强人物档案，必须持续区分“协作账号这个人”和“协作账号这个品牌/账号”。",
+        "role_summary": "内容账号A相关 IP、内容标准、资源和业务策略的重要协作方。",
+        "relationship_to_user": "内容创作者A、协作者己和内容账号A按同一人处理；与用户本人存在业务决策、IP 赋能、内容标准和客户资源协作。",
+        "work_context": "常见场景包括内容账号A账号、内容审稿、商务代理、客户确权、选题标准、微信指数和业务策略。",
+        "current_line": "当前判断：这是强人物档案，必须持续区分“内容创作者A这个人”和“内容账号A这个品牌/账号”。",
     },
     MAMA_CANONICAL: {
-        "role_summary": "前同事，曾承担同事代理账号和客户对接相关工作。",
-        "relationship_to_user": "协作者C、本名协作者C，曾用飞书名“同事代理账号 协作者C”；现在按已离职同事归档。",
+        "role_summary": "前同事，曾承担协作者庚和客户对接相关工作。",
+        "relationship_to_user": "协作者庚、本名协作者庚，曾用飞书名“协作者庚”；现在按已离职同事归档。",
         "work_context": "常见场景包括商务代理、客户报价、合同、医美项目、客户沟通和离职/送别材料。",
         "current_line": "当前判断：这是已确认身份合并档案，后续重点保留商务案例和客户交接信息。",
     },
     TAOZI_CANONICAL: {
         "role_summary": "团队协作和管理支持成员，常出现在招聘、绩效、会议组织和业务沟通里。",
-        "relationship_to_user": "协作者B和协作者B按同一人处理；与用户本人在团队管理、沟通辅导和业务推进上有关联。",
+        "relationship_to_user": "协作者辛和协作者辛按同一人处理；与用户本人在团队管理、沟通辅导和业务推进上有关联。",
         "work_context": "常见场景包括招聘、绩效、周例会、业务人员沟通、内容运营和团队协作。",
         "current_line": "当前判断：身份已合并，后续应继续补足她在管理支持和业务协调中的稳定职责。",
     },
-    "错误账号": {
-        "role_summary": "已确认同事，飞书显示名可能为“错误账号”。",
-        "relationship_to_user": "错误账号不是用户本人，也不是误抓账号；按用户本人的同事保留为人物线索。",
-        "work_context": "目前证据主要来自项目A、主账号、协作账号和商务交付相关记录，稳定职责还需要自动补证据。",
+    "协作者丑": {
+        "role_summary": "已确认同事，飞书显示名可能为“协作者丑”。",
+        "relationship_to_user": "协作者丑不是用户本人，也不是误抓账号；按用户本人的同事保留为人物线索。",
+        "work_context": "目前证据主要来自业务项目A、内容账号B、内容账号A和商务交付相关记录，稳定职责还需要自动补证据。",
         "current_line": "当前判断：身份已由用户确认，但高质量协作证据偏少；系统继续自动补强。",
     },
-    "外部客户A": {
+    "客户甲": {
         "role_summary": "外部客户或项目方，主要关联企业 AI 应用、中台方案和飞书生态迁移诉求。",
-        "relationship_to_user": "与用户本人是客户/项目方关系，围绕某区域电商、企业数据和交付方案沟通。",
+        "relationship_to_user": "与用户本人是客户/项目方关系，围绕客户项目A、企业数据和交付方案沟通。",
         "work_context": "常见场景包括钉钉到飞书迁移、本地部署、中台方案、企业数据和 AI 应用规划。",
         "current_line": "当前判断：这是外部客户档案，后续应把客户需求、承诺和交付边界分开记录。",
     },
@@ -166,20 +166,20 @@ PROFILE_OVERRIDES = {
 
 CATEGORY_BY_NAME = {
     USER_CANONICAL: "self",
-    "协作者F": "team",
-    "协作者G": "team",
-    "协作者E": "team",
-    "协作者D": "team",
-    "协作者L": "team",
-    "协作者H": "team",
+    "协作者甲": "team",
+    "协作者乙": "team",
+    "协作者丙": "team",
+    "Collaborator D": "team",
+    "协作者戊": "team",
+    "协作者壬": "team",
     TAOZI_CANONICAL: "team",
-    "协作者I": "team",
-    "协作者J": "team",
-    "错误账号": "team",
+    "协作者癸": "team",
+    "协作者子": "team",
+    "协作者丑": "team",
     MAMA_CANONICAL: "team",
-    "外部客户A": "customer",
+    "客户甲": "customer",
     BIBI_CANONICAL: "business",
-    "协作者K": "other",
+    "协作者寅": "other",
 }
 
 CATEGORY_LABELS = {
@@ -191,15 +191,15 @@ CATEGORY_LABELS = {
 }
 
 PROJECT_LABELS = {
-    "main_account": "主账号",
-    "machine0": "账号边界A",
-    "project_a": "项目A",
+    "heige_ai": "内容账号B",
+    "machine0": "技术账号A",
+    "tiangong": "业务项目A",
     "immortal": "永生记忆库",
     "feishu": "飞书",
     "openclaw": "OpenClaw / 龙虾",
     "content_ops": "内容运营",
     "business_ops": "商务与交付",
-    "partner_brand": "协作账号",
+    "xiaoshengbibi": "内容账号A",
     "general": "通用记忆",
 }
 
@@ -234,7 +234,7 @@ TYPE_WEIGHT = {
 
 LOW_SIGNAL_RE = re.compile(
     r"(本章节主要|本次会议|文字记录|你现在能看到吗|听得到吗|哈哈|嗯嗯|优化后文案|正式版|"
-    r"候选人|面试|全员被开|转正时被要求|临时需求|@同事代理账号|@错误账号|"
+    r"候选人|面试|全员被开|转正时被要求|临时需求|@协作者庚|@协作者丑|"
     r"约定时间|线上加入|等待人员加入|提醒参会|会议记录|录制：|智能纪要：|职业冒险|口播脚本|盾牌|"
     r"游戏通关视频脚本|送别视频|还记得我们一起|客户无法拒绝的报价方案|冒险脚本)"
 )
@@ -363,7 +363,7 @@ def row_people(row: dict[str, Any]) -> list[str]:
             continue
         if name not in output:
             output.append(name)
-    if MAMA_ROLE_RE.search(statement) or "协作者C" in statement or "协作者C" in row_text:
+    if MAMA_ROLE_RE.search(statement) or "协作者庚" in statement or "协作者庚" in row_text:
         if MAMA_CANONICAL not in output:
             output.append(MAMA_CANONICAL)
     if "用户本人" in row_text and USER_CANONICAL not in output:
@@ -391,7 +391,7 @@ def confidence_for_person(person: str, rows: list[dict[str, Any]], highlights: l
         if not is_low_signal(row)
     ]
     reviewed_rows = [row for row in rows if row.get("_origin") == "reviewed_profile"]
-    if person == "错误账号" and len(high_signal) < 3:
+    if person == "协作者丑" and len(high_signal) < 3:
         return "low", "证据偏少：已按同事保留为人物线索，系统会在后续采集和蒸馏中自动补强。"
     if len(rows) <= 2 or len(high_signal) == 0:
         return "low", "证据偏少：目前只保留为人物线索，后续自动采集到更多高质量协作记录后再稳定建档。"

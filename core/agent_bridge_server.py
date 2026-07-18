@@ -45,6 +45,24 @@ DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
+def is_allowed_origin(origin: str) -> bool:
+    try:
+        parsed = urlparse(str(origin or ""))
+        _ = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.scheme in {"http", "https"}
+        and parsed.hostname in LOOPBACK_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 def read_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -215,7 +233,7 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
 
     def end_headers(self) -> None:
         origin = self.headers.get("Origin", "")
-        if origin.startswith(("http://127.0.0.1", "http://localhost")):
+        if is_allowed_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Immortal-Token")

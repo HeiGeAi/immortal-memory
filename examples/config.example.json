@@ -27,6 +27,10 @@
     "expected_user_open_id": "",
     "reject_user_names": []
   },
+  "obsidian": {
+    "enabled": true,
+    "vault_path": "~/Documents/Immortal Obsidian Vault"
+  },
   "owner_aliases": [
     "Your Alias"
   ],
@@ -39,5 +43,42 @@
     "slug_prefix": "user"
   },
   "vault_dir": "~/.immortal",
-  "version": 1
+  "version": 1,
+  "web_capture": {
+    "auto_capture_metadata": true,
+    "browsers": [
+      {
+        "history_path": "~/Library/Application Support/Google/Chrome/Default/History",
+        "name": "chrome",
+        "profile": "Default"
+      },
+      {
+        "history_path": "~/Library/Application Support/Microsoft Edge/Default/History",
+        "name": "edge",
+        "profile": "Default"
+      }
+    ],
+    "deny_domains": [
+      "accounts.google.com",
+      "login.microsoftonline.com",
+      "login.live.com",
+      "appleid.apple.com",
+      "icloud.com",
+      "gmail.com",
+      "mail.google.com",
+      "outlook.live.com",
+      "outlook.office.com",
+      "paypal.com",
+      "stripe.com",
+      "alipay.com",
+      "weixin.qq.com",
+      "web.wechat.com"
+    ],
+    "enabled": true,
+    "fulltext_allow_domains": [],
+    "history_lookback_hours": 24,
+    "max_pages_per_run": 5,
+    "max_visits_per_run": 200,
+    "strip_url_query": true
+  }
 }

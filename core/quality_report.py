@@ -40,41 +40,41 @@ USER_CANONICAL = people_layer.USER_CANONICAL
 BIBI_CANONICAL = people_layer.BIBI_CANONICAL
 TAOZI_CANONICAL = people_layer.TAOZI_CANONICAL
 MAMA_CANONICAL = people_layer.MAMA_CANONICAL
-SHUSHU_CANONICAL = "错误账号"
+SHUSHU_CANONICAL = "协作者丑"
 
 CONFIRMED_IDENTITY_RULES = [
     {
         "id": "user",
         "canonical": USER_CANONICAL,
-        "aliases": ["用户本人", "用户本人", "Configured User", "用户本人"],
+        "aliases": ["用户本人", "用户本人", "Owner", "用户本人"],
         "expected_category": "self",
         "must_exist": True,
     },
     {
-        "id": "partner",
+        "id": "bibi",
         "canonical": BIBI_CANONICAL,
-        "aliases": ["协作账号", "协作者A", "协作账号"],
+        "aliases": ["内容创作者A", "协作者己", "内容账号A"],
         "expected_not_category": "self",
         "must_exist": True,
     },
     {
         "id": "taozi",
         "canonical": TAOZI_CANONICAL,
-        "aliases": ["协作者B", "协作者B"],
+        "aliases": ["协作者辛", "协作者辛"],
         "expected_not_category": "self",
         "must_exist": True,
     },
     {
         "id": "mama",
         "canonical": MAMA_CANONICAL,
-        "aliases": ["协作者C", "协作者C", "同事代理账号"],
+        "aliases": ["协作者庚", "协作者庚", "协作者庚"],
         "expected_not_category": "self",
         "must_exist": True,
     },
     {
         "id": "shushu",
         "canonical": SHUSHU_CANONICAL,
-        "aliases": ["错误账号", "错误账号", "错误账号"],
+        "aliases": ["协作者丑", "协作者丑", "协作者丑"],
         "expected_not_category": "self",
         "must_exist": True,
     },
@@ -87,12 +87,12 @@ STATUS_LABELS = {
     "warn": "输入不完整",
 }
 PROFILE_CONTAMINATION_RE = re.compile(
-    r"(候选人|简历|面试|录用决定|协作账号账号|协作账号账号|公众号矩阵|第三方观点|"
+    r"(候选人|简历|面试|录用决定|内容账号A账号|内容创作者A账号|公众号矩阵|第三方观点|"
     r"给直接管理者|客户无法拒绝的报价方案|送别视频|口播脚本|游戏通关视频)"
 )
 FIRST_PERSON_RE = re.compile(r"(^|[。！？\n])\s*(我|我们|咱们)")
 OTHER_SUBJECT_RE = re.compile(
-    r"(^|\n|\s)(协作者A|协作账号|协作者L|协作者L|郭协作者H|协作者H|协作者I|候选人)"
+    r"(^|\n|\s)(协作者己|内容创作者A|董协作者戊|协作者戊|郭协作者壬|协作者壬|协作者癸|候选人)"
     r"(认为|指出|提出|表示|反馈|负责|用|的|在|将|需|需要|奖金|签字)"
 )
 ORG_FACT_RE = re.compile(
@@ -203,7 +203,7 @@ def reviewed_self_profile_contamination_reason(
         return "other_person_subject"
     if ORG_FACT_RE.search(statement):
         return "org_or_event_fact"
-    if (("partner_brand" in projects or PROFILE_CONTAMINATION_RE.search(text)) and not has_user):
+    if (("xiaoshengbibi" in projects or PROFILE_CONTAMINATION_RE.search(text)) and not has_user):
         return "brand_or_third_party_context_without_owner"
     return ""
 
@@ -396,7 +396,7 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
 
     user_alias_misses = []
     mama_misses = []
-    partner_brand_hits = []
+    bibi_brand_hits = []
     contamination_hits = []
     for row in rows:
         text = row_text(row)
@@ -411,7 +411,7 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
             and BIBI_CANONICAL in canonical_people
             and not people_layer.BIBI_PERSON_CONTEXT_RE.search(text)
         ):
-            partner_brand_hits.append(row_sample(row))
+            bibi_brand_hits.append(row_sample(row))
         contamination_reason = reviewed_self_profile_contamination_reason(
             row,
             text=text,
@@ -421,13 +421,13 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
             sample = row_sample(row)
             sample["reason"] = contamination_reason
             contamination_hits.append(sample)
-        if "同事代理账号" in raw_people and MAMA_CANONICAL not in canonical_people:
+        if "协作者庚" in raw_people and MAMA_CANONICAL not in canonical_people:
             mama_misses.append(row_sample(row))
 
     if user_alias_misses:
         make_issue(
             issues,
-            issue_id="user_alias_extraction_miss:user",
+            issue_id="user_alias_extraction_miss:xujiang",
             area="identity",
             severity="medium",
             title="用户本人别名可能漏抽取",
@@ -441,21 +441,21 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
             issue_id="mama_role_alias_miss",
             area="identity",
             severity="high",
-            title="同事代理账号没有归到协作者C",
-            detail=f"发现 {len(mama_misses)} 条商务代理语境没有进入协作者C档案。",
+            title="协作者庚没有归到协作者庚",
+            detail=f"发现 {len(mama_misses)} 条商务代理语境没有进入协作者庚档案。",
             suggested_action="优先检查 people_index.py 的 MAMA_ROLE_RE 和 row_people 规则。",
             evidence=mama_misses[:6],
         )
-    if partner_brand_hits:
+    if bibi_brand_hits:
         make_issue(
             issues,
-            issue_id="partner_brand_as_person",
+            issue_id="bibi_brand_as_person",
             area="identity",
             severity="medium",
-            title="协作账号品牌语境可能被当成人",
-            detail=f"发现 {len(partner_brand_hits)} 条账号/品牌语境仍进入协作账号人物证据。",
-            suggested_action="继续收紧 BIBI_BRAND_CONTEXT_RE，不把账号素材当作协作账号本人行为。",
-            evidence=partner_brand_hits[:6],
+            title="内容账号A品牌语境可能被当成人",
+            detail=f"发现 {len(bibi_brand_hits)} 条账号/品牌语境仍进入内容创作者A人物证据。",
+            suggested_action="继续收紧 BIBI_BRAND_CONTEXT_RE，不把账号素材当作内容创作者A本人行为。",
+            evidence=bibi_brand_hits[:6],
         )
     if contamination_hits:
         make_issue(
@@ -463,7 +463,7 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
             issue_id="reviewed_profile_contamination",
             area="profile",
             severity="high",
-            title="长期画像存在第三方或协作账号账号污染风险",
+            title="长期画像存在第三方或内容创作者A账号污染风险",
             detail=f"发现 {len(contamination_hits)} 条 reviewed self_profile 缺少用户主语，但含第三方/账号语境。",
             suggested_action="用 profile-auto-review 重新剪掉不符合当前归因规则的 reviewed rows。",
             evidence=contamination_hits[:6],
@@ -475,7 +475,7 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
         "confirmed_rules": len(CONFIRMED_IDENTITY_RULES),
         "user_alias_miss_count": len(user_alias_misses),
         "mama_role_miss_count": len(mama_misses),
-        "partner_brand_ambiguity_count": len(partner_brand_hits),
+        "bibi_brand_ambiguity_count": len(bibi_brand_hits),
         "reviewed_profile_contamination_count": len(contamination_hits),
     }
     return issues, observations, metrics
@@ -494,7 +494,10 @@ def check_relationships(index: dict[str, Any]) -> tuple[list[dict[str, Any]], li
     top_weak_score = max((float_value(edge.get("score")) for edge in weak_edges), default=0.0)
     ratio = round(top_project_score / top_person_score, 2) if top_person_score else 0.0
 
-    weak_threshold = max(80.0, top_person_score * 0.8)
+    # co_mention_weak and person_person scores use different scales. Basing
+    # this threshold on the strongest person edge made the alert unreachable
+    # in real data (person scores in the thousands, project scores <= 120).
+    weak_threshold = 80.0
     weak_high = sorted(
         [edge for edge in weak_edges if float_value(edge.get("score")) >= weak_threshold],
         key=lambda edge: float_value(edge.get("score")),
@@ -602,8 +605,8 @@ def check_relationships(index: dict[str, Any]) -> tuple[list[dict[str, Any]], li
         source = str(edge.get("source_label") or "")
         target = str(edge.get("target_label") or "")
         if (
-            (source == USER_CANONICAL and target == "主账号")
-            or (source == BIBI_CANONICAL and target == "协作账号")
+            (source == USER_CANONICAL and target == "内容账号B")
+            or (source == BIBI_CANONICAL and target == "内容账号A")
         ):
             self_identity_edges.append(edge)
     if self_identity_edges:
@@ -613,7 +616,7 @@ def check_relationships(index: dict[str, Any]) -> tuple[list[dict[str, Any]], li
             area="relationship",
             severity="low",
             title="账号/身份项目边是热度，不是真协作关系",
-            detail="主账号、协作账号这类项目标签会高频出现，应解释为身份/账号热度。",
+            detail="内容账号B、内容账号A这类项目标签会高频出现，应解释为身份/账号热度。",
             suggested_action="看板文案使用“项目关联热度”，不要把它称为强关系。",
             evidence=[edge_sample(edge) for edge in self_identity_edges[:4]],
         )
@@ -796,7 +799,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- 用户本人档案数：{identity.get('self_count', 0)}",
         f"- 用户本人漏抽取样本：{identity.get('user_alias_miss_count', 0)}",
         f"- 商务代理归因异常样本：{identity.get('mama_role_miss_count', 0)}",
-        f"- 协作账号品牌/人物歧义样本：{identity.get('partner_brand_ambiguity_count', 0)}",
+        f"- 内容账号A品牌/人物歧义样本：{identity.get('bibi_brand_ambiguity_count', 0)}",
         "",
         "## 关系质量",
         f"- 总关系边：{relationships.get('total_edges', 0)}",
