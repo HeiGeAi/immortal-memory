@@ -20,6 +20,10 @@ from secret_scan import scan_text_shapes
 NOTES_SUBDIR = "笔记"
 
 
+class ReconciliationConflict(RuntimeError):
+    """The same note fact has different payloads across durable stores."""
+
+
 @dataclass(frozen=True)
 class NoteIngestionLimits:
     max_files: int = 1000
@@ -48,11 +52,8 @@ def after_daily_append() -> None:
     """Fault-injection boundary between authoritative daily and index writes."""
 
 
-def _safe_relative(path: Path, root: Path) -> Optional[str]:
-    try:
-        return path.relative_to(root).as_posix()
-    except ValueError:
-        return None
+def before_file_open(_relative_path: str) -> None:
+    """Deterministic test boundary; production leaves the anchored fd unchanged."""
 
 
 def _skip(
@@ -89,23 +90,30 @@ def _skip_secret(
 
 
 def _walk_note_entries(
-    directory: Path,
-    root: Path,
+    directory_fd: int,
+    relative_directory: str,
     skipped: list[dict[str, Any]],
     counts: Counter,
 ):
     try:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        names = sorted(os.listdir(directory_fd))
     except OSError:
-        relative = _safe_relative(directory, root) or "."
-        _skip(skipped, counts, relative, "directory_unreadable")
+        _skip(skipped, counts, relative_directory or ".", "directory_unreadable")
         return
-    for entry in entries:
-        path = Path(entry.path)
-        relative = _safe_relative(path, root) or entry.name
-        if entry.is_symlink():
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    for name in names:
+        relative = f"{relative_directory}/{name}" if relative_directory else name
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            _skip(skipped, counts, relative, "file_unreadable")
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
             try:
-                is_directory = entry.is_dir(follow_symlinks=True)
+                followed = os.stat(name, dir_fd=directory_fd, follow_symlinks=True)
+                is_directory = stat.S_ISDIR(followed.st_mode)
             except OSError:
                 is_directory = False
             _skip(
@@ -115,32 +123,55 @@ def _walk_note_entries(
                 "symlink_directory" if is_directory else "symlink_file",
             )
             continue
-        if entry.is_dir(follow_symlinks=False):
-            yield from _walk_note_entries(path, root, skipped, counts)
+        if stat.S_ISDIR(metadata.st_mode):
+            try:
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            except OSError:
+                _skip(skipped, counts, relative, "directory_unreadable")
+                continue
+            try:
+                yield from _walk_note_entries(
+                    child_fd,
+                    relative,
+                    skipped,
+                    counts,
+                )
+            finally:
+                os.close(child_fd)
             continue
-        if not entry.is_file(follow_symlinks=False):
-            if path.suffix.lower() == ".md":
+        if not stat.S_ISREG(metadata.st_mode):
+            if Path(name).suffix.lower() == ".md":
                 _skip(skipped, counts, relative, "not_regular_file")
             continue
-        if path.suffix.lower() != ".md" or path.name.startswith("_"):
+        if Path(name).suffix.lower() != ".md" or name.startswith("_"):
             continue
-        yield path
+        yield directory_fd, name, relative
 
 
-def _read_regular_file(path: Path, max_bytes: int) -> tuple[Optional[bytes], Optional[os.stat_result], str]:
+def _open_regular_file(
+    directory_fd: int,
+    name: str,
+) -> tuple[Optional[int], Optional[os.stat_result], str]:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(path, flags)
+        fd = os.open(name, flags, dir_fd=directory_fd)
     except OSError:
         return None, None, "file_unreadable"
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
+            os.close(fd)
             return None, metadata, "not_regular_file"
-        if metadata.st_size > max_bytes:
-            return None, metadata, "file_too_large"
+        return fd, metadata, ""
+    except OSError:
+        os.close(fd)
+        return None, None, "file_unreadable"
+
+
+def _read_open_file(fd: int, max_bytes: int) -> tuple[Optional[bytes], str]:
+    try:
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -150,10 +181,10 @@ def _read_regular_file(path: Path, max_bytes: int) -> tuple[Optional[bytes], Opt
             chunks.append(chunk)
             total += len(chunk)
             if total > max_bytes:
-                return None, metadata, "file_too_large"
-        return b"".join(chunks), metadata, ""
+                return None, "file_too_large"
+        return b"".join(chunks), ""
     except OSError:
-        return None, None, "file_unreadable"
+        return None, "file_unreadable"
     finally:
         os.close(fd)
 
@@ -162,7 +193,15 @@ def discover_notes(
     obsidian_vault: Path,
     *,
     limits: NoteIngestionLimits,
-) -> tuple[list[NoteCandidate], list[dict[str, Any]], dict[str, int], dict[str, int], int]:
+) -> tuple[
+    list[NoteCandidate],
+    list[dict[str, Any]],
+    dict[str, int],
+    dict[str, int],
+    int,
+    int,
+    int,
+]:
     notes_root = Path(obsidian_vault) / NOTES_SUBDIR
     skipped: list[dict[str, Any]] = []
     skipped_counts: Counter = Counter()
@@ -170,79 +209,102 @@ def discover_notes(
     candidates: list[NoteCandidate] = []
     scanned = 0
     accepted_bytes = 0
+    processed_bytes = 0
     bounded_files = 0
 
     if notes_root.is_symlink():
         _skip(skipped, skipped_counts, ".", "symlink_directory")
-        return [], skipped, dict(skipped_counts), {}, scanned
-    if not notes_root.is_dir():
-        return [], skipped, {}, {}, scanned
+        return [], skipped, dict(skipped_counts), {}, scanned, 0, 0
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
     try:
-        root = notes_root.resolve(strict=True)
+        root_fd = os.open(notes_root, directory_flags)
+    except FileNotFoundError:
+        return [], skipped, {}, {}, scanned, 0, 0
     except OSError:
         _skip(skipped, skipped_counts, ".", "directory_unreadable")
-        return [], skipped, dict(skipped_counts), {}, scanned
+        return [], skipped, dict(skipped_counts), {}, scanned, 0, 0
 
-    for path in _walk_note_entries(notes_root, root, skipped, skipped_counts):
-        scanned += 1
-        relative = _safe_relative(path, notes_root) or path.name
-        try:
-            resolved = path.resolve(strict=True)
-            if _safe_relative(resolved, root) is None:
-                _skip(skipped, skipped_counts, relative, "outside_notes_root")
+    try:
+        for parent_fd, name, relative in _walk_note_entries(
+            root_fd,
+            "",
+            skipped,
+            skipped_counts,
+        ):
+            scanned += 1
+            before_file_open(relative)
+            fd, metadata, open_error = _open_regular_file(parent_fd, name)
+            if open_error:
+                _skip(skipped, skipped_counts, relative, open_error)
                 continue
-            preliminary = path.lstat()
-        except OSError:
-            _skip(skipped, skipped_counts, relative, "file_unreadable")
-            continue
-        if preliminary.st_size > limits.max_file_bytes:
-            _skip(skipped, skipped_counts, relative, "file_too_large")
-            continue
-        if bounded_files >= limits.max_files:
-            _skip(skipped, skipped_counts, relative, "max_files_reached")
-            continue
-        bounded_files += 1
-        payload, metadata, read_error = _read_regular_file(
-            path,
-            limits.max_file_bytes,
-        )
-        if read_error:
-            _skip(skipped, skipped_counts, relative, read_error)
-            continue
-        assert payload is not None and metadata is not None
-        if accepted_bytes + len(payload) > limits.max_total_bytes:
-            _skip(skipped, skipped_counts, relative, "total_bytes_exceeded")
-            continue
-        text = payload.decode("utf-8", errors="replace")
-        rules = scan_text_shapes(text)
-        if rules:
-            secret_counts.update(rules)
-            _skip_secret(
-                skipped,
-                skipped_counts,
-                relative,
-                list(rules),
+            assert fd is not None and metadata is not None
+            if metadata.st_size > limits.max_file_bytes:
+                os.close(fd)
+                _skip(skipped, skipped_counts, relative, "file_too_large")
+                continue
+            if bounded_files >= limits.max_files:
+                os.close(fd)
+                _skip(skipped, skipped_counts, relative, "max_files_reached")
+                continue
+            bounded_files += 1
+            if processed_bytes + metadata.st_size > limits.max_total_bytes:
+                os.close(fd)
+                _skip(skipped, skipped_counts, relative, "total_bytes_exceeded")
+                continue
+            remaining_budget = limits.max_total_bytes - processed_bytes
+            processed_bytes += metadata.st_size
+            read_limit = min(limits.max_file_bytes, remaining_budget)
+            payload, read_error = _read_open_file(fd, read_limit)
+            if read_error:
+                reason = (
+                    "total_bytes_exceeded"
+                    if read_error == "file_too_large"
+                    and remaining_budget <= limits.max_file_bytes
+                    else read_error
+                )
+                _skip(skipped, skipped_counts, relative, reason)
+                continue
+            assert payload is not None
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError:
+                _skip(skipped, skipped_counts, relative, "invalid_utf8")
+                continue
+            rules = scan_text_shapes(text)
+            if rules:
+                secret_counts.update(rules)
+                _skip_secret(
+                    skipped,
+                    skipped_counts,
+                    relative,
+                    list(rules),
+                )
+                continue
+            if not text.strip():
+                _skip(skipped, skipped_counts, relative, "empty_note")
+                continue
+            candidates.append(
+                NoteCandidate(
+                    path=Path(relative),
+                    relative_path=relative,
+                    text=text,
+                    size=len(payload),
+                    mtime=metadata.st_mtime,
+                )
             )
-            continue
-        if not text.strip():
-            _skip(skipped, skipped_counts, relative, "empty_note")
-            continue
-        candidates.append(
-            NoteCandidate(
-                path=path,
-                relative_path=relative,
-                text=text,
-                size=len(payload),
-                mtime=metadata.st_mtime,
-            )
-        )
-        accepted_bytes += len(payload)
+            accepted_bytes += len(payload)
+    finally:
+        os.close(root_fd)
     return (
         candidates,
         skipped,
         dict(sorted(skipped_counts.items())),
         dict(sorted(secret_counts.items())),
         scanned,
+        processed_bytes,
+        accepted_bytes,
     )
 
 
@@ -289,6 +351,43 @@ def _read_ids(path: Path) -> set[str]:
     return ids
 
 
+def _public_fact(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if not key.startswith("_")}
+
+
+def _read_note_rows(path: Path) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    if not path.is_file():
+        return rows
+    with path.open("rb") as handle:
+        for raw in handle:
+            if not raw.strip():
+                continue
+            try:
+                row = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("invalid_jsonl_fact") from exc
+            if not isinstance(row, dict):
+                raise ValueError("invalid_jsonl_fact")
+            if row.get("source") != "obsidian-note":
+                continue
+            record_id = str(row.get("id") or "").strip()
+            if not record_id:
+                raise ValueError("invalid_jsonl_fact")
+            existing = rows.get(record_id)
+            if existing is not None and _public_fact(existing) != _public_fact(row):
+                raise ReconciliationConflict("duplicate_note_payload_conflict")
+            rows[record_id] = row
+    return rows
+
+
+def _daily_path_for(vault: Path, row: dict[str, Any]) -> Path:
+    day = str(row.get("timestamp") or "")[:10]
+    if len(day) != 10 or day[4:5] != "-" or day[7:8] != "-":
+        raise ValueError("invalid_note_timestamp")
+    return vault / "daily" / f"{day}.jsonl"
+
+
 def _repair_partial_tail(path: Path) -> bool:
     if not path.is_file() or path.stat().st_size == 0:
         return False
@@ -330,6 +429,7 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]], *, public: bool) -> No
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
+    existed = path.exists()
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
     fd = os.open(path, flags, 0o600)
     try:
@@ -354,6 +454,12 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]], *, public: bool) -> No
         os.fsync(fd)
     finally:
         os.close(fd)
+    if not existed:
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def _base_result(
@@ -364,6 +470,8 @@ def _base_result(
     skipped: list[dict[str, Any]],
     skipped_by_reason: dict[str, int],
     secret_shapes: dict[str, int],
+    processed_bytes: int,
+    accepted_bytes: int,
 ) -> dict[str, Any]:
     return {
         "status": "ok",
@@ -376,6 +484,8 @@ def _base_result(
             "repaired_index": 0,
             "repaired_daily": 0,
             "repaired_tails": 0,
+            "processed_bytes": processed_bytes,
+            "accepted_bytes": accepted_bytes,
         },
         "skipped": skipped,
         "skipped_by_reason": skipped_by_reason,
@@ -388,14 +498,55 @@ def _persist_state(vault: Path, result: dict[str, Any]) -> dict[str, Any]:
         atomic_write_json(state_path(vault), result)
         return result
     except OSError:
-        result["status"] = "error"
-        result["error_code"] = "state_write_failed"
+        failed = dict(result)
+        failed["status"] = "error"
+        failed["error_code"] = "state_write_failed"
         totals = result.get("totals") if isinstance(result.get("totals"), dict) else {}
-        result["facts_committed"] = any(
+        failed["facts_committed"] = bool(result.get("facts_committed")) or any(
             int((totals or {}).get(key) or 0) > 0
             for key in ("ingested_this_run", "repaired_index", "repaired_daily")
         )
-        return result
+        return failed
+
+
+def _previous_last_success(vault: Path) -> Optional[str]:
+    previous = read_ingestion_state(vault)
+    if previous.get("status") == "ok":
+        value = previous.get("last_success") or previous.get("generated_at")
+    else:
+        value = previous.get("last_success")
+    return str(value) if value else None
+
+
+def _persist_failure(
+    vault: Path,
+    result: dict[str, Any],
+    *,
+    stage: str,
+    error: Exception,
+    last_success: Optional[str],
+    facts_committed: bool,
+    pending_repair_direction: Optional[str],
+) -> dict[str, Any]:
+    failed = dict(result)
+    failed["status"] = "error"
+    failed["error_code"] = (
+        "reconciliation_conflict"
+        if isinstance(error, ReconciliationConflict)
+        else "write_failed"
+    )
+    failed["error_stage"] = stage
+    failed["error_type"] = type(error).__name__
+    failed["facts_committed"] = facts_committed
+    if last_success:
+        failed["last_success"] = last_success
+    if pending_repair_direction:
+        failed["pending_repair_direction"] = pending_repair_direction
+    persisted = _persist_state(vault, failed)
+    if persisted.get("error_code") == "state_write_failed":
+        persisted["original_error_stage"] = stage
+        persisted["error_type"] = "OSError"
+    return persisted
 
 
 def ingest_notes(
@@ -406,10 +557,15 @@ def ingest_notes(
     limits: Optional[NoteIngestionLimits] = None,
 ) -> dict[str, Any]:
     limits = limits or NoteIngestionLimits()
-    candidates, skipped, skipped_by_reason, secret_shapes, scanned = discover_notes(
-        Path(obsidian_vault),
-        limits=limits,
-    )
+    (
+        candidates,
+        skipped,
+        skipped_by_reason,
+        secret_shapes,
+        scanned,
+        processed_bytes,
+        accepted_bytes,
+    ) = discover_notes(Path(obsidian_vault), limits=limits)
     records = [_record(candidate) for candidate in candidates]
     result = _base_result(
         dry_run=dry_run,
@@ -418,6 +574,8 @@ def ingest_notes(
         skipped=skipped,
         skipped_by_reason=skipped_by_reason,
         secret_shapes=secret_shapes,
+        processed_bytes=processed_bytes,
+        accepted_bytes=accepted_bytes,
     )
     vault = Path(vault_dir)
     index = vault / "index.jsonl"
@@ -427,57 +585,112 @@ def ingest_notes(
             1 for record in records if record["id"] not in existing
         )
         return result
-    if not records:
-        return _persist_state(vault, result)
 
+    last_success = _previous_last_success(vault)
     index.parent.mkdir(parents=True, exist_ok=True)
+    stage = "reconcile"
+    facts_committed = False
+    pending_repair_direction: Optional[str] = None
     try:
         with source_lock(index, exclusive=True):
+            stage = "repair_tail"
             repaired_tails = 1 if _repair_partial_tail(index) else 0
-            index_ids = _read_ids(index)
-            daily_ids: dict[Path, set[str]] = {}
-            checked_daily_tails: set[Path] = set()
+            daily_paths = sorted((vault / "daily").glob("*.jsonl"))
+            for daily in daily_paths:
+                if _repair_partial_tail(daily):
+                    repaired_tails += 1
+
+            stage = "reconcile"
+            index_rows = _read_note_rows(index)
+            daily_rows: dict[str, dict[str, Any]] = {}
+            for daily in daily_paths:
+                for record_id, row in _read_note_rows(daily).items():
+                    existing = daily_rows.get(record_id)
+                    if (
+                        existing is not None
+                        and _public_fact(existing) != _public_fact(row)
+                    ):
+                        raise ReconciliationConflict("daily_note_payload_conflict")
+                    daily_rows[record_id] = row
+            for record_id in index_rows.keys() & daily_rows.keys():
+                if _public_fact(index_rows[record_id]) != _public_fact(
+                    daily_rows[record_id]
+                ):
+                    raise ReconciliationConflict("cross_store_note_payload_conflict")
+
+            index_ids = set(index_rows)
+            daily_ids = set(daily_rows)
             daily_appends: dict[Path, list[dict[str, Any]]] = {}
             index_appends: list[dict[str, Any]] = []
-            repaired_index = 0
-            repaired_daily = 0
+            missing_from_index = daily_ids - index_ids
+            missing_from_daily = index_ids - daily_ids
+            repaired_index = len(missing_from_index)
+            repaired_daily = len(missing_from_daily)
             ingested = 0
+
+            for record_id in sorted(missing_from_daily):
+                row = index_rows[record_id]
+                daily_appends.setdefault(_daily_path_for(vault, row), []).append(row)
+            for record_id in sorted(missing_from_index):
+                index_appends.append(daily_rows[record_id])
+            daily_ids.update(missing_from_daily)
+            index_ids.update(missing_from_index)
+
             for record in records:
                 daily = vault / "daily" / f"{str(record['timestamp'])[:10]}.jsonl"
-                if daily not in checked_daily_tails:
+                if daily not in daily_paths:
+                    stage = "repair_tail"
                     if _repair_partial_tail(daily):
                         repaired_tails += 1
-                    checked_daily_tails.add(daily)
-                ids = daily_ids.setdefault(daily, _read_ids(daily))
-                in_daily = record["id"] in ids
+                    stage = "reconcile"
+                    daily_paths.append(daily)
+                in_daily = record["id"] in daily_ids
                 in_index = record["id"] in index_ids
                 if in_daily and in_index:
                     continue
                 if not in_daily:
                     daily_appends.setdefault(daily, []).append(record)
-                    ids.add(record["id"])
-                    if in_index:
-                        repaired_daily += 1
+                    daily_ids.add(record["id"])
                 if not in_index:
                     index_appends.append(record)
                     index_ids.add(record["id"])
-                    if in_daily:
-                        repaired_index += 1
                     ingested += 1
+
+            stage = "daily_append"
             for daily, rows in sorted(daily_appends.items(), key=lambda item: str(item[0])):
+                if rows:
+                    facts_committed = True
+                    pending_repair_direction = (
+                        "daily_to_index" if index_appends else "index_to_daily"
+                    )
                 _append_jsonl(daily, rows, public=True)
-            if daily_appends:
+            if daily_appends and index_appends:
                 after_daily_append()
+            elif daily_appends:
+                pending_repair_direction = None
+
+            stage = "index_append"
+            if index_appends:
+                facts_committed = True
+                pending_repair_direction = "daily_to_index"
             _append_jsonl(index, index_appends, public=False)
+            pending_repair_direction = None
             result["totals"]["ingested_this_run"] = ingested
             result["totals"]["repaired_index"] = repaired_index
             result["totals"]["repaired_daily"] = repaired_daily
             result["totals"]["repaired_tails"] = repaired_tails
-    except Exception:
-        result["status"] = "error"
-        result["error_code"] = "write_interrupted"
-        return result
+    except Exception as exc:
+        return _persist_failure(
+            vault,
+            result,
+            stage=stage,
+            error=exc,
+            last_success=last_success,
+            facts_committed=facts_committed,
+            pending_repair_direction=pending_repair_direction,
+        )
 
+    result["last_success"] = result["generated_at"]
     return _persist_state(vault, result)
 
 

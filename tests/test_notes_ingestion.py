@@ -108,6 +108,93 @@ def test_total_byte_limit_is_enforced_independently_of_file_count(tmp_path):
     assert result["skipped_by_reason"] == {"total_bytes_exceeded": 1}
 
 
+def test_secret_and_empty_files_consume_processed_byte_budget(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    notes = obsidian / "笔记"
+    secret = f"value: {FAKE_SECRET}".encode("utf-8")
+    empty = b"   "
+    safe = b"# Safe"
+    (notes / "a-secret.md").write_bytes(secret)
+    (notes / "b-empty.md").write_bytes(empty)
+    (notes / "c-safe.md").write_bytes(safe)
+
+    result = notes_ingestion.ingest_notes(
+        vault,
+        obsidian,
+        dry_run=True,
+        limits=notes_ingestion.NoteIngestionLimits(
+            max_files=10,
+            max_file_bytes=100,
+            max_total_bytes=len(secret) + len(empty),
+        ),
+    )
+
+    assert result["totals"]["processed_bytes"] == len(secret) + len(empty)
+    assert result["totals"]["accepted_bytes"] == 0
+    assert result["totals"]["planned_this_run"] == 0
+    assert result["skipped_by_reason"] == {
+        "empty_note": 1,
+        "secret_shape": 1,
+        "total_bytes_exceeded": 1,
+    }
+
+
+def test_invalid_utf8_consumes_processed_byte_budget(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    notes = obsidian / "笔记"
+    invalid = b"\xff\xfe\xfd"
+    safe = b"# Safe"
+    (notes / "a-invalid.md").write_bytes(invalid)
+    (notes / "b-safe.md").write_bytes(safe)
+
+    result = notes_ingestion.ingest_notes(
+        vault,
+        obsidian,
+        dry_run=True,
+        limits=notes_ingestion.NoteIngestionLimits(
+            max_files=10,
+            max_file_bytes=100,
+            max_total_bytes=len(invalid),
+        ),
+    )
+
+    assert result["totals"]["processed_bytes"] == len(invalid)
+    assert result["totals"]["accepted_bytes"] == 0
+    assert result["skipped_by_reason"] == {
+        "invalid_utf8": 1,
+        "total_bytes_exceeded": 1,
+    }
+
+
+def test_parent_directory_replacement_cannot_redirect_file_open(tmp_path, monkeypatch):
+    vault, obsidian = make_obsidian(tmp_path)
+    notes = obsidian / "笔记"
+    owned = notes / "nested"
+    owned.mkdir()
+    (owned / "note.md").write_text("# Owned\n\nInside root.", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "note.md").write_text("# Outside\n\nMust not ingest.", encoding="utf-8")
+    moved = notes / "nested-original"
+    module = importlib.import_module("notes_ingestion")
+    replaced = {"done": False}
+
+    def replace_parent(relative_path):
+        if relative_path == "nested/note.md" and not replaced["done"]:
+            owned.rename(moved)
+            owned.symlink_to(outside, target_is_directory=True)
+            replaced["done"] = True
+
+    monkeypatch.setattr(module, "before_file_open", replace_parent)
+    result = module.ingest_notes(vault, obsidian, dry_run=False)
+    dumped = (vault / "index.jsonl").read_text(encoding="utf-8")
+
+    assert replaced["done"] is True
+    assert result["totals"]["planned_this_run"] == 1
+    assert "Owned" in dumped
+    assert "Outside" not in dumped
+
+
 def test_secret_shapes_are_skipped_without_leaking_the_candidate(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     (obsidian / "笔记" / "secret.md").write_text(
@@ -183,11 +270,17 @@ def test_retry_repairs_failure_between_daily_and_index_without_daily_duplicate(
     module = importlib.import_module("notes_ingestion")
     monkeypatch.setattr(module, "after_daily_append", fail_once)
     interrupted = module.ingest_notes(vault, obsidian, dry_run=False)
+    interrupted_status = module.read_ingestion_state(vault)
     recovered = module.ingest_notes(vault, obsidian, dry_run=False)
     daily = next((vault / "daily").glob("*.jsonl"))
 
     assert interrupted["status"] == "error"
-    assert interrupted["error_code"] == "write_interrupted"
+    assert interrupted["error_code"] == "write_failed"
+    assert interrupted["error_stage"] == "daily_append"
+    assert interrupted["error_type"] == "OSError"
+    assert interrupted["facts_committed"] is True
+    assert interrupted["pending_repair_direction"] == "daily_to_index"
+    assert interrupted_status == interrupted
     assert recovered["status"] == "ok"
     assert recovered["totals"]["repaired_index"] == 1
     assert len(jsonl_rows(daily)) == 1
@@ -200,6 +293,7 @@ def test_retry_repairs_missing_daily_when_index_record_already_exists(tmp_path):
     first = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
     daily = next((vault / "daily").glob("*.jsonl"))
     daily.unlink()
+    (obsidian / "笔记" / "one.md").unlink()
 
     repaired = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
 
@@ -208,6 +302,75 @@ def test_retry_repairs_missing_daily_when_index_record_already_exists(tmp_path):
     assert repaired["totals"]["repaired_daily"] == 1
     assert len(jsonl_rows(daily)) == 1
     assert len(jsonl_rows(vault / "index.jsonl")) == 1
+
+
+def test_reconcile_repairs_index_from_daily_after_source_was_deleted(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "one.md"
+    note.write_text("# One\n\nOrphan daily.", encoding="utf-8")
+    first = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+    (vault / "index.jsonl").unlink()
+    note.unlink()
+
+    repaired = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    assert first["status"] == "ok"
+    assert repaired["status"] == "ok"
+    assert repaired["totals"]["repaired_index"] == 1
+    assert len(jsonl_rows(vault / "index.jsonl")) == 1
+
+
+def test_reconcile_daily_only_v1_before_ingesting_modified_v2(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "one.md"
+    note.write_text("# One\n\nVersion one.", encoding="utf-8")
+    first = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+    (vault / "index.jsonl").unlink()
+    note.write_text("# One\n\nVersion two.", encoding="utf-8")
+
+    repaired = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    daily = next((vault / "daily").glob("*.jsonl"))
+    daily_rows = jsonl_rows(daily)
+    index_rows = jsonl_rows(vault / "index.jsonl")
+    assert first["status"] == "ok"
+    assert repaired["status"] == "ok"
+    assert repaired["totals"]["repaired_index"] == 1
+    assert repaired["totals"]["ingested_this_run"] == 1
+    assert len({row["id"] for row in daily_rows}) == 2
+    assert len({row["id"] for row in index_rows}) == 2
+    assert {row["content"] for row in daily_rows} == {
+        "# One\n\nVersion one.",
+        "# One\n\nVersion two.",
+    }
+    assert {row["content"] for row in index_rows} == {
+        "# One\n\nVersion one.",
+        "# One\n\nVersion two.",
+    }
+
+
+def test_reconcile_conflicting_payloads_fails_closed_without_new_fact_writes(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "one.md"
+    note.write_text("# One\n\nConflict.", encoding="utf-8")
+    first = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+    daily = next((vault / "daily").glob("*.jsonl"))
+    daily_rows = jsonl_rows(daily)
+    daily_rows[0]["content"] = "tampered"
+    daily.write_text(json.dumps(daily_rows[0], ensure_ascii=False) + "\n", encoding="utf-8")
+    note.unlink()
+    index_before = (vault / "index.jsonl").read_bytes()
+    daily_before = daily.read_bytes()
+
+    failed = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    assert first["status"] == "ok"
+    assert failed["status"] == "error"
+    assert failed["error_stage"] == "reconcile"
+    assert failed["error_type"] == "ReconciliationConflict"
+    assert failed["facts_committed"] is False
+    assert (vault / "index.jsonl").read_bytes() == index_before
+    assert daily.read_bytes() == daily_before
 
 
 def test_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
@@ -325,6 +488,70 @@ def test_state_write_failure_is_typed_and_preserves_committed_fact_for_retry(
     assert len(jsonl_rows(vault / "index.jsonl")) == 1
     assert retried["status"] == "ok"
     assert retried["totals"]["ingested_this_run"] == 0
+
+
+def test_write_failure_replaces_old_ok_status_with_typed_persisted_error(
+    tmp_path,
+    monkeypatch,
+):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "one.md"
+    note.write_text("# One\n\nFirst.", encoding="utf-8")
+    module = importlib.import_module("notes_ingestion")
+    first = module.ingest_notes(vault, obsidian, dry_run=False)
+    note.write_text("# One\n\nSecond.", encoding="utf-8")
+    original_append = module._append_jsonl
+
+    def fail_index(path, rows, *, public):
+        if Path(path).name == "index.jsonl" and rows:
+            raise OSError("sensitive external detail")
+        return original_append(path, rows, public=public)
+
+    monkeypatch.setattr(module, "_append_jsonl", fail_index)
+    failed = module.ingest_notes(vault, obsidian, dry_run=False)
+    status = module.read_ingestion_state(vault)
+    dumped = json.dumps(failed, ensure_ascii=False)
+
+    assert first["status"] == "ok"
+    assert failed["status"] == "error"
+    assert failed["error_code"] == "write_failed"
+    assert failed["error_stage"] == "index_append"
+    assert failed["error_type"] == "OSError"
+    assert failed["facts_committed"] is True
+    assert failed["pending_repair_direction"] == "daily_to_index"
+    assert failed["last_success"] == first["last_success"]
+    assert status == failed
+    assert "sensitive external detail" not in dumped
+
+
+def test_error_state_write_failure_returns_state_write_failed(tmp_path, monkeypatch):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "one.md"
+    note.write_text("# One\n\nFirst.", encoding="utf-8")
+    module = importlib.import_module("notes_ingestion")
+    first = module.ingest_notes(vault, obsidian, dry_run=False)
+    note.write_text("# One\n\nSecond.", encoding="utf-8")
+
+    def fail_append(_path, _rows, *, public):
+        raise OSError("append detail")
+
+    def fail_state(_path, _payload):
+        raise OSError("state detail")
+
+    monkeypatch.setattr(module, "_append_jsonl", fail_append)
+    monkeypatch.setattr(module, "atomic_write_json", fail_state)
+    failed = module.ingest_notes(vault, obsidian, dry_run=False)
+    dumped = json.dumps(failed, ensure_ascii=False)
+
+    assert first["status"] == "ok"
+    assert failed["status"] == "error"
+    assert failed["error_code"] == "state_write_failed"
+    assert failed["original_error_stage"] == "daily_append"
+    assert failed["error_type"] == "OSError"
+    assert failed["facts_committed"] is True
+    assert failed["last_success"] == first["last_success"]
+    assert "append detail" not in dumped
+    assert "state detail" not in dumped
 
 
 def test_corrupt_state_returns_typed_error_instead_of_traceback(tmp_path):
