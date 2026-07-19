@@ -103,6 +103,28 @@ def test_same_count_database_id_replacement_forces_rebuild(tmp_path):
     assert meta["indexed_ids_sha256"] == index_integrity.ids_sha256({"a", "b"})
 
 
+def test_actual_source_database_parity_overrides_forged_matching_meta_digest(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha"), record("b", "bravo")])
+    reconcile_index(source, database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute("UPDATE docs SET rec_id='c' WHERE rec_id='b'")
+        con.execute(
+            "UPDATE meta SET value=? WHERE key='indexed_ids_sha256'",
+            (index_integrity.ids_sha256({"a", "c"}),),
+        )
+        con.commit()
+
+    report = reconcile_index(source, database)
+
+    assert report["mode"] == "full_rebuild"
+    assert report["reason"] == "id_set_mismatch"
+    assert report["missing_in_sqlite"] == []
+    assert report["missing_in_jsonl"] == []
+    assert db_ids(database) == {"a", "b"}
+
+
 def test_failed_staging_validation_preserves_live_database_bytes(tmp_path, monkeypatch):
     source = tmp_path / "index.jsonl"
     database = tmp_path / "search_index.db"
@@ -509,6 +531,157 @@ def test_staging_path_rejects_hardlink_samefile_without_unlinking_source(tmp_pat
     assert source.read_bytes() == before
     assert staging.read_bytes() == before
     assert os.path.samefile(source, staging)
+
+
+@pytest.mark.parametrize("artifact_suffix", ["", "-wal", "-shm", "-journal"])
+@pytest.mark.parametrize(
+    "protected_name",
+    ["source", "database", "wal", "shm", "journal", "lock"],
+)
+def test_every_staging_artifact_is_checked_against_every_protected_path(
+    tmp_path, artifact_suffix, protected_name
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("source", "keep")])
+    protected = {
+        "source": source,
+        "database": database,
+        "wal": Path(str(database) + "-wal"),
+        "shm": Path(str(database) + "-shm"),
+        "journal": Path(str(database) + "-journal"),
+        "lock": Path(str(database) + ".reconcile.lock"),
+    }
+    for name, path in protected.items():
+        if name != "source":
+            path.write_bytes(("protected-" + name).encode("utf-8"))
+    staging = tmp_path / "candidate.staging"
+    artifact = Path(str(staging) + artifact_suffix)
+    os.link(protected[protected_name], artifact)
+    before = protected[protected_name].read_bytes()
+
+    with pytest.raises(ValueError, match="unsafe staging path"):
+        reconcile_index(source, database, staging_path=staging)
+
+    assert protected[protected_name].read_bytes() == before
+    assert artifact.exists()
+    assert os.path.samefile(artifact, protected[protected_name])
+
+
+def test_default_staging_wal_cannot_be_the_source(tmp_path):
+    database = tmp_path / "search_index.db"
+    source = Path(str(database) + ".staging-wal")
+    write_records(source, [record("a", "must survive")])
+    before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="unsafe staging path"):
+        reconcile_index(source, database)
+
+    assert source.read_bytes() == before
+    assert not database.exists()
+
+
+@pytest.mark.parametrize("collision", ["same", "symlink", "hardlink"])
+def test_source_and_database_collision_is_rejected_before_any_write(
+    tmp_path, collision
+):
+    source = tmp_path / "index.jsonl"
+    write_records(source, [record("a", "must survive")])
+    if collision == "same":
+        database = source
+    elif collision == "symlink":
+        database = tmp_path / "database-link"
+        database.symlink_to(source)
+    else:
+        database = tmp_path / "database-hardlink"
+        os.link(source, database)
+    before = source.read_bytes()
+    existing = sorted(path.name for path in tmp_path.iterdir())
+
+    with pytest.raises(ValueError, match="source and database"):
+        reconcile_index(source, database)
+
+    assert source.read_bytes() == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == existing
+
+
+def test_invalid_staging_is_rejected_before_database_parent_mkdir(tmp_path):
+    source = tmp_path / "index.jsonl"
+    write_records(source, [record("a", "alpha")])
+    database = tmp_path / "must-not-exist" / "search_index.db"
+    staging = tmp_path / "outside.staging"
+
+    with pytest.raises(ValueError, match="unsafe staging path"):
+        reconcile_index(source, database, staging_path=staging)
+
+    assert not database.parent.exists()
+
+
+@pytest.mark.parametrize("mutation_timing", ["entry", "return"])
+def test_source_change_at_replace_boundary_retries_to_exact_parity(
+    tmp_path, monkeypatch, mutation_timing
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    original = index_integrity._replace_database
+    calls = 0
+
+    def mutate_around_replace(staging, target):
+        nonlocal calls
+        calls += 1
+        if calls == 1 and mutation_timing == "entry":
+            write_records(source, [record("b", "bravo")])
+        result = original(staging, target)
+        if calls == 1 and mutation_timing == "return":
+            write_records(source, [record("b", "bravo")])
+        return result
+
+    monkeypatch.setattr(
+        index_integrity,
+        "_replace_database",
+        mutate_around_replace,
+    )
+
+    report = reconcile_index(source, database)
+
+    assert calls == 2
+    assert report["jsonl_unique_ids"] == 1
+    assert report["sqlite_ids"] == 1
+    assert report["missing_in_sqlite"] == []
+    assert report["missing_in_jsonl"] == []
+    assert db_ids(database) == {"b"}
+
+
+def test_source_change_after_every_replace_fails_closed(tmp_path, monkeypatch):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    original = index_integrity._replace_database
+    calls = 0
+
+    def mutate_after_every_replace(staging, target):
+        nonlocal calls
+        result = original(staging, target)
+        calls += 1
+        rec_id = "b" if calls % 2 else "a"
+        text = "bravo" if calls % 2 else "alpha"
+        write_records(source, [record(rec_id, text)])
+        return result
+
+    monkeypatch.setattr(
+        index_integrity,
+        "_replace_database",
+        mutate_after_every_replace,
+    )
+
+    with pytest.raises(
+        index_integrity.SourceChangedError,
+        match="source changed after staging replace after 3 attempts",
+    ):
+        reconcile_index(source, database)
+
+    assert calls == 3
 
 
 def test_report_only_cli_executes_real_arguments_without_creating_staging(tmp_path):

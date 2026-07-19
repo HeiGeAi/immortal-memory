@@ -79,7 +79,10 @@ def _reset(con) -> None:
 
 
 def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
-    """Reconcile the read model and return the number of inserted records."""
+    """Deep-reconcile the read model and return the inserted record count.
+
+    This belongs to the scheduled collection pipeline, not the recall path.
+    """
     if not INDEX_FILE.exists():
         return 0
     from index_integrity import reconcile_index
@@ -91,6 +94,65 @@ def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
             f"写入: {result['added']}"
         )
     return int(result["added"])
+
+
+def is_ready() -> bool:
+    """Return trusted index readiness using only source stat and fixed metadata."""
+    if not INDEX_FILE.exists() or not DB_FILE.exists():
+        return False
+    con = None
+    try:
+        source_before = INDEX_FILE.stat()
+        con = _connect()
+        rows = dict(
+            con.execute(
+                "SELECT key,value FROM meta WHERE key IN "
+                "('parity_status','last_size','source_dev','source_ino',"
+                "'source_mtime_ns','indexed_id_count','indexed_ids_sha256')"
+            ).fetchall()
+        )
+        source_after = INDEX_FILE.stat()
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return False
+    finally:
+        if con is not None:
+            con.close()
+    required = {
+        "parity_status",
+        "last_size",
+        "source_dev",
+        "source_ino",
+        "source_mtime_ns",
+        "indexed_id_count",
+        "indexed_ids_sha256",
+    }
+    if set(rows) != required or rows["parity_status"] != "trusted":
+        return False
+    before_signature = (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_size,
+        source_before.st_mtime_ns,
+    )
+    after_signature = (
+        source_after.st_dev,
+        source_after.st_ino,
+        source_after.st_size,
+        source_after.st_mtime_ns,
+    )
+    if before_signature != after_signature:
+        return False
+    try:
+        return (
+            int(rows["last_size"]) == source_after.st_size
+            and int(rows["source_dev"]) == source_after.st_dev
+            and int(rows["source_ino"]) == source_after.st_ino
+            and int(rows["source_mtime_ns"]) == source_after.st_mtime_ns
+            and int(rows["indexed_id_count"]) >= 0
+            and bool(rows["indexed_ids_sha256"])
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _escape_match(q: str) -> str:

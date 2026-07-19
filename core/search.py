@@ -468,11 +468,12 @@ def _inmemory_search(query, limit, source, source_prefix, since, until):
 def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
                    source_prefix: Optional[str] = None, since: Optional[str] = None,
                    until: Optional[str] = None) -> tuple:
-    """多通道 RRF 融合检索（持久化索引快路径 + 内存引擎回退）。
+    """通过已验证的持久化索引执行多通道 RRF 融合检索。
 
     快路径：SQLite 持久化索引(index_db) 提供关键词(bm25/LIKE) + 短语两通道，亚秒级。
     叠加 embedding 通道（有 key 时），RRF 融合。
-    DB 未构建或任何异常 -> 回退到内存 TF-IDF 引擎，保证 recall 永不失效。
+    索引新鲜度由采集后的计划同步任务维护。查询只做 O(1) 水位检查，
+    不触发深度校验、重建或全量 JSONL 回退。
 
     Returns: (mode, results)，mode 形如 "fusion(bm25+phrase)" / "fusion(like+phrase+embedding)"
     """
@@ -481,12 +482,13 @@ def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
     # ---- 快路径：持久化 SQLite 索引 ----
     try:
         import index_db
-        index_db.sync()  # 增量同步，首次构建后基本零成本
+        if not index_db.is_ready():
+            return ("index_unavailable", [])
         labels, rankings = index_db.channels(
             query, limit=limit, source=source, source_prefix=source_prefix,
             since=since, until=until)
     except Exception:
-        labels, rankings = [], []
+        return ("index_unavailable", [])
 
     if rankings:
         emb = _embedding_channel(query, candidates, source, source_prefix, since, until)
@@ -498,8 +500,7 @@ def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
         fused = _rrf_fuse(rankings)
         return ("fusion(" + "+".join(labels) + ")", fused[:limit])
 
-    # ---- 回退：内存引擎 ----
-    return _inmemory_search(query, limit, source, source_prefix, since, until)
+    return ("none", [])
 
 
 def format_results(results: list, query: str, mode: str) -> str:

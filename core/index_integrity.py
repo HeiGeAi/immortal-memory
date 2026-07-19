@@ -356,6 +356,22 @@ def _write_metadata(
     _meta_set(con, "prefix_sha256", revision["content_sha256"])
     _meta_set(con, "indexed_id_count", id_count)
     _meta_set(con, "indexed_ids_sha256", ids_sha256(ids))
+    _meta_set(con, "parity_status", "trusted")
+
+
+def _parity_result(source_ids: Set[str], database_ids: Set[str]) -> Dict:
+    source_only = source_ids - database_ids
+    database_only = database_ids - source_ids
+    return {
+        "jsonl_unique_ids": len(source_ids),
+        "sqlite_ids": len(database_ids),
+        "missing_in_sqlite": sorted(source_only),
+        "missing_in_jsonl": sorted(database_only),
+        "source_unique_ids": len(source_ids),
+        "database_unique_ids": len(database_ids),
+        "source_only_ids": len(source_only),
+        "database_only_ids": len(database_only),
+    }
 
 
 def verify_id_parity(staging: Path, expected_ids: Set[str]) -> Dict:
@@ -386,16 +402,7 @@ def verify_id_parity(staging: Path, expected_ids: Set[str]) -> Dict:
             raise IndexIntegrityError(
                 f"staging FTS count mismatch: docs={docs_count} fts={fts_count}"
             )
-    return {
-        "jsonl_unique_ids": len(expected_ids),
-        "sqlite_ids": len(db_ids),
-        "missing_in_sqlite": sorted(source_only),
-        "missing_in_jsonl": sorted(database_only),
-        "source_unique_ids": len(expected_ids),
-        "database_unique_ids": len(db_ids),
-        "source_only_ids": len(source_only),
-        "database_only_ids": len(database_only),
-    }
+    return _parity_result(expected_ids, db_ids)
 
 
 def _fsync_file(path: Path) -> None:
@@ -456,23 +463,38 @@ def _build_and_replace_staging(
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
     staging.parent.mkdir(parents=True, exist_ok=True)
+    source_changed_after_replace = False
     for _attempt in range(max_attempts):
         _cleanup_staging(staging)
         try:
             result, scanned_revision = _build_staging_once(source, staging)
-            final_revision = source_revision(source, max_attempts=1)
+            pre_replace_revision = source_revision(source, max_attempts=1)
         except SourceChangedError:
             _cleanup_staging(staging)
             continue
         except Exception:
             _cleanup_staging(staging)
             raise
-        if scanned_revision != final_revision:
+        if scanned_revision != pre_replace_revision:
             _cleanup_staging(staging)
             continue
         _replace_database(staging, database)
+        try:
+            post_replace_revision = source_revision(source, max_attempts=1)
+        except SourceChangedError:
+            source_changed_after_replace = True
+            continue
+        if scanned_revision != post_replace_revision:
+            # This proves point-in-time parity at return. A writer that does not
+            # share this reconciler's lock can still append after this check.
+            source_changed_after_replace = True
+            continue
         return result
     _cleanup_staging(staging)
+    if source_changed_after_replace:
+        raise SourceChangedError(
+            f"source changed after staging replace after {max_attempts} attempts"
+        )
     raise SourceChangedError(
         f"source changed during staging replacement after {max_attempts} attempts"
     )
@@ -492,7 +514,12 @@ def _replace_database(staging: Path, database: Path) -> None:
     _fsync_directory(database.parent)
 
 
-def _incremental_sync(source: Path, database: Path) -> Dict:
+def _incremental_sync(
+    source: Path,
+    database: Path,
+    expected_source_ids: Set[str],
+    expected_revision: Dict[str, object],
+) -> Dict:
     with sqlite3.connect(str(database), timeout=30) as con:
         con.execute("PRAGMA busy_timeout=30000")
         con.execute("BEGIN IMMEDIATE")
@@ -503,7 +530,6 @@ def _incremental_sync(source: Path, database: Path) -> Dict:
             return {"retry_rebuild": reason}
         last_size = int(fresh["last_size"])
         last_line = int(fresh["last_line"])
-        source_before = _stat_signature(source.stat())
         existing_ids = {
             str(row[0])
             for row in con.execute("SELECT rec_id FROM docs").fetchall()
@@ -529,36 +555,28 @@ def _incremental_sync(source: Path, database: Path) -> Dict:
         if docs_count != len(ids) or unique_count != len(ids) or fts_count != len(ids):
             con.rollback()
             return {"retry_rebuild": "id_count_mismatch"}
+        database_ids = {
+            str(row[0])
+            for row in con.execute("SELECT rec_id FROM docs").fetchall()
+        }
+        if database_ids != expected_source_ids:
+            con.rollback()
+            return {"retry_rebuild": "id_set_mismatch"}
         revision = source_revision(source, max_attempts=1)
-        revision_signature = (
-            int(revision["dev"]),
-            int(revision["ino"]),
-            int(revision["size"]),
-            int(revision["mtime_ns"]),
-        )
-        if (
-            revision_signature != source_before
-            or int(revision["size"]) != processed_offset
-        ):
+        if revision != expected_revision or int(revision["size"]) != processed_offset:
             con.rollback()
             raise SourceChangedError(
                 "source changed after incremental scan"
             )
-        _write_metadata(con, revision, ids)
+        _write_metadata(con, revision, database_ids)
         con.commit()
+    parity = _parity_result(expected_source_ids, database_ids)
     return {
         "mode": "incremental" if added else "current",
         "action": "incremental" if added else "current",
         "reason": "append_only",
         "added": added,
-        "jsonl_unique_ids": len(ids),
-        "sqlite_ids": len(ids),
-        "missing_in_sqlite": [],
-        "missing_in_jsonl": [],
-        "source_unique_ids": len(ids),
-        "database_unique_ids": len(ids),
-        "source_only_ids": 0,
-        "database_only_ids": 0,
+        **parity,
     }
 
 
@@ -673,12 +691,12 @@ def _validate_staging_path(
     lock_path: Path,
 ) -> Path:
     staging = staging.absolute()
-    database_parent = database.parent.resolve()
-    if staging.parent.resolve() != database_parent:
+    database_parent = database.parent.resolve(strict=False)
+    if staging.parent.resolve(strict=False) != database_parent:
         raise ValueError(
             "unsafe staging path: must be a direct child of database.parent"
         )
-    forbidden = (
+    protected = (
         source,
         database,
         Path(str(database) + "-wal"),
@@ -686,12 +704,21 @@ def _validate_staging_path(
         Path(str(database) + "-journal"),
         lock_path,
     )
-    if any(_paths_collide(staging, candidate) for candidate in forbidden):
-        raise ValueError("unsafe staging path: conflicts with protected index path")
-    if staging.is_symlink():
-        raise ValueError("unsafe staging path: symlink is not allowed")
-    if staging.exists() and not stat_module.S_ISREG(staging.lstat().st_mode):
-        raise ValueError("unsafe staging path: regular file required")
+    artifacts = (
+        staging,
+        Path(str(staging) + "-wal"),
+        Path(str(staging) + "-shm"),
+        Path(str(staging) + "-journal"),
+    )
+    for artifact in artifacts:
+        if any(_paths_collide(artifact, candidate) for candidate in protected):
+            raise ValueError(
+                "unsafe staging path: conflicts with protected index path"
+            )
+        if artifact.is_symlink():
+            raise ValueError("unsafe staging path: symlink is not allowed")
+        if artifact.exists() and not stat_module.S_ISREG(artifact.lstat().st_mode):
+            raise ValueError("unsafe staging path: regular file required")
     return staging
 
 
@@ -707,10 +734,11 @@ def reconcile_index(
     database = Path(database)
     if not source.exists():
         raise FileNotFoundError(source)
+    if _paths_collide(source, database):
+        raise ValueError("source and database paths must not collide")
     if report_only:
         return report_index_integrity(source, database)
 
-    database.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(str(database) + ".reconcile.lock")
     staging = (
         Path(staging_path)
@@ -718,6 +746,7 @@ def reconcile_index(
         else Path(str(database) + ".staging")
     )
     staging = _validate_staging_path(source, database, staging, lock_path)
+    database.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock:
         _acquire_lock(lock)
         if force_rebuild:
@@ -726,7 +755,25 @@ def reconcile_index(
             reason = "database_missing"
         else:
             try:
-                incremental = _incremental_sync(source, database)
+                source_ids, revision = _scan_source_ids_once(source)
+                database_ids = _database_ids(database)
+                state = _db_state(database)
+                reason = _rebuild_reason(source, state)
+                source_only = source_ids - database_ids
+                database_only = database_ids - source_ids
+                if reason is None and (
+                    database_only or (source_only and not database_ids < source_ids)
+                ):
+                    reason = "id_set_mismatch"
+                if reason is None:
+                    incremental = _incremental_sync(
+                        source,
+                        database,
+                        source_ids,
+                        revision,
+                    )
+                else:
+                    incremental = {"retry_rebuild": reason}
             except sqlite3.DatabaseError:
                 reason = "database_invalid"
             else:
