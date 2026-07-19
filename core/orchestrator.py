@@ -38,6 +38,22 @@ RUNTIME_TELEMETRY = RuntimeTelemetry(IMMORTAL_DIR / "runtime")
 _ACTIVE_STAGE = ""
 _STAGE_ERROR_COUNT = 0
 
+REQUIRED_FAILURES = {
+    "collect failed",
+    "search index sync failed",
+    "claims migration failed",
+    "context compile failed",
+    "cards build failed",
+    "portable export failed",
+    "portable restore-check failed",
+}
+REQUIRED_FAILURE_PREFIXES = (
+    "required core script missing",
+    "index integrity failed",
+    "migration failed",
+    "export verify failed",
+)
+
 DISTILL_INTERVAL_DAYS = 1  # 每天蒸馏一次（数据变化大的话有意义）
 CLEANUP_INTERVAL_DAYS = 7  # 每周清理一次磁盘
 PORTABLE_EXPORT_INTERVAL_DAYS = 3  # 每 3 天生成一次可恢复便携包
@@ -153,6 +169,19 @@ def telemetry_finish_active(errors: list) -> None:
 def telemetry_heartbeat_loop(stop_event: threading.Event, interval: float = 30.0) -> None:
     while not stop_event.wait(interval):
         RUNTIME_TELEMETRY.heartbeat()
+
+
+def orchestration_status(errors: list[str]) -> tuple[str, int]:
+    normalized = {str(item).strip() for item in errors}
+    if normalized.intersection(REQUIRED_FAILURES) or any(
+        error.startswith(prefix)
+        for error in normalized
+        for prefix in REQUIRED_FAILURE_PREFIXES
+    ):
+        return "failed", 1
+    if normalized:
+        return "attention", 0
+    return "success", 0
 
 
 def child_env() -> dict:
@@ -835,7 +864,7 @@ def release_lock():
 
 def main():
     if not acquire_lock():
-        return
+        return 0
     global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
     _ACTIVE_STAGE = ""
     _STAGE_ERROR_COUNT = 0
@@ -863,11 +892,13 @@ def main():
             results=results if isinstance(results, dict) else {},
             error="；".join(str(item) for item in (errors or [])),
         )
+        return int(outcome.get("exit_code") or (1 if status == "failed" else 0))
     except ControlJobCanceled as exc:
         if _ACTIVE_STAGE:
             RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="canceled", error=str(exc))
             _ACTIVE_STAGE = ""
         RUNTIME_TELEMETRY.finish_run(status="canceled", error=str(exc))
+        return 2
     except Exception as exc:
         if _ACTIVE_STAGE:
             RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="failed", error=str(exc))
@@ -1161,8 +1192,10 @@ def run_main():
     if errors:
         log(f"  警告: 错误: {', '.join(errors)}")
     log("")
+    status, exit_code = orchestration_status(errors)
     return {
-        "status": "attention" if errors else "success",
+        "status": status,
+        "exit_code": exit_code,
         "errors": errors,
         "results": {
             "new_records": collect_info.get("total_new", 0),
@@ -1182,4 +1215,4 @@ def run_main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

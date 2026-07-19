@@ -1382,6 +1382,10 @@ def command_profile_auto_review(args) -> int:
     return run_script("profile_auto_review.py", args.profile_auto_review_args)
 
 
+def command_profile_attribution_audit(args) -> int:
+    return run_script("profile_attribution_audit.py", args.profile_attribution_audit_args)
+
+
 def command_profile_nuwa(args) -> int:
     code = run_script("profile_nuwa.py", args.profile_nuwa_args)
     if code in {0, 2}:
@@ -1902,6 +1906,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile_auto_review.add_argument("profile_auto_review_args", nargs=argparse.REMAINDER)
     profile_auto_review.set_defaults(func=command_profile_auto_review)
 
+    profile_attribution_audit = sub.add_parser(
+        "profile-attribution-audit",
+        help="Audit owner attribution and optionally quarantine polluted profile memories",
+    )
+    profile_attribution_audit.add_argument(
+        "profile_attribution_audit_args",
+        nargs=argparse.REMAINDER,
+    )
+    profile_attribution_audit.set_defaults(func=command_profile_attribution_audit)
+
     profile_nuwa = sub.add_parser(
         "profile-nuwa",
         help="Build a Nuwa-style thinking profile from reviewed long-term memory",
@@ -2031,11 +2045,6 @@ def build_parser() -> argparse.ArgumentParser:
     cards_p.set_defaults(func=lambda args: run_script(
         "cards.py", [args.action] + ([args.extra] if args.extra else [])))
 
-    project_p = sub.add_parser("project", help="项目立项与 Obsidian 可视化项目管理：new / build / list / build-all")
-    project_p.add_argument("project_args", nargs=argparse.REMAINDER,
-                           help="转发给 project.py，如：new \"项目名\" --terms a,b --people p1 --client 名")
-    project_p.set_defaults(func=lambda args: run_script("project.py", args.project_args))
-
     brief = sub.add_parser("brief", help="Generate a local daily brief from recent records")
     brief.add_argument("--days", type=int, default=2)
     brief.add_argument("--limit", type=int, default=8)
@@ -2108,6 +2117,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("profile_merge.py", argv[1:])
     if argv and argv[0] == "profile-auto-review":
         return run_script("profile_auto_review.py", argv[1:])
+    if argv and argv[0] == "profile-attribution-audit":
+        return run_script("profile_attribution_audit.py", argv[1:])
     if argv and argv[0] in {"profile-nuwa", "distill-profile"}:
         return command_profile_nuwa(argparse.Namespace(profile_nuwa_args=argv[1:]))
     if argv and argv[0] in {"role-distill", "agent-build"}:
