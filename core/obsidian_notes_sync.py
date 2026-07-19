@@ -1,119 +1,103 @@
 #!/usr/bin/env python3
-"""Ingest user-authored Markdown notes through a bounded, local-only command."""
+"""CLI adapter for safe, bounded and recoverable Obsidian note ingestion."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import re
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Optional
 
 from config import configured_vault_dir, load_config
+from notes_ingestion import (
+    NoteIngestionLimits,
+    ingest_notes,
+    read_ingestion_state,
+)
 from obsidian_sync import obsidian_config
-from web_capture import append_records, load_existing_dedup, now_iso
 
 
-NOTES_SUBDIR = "笔记"
-FRONTMATTER = re.compile(r"\A---\n.*?\n---\n?", re.DOTALL)
+def _positive_int(value: Any, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return fallback
+    return parsed if parsed > 0 else fallback
 
 
-def state_path(vault_dir: Path) -> Path:
-    return vault_dir / "notes" / "state.json"
-
-
-def note_files(notes_root: Path) -> Iterator[Path]:
-    if not notes_root.is_dir():
-        return
-    for path in sorted(notes_root.rglob("*.md")):
-        if not path.name.startswith("_") and path.is_file():
-            yield path
-
-
-def make_record(obsidian_vault: Path, path: Path) -> dict[str, Any] | None:
-    text = path.read_text(encoding="utf-8", errors="replace")
-    body = FRONTMATTER.sub("", text, count=1).strip()
-    if not body:
-        return None
-    relative = path.relative_to(obsidian_vault).as_posix()
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    dedup_key = f"obsidian-note|{relative}|{digest}"
-    title = path.stem
-    for line in body.splitlines():
-        if line.strip().startswith("#"):
-            title = line.strip().lstrip("#").strip() or title
-            break
-    return {
-        "id": f"obsidian-note-{hashlib.sha256(dedup_key.encode()).hexdigest()[:20]}",
-        "timestamp": now_iso(),
-        "source": "obsidian-note",
-        "type": "manual-note",
-        "role": "user",
-        "project": "notes",
-        "title": title[:120],
-        "content": body,
-        "metadata": {"relative_path": relative, "dedup_key": dedup_key},
-        "_dedup_key": dedup_key,
-    }
-
-
-def sync(vault_dir: Path, obsidian_vault: Path, *, dry_run: bool) -> dict[str, Any]:
-    existing = load_existing_dedup(vault_dir, "obsidian-note")
-    records: list[dict[str, Any]] = []
-    scanned = 0
-    for path in note_files(obsidian_vault / NOTES_SUBDIR):
-        scanned += 1
-        record = make_record(obsidian_vault, path)
-        if record and record["_dedup_key"] not in existing:
-            records.append(record)
-    if records and not dry_run:
-        append_records(vault_dir, records)
-    result = {
-        "status": "ok",
-        "dry_run": dry_run,
-        "generated_at": now_iso(),
-        "totals": {
-            "scanned": scanned,
-            "planned_this_run": len(records),
-            "ingested_this_run": 0 if dry_run else len(records),
-        },
-    }
-    if not dry_run:
-        target = state_path(vault_dir)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return result
+def configured_limits(
+    config: dict[str, Any],
+    *,
+    max_files: Optional[int] = None,
+    max_file_bytes: Optional[int] = None,
+    max_total_bytes: Optional[int] = None,
+) -> NoteIngestionLimits:
+    defaults = NoteIngestionLimits()
+    obsidian = config.get("obsidian") if isinstance(config.get("obsidian"), dict) else {}
+    raw = obsidian.get("notes_sync") if isinstance(obsidian.get("notes_sync"), dict) else {}
+    return NoteIngestionLimits(
+        max_files=_positive_int(
+            max_files if max_files is not None else raw.get("max_files"),
+            defaults.max_files,
+        ),
+        max_file_bytes=_positive_int(
+            max_file_bytes if max_file_bytes is not None else raw.get("max_file_bytes"),
+            defaults.max_file_bytes,
+        ),
+        max_total_bytes=_positive_int(
+            max_total_bytes if max_total_bytes is not None else raw.get("max_total_bytes"),
+            defaults.max_total_bytes,
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Ingest Markdown files from an Obsidian 笔记 directory")
+    parser = argparse.ArgumentParser(
+        description="Ingest Markdown files from an Obsidian 笔记 directory"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sync_parser = sub.add_parser("sync", help="Scan and ingest notes")
     sync_parser.add_argument("--vault-path")
     sync_parser.add_argument("--dry-run", action="store_true")
     sync_parser.add_argument("--json", action="store_true")
-    status_parser = sub.add_parser("status", help="Read the last persisted ingestion status")
+    sync_parser.add_argument("--max-files", type=int)
+    sync_parser.add_argument("--max-file-bytes", type=int)
+    sync_parser.add_argument("--max-total-bytes", type=int)
+    status_parser = sub.add_parser(
+        "status",
+        help="Read the last persisted ingestion status",
+    )
     status_parser.add_argument("--json", action="store_true")
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     config = load_config()
     vault_dir = configured_vault_dir(config)
     if args.command == "status":
-        path = state_path(vault_dir)
-        payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {"status": "missing"}
+        payload = read_ingestion_state(vault_dir)
     else:
         obsidian = obsidian_config(config)
         path = Path(args.vault_path or obsidian["vault_path"]).expanduser()
-        payload = sync(vault_dir, path, dry_run=bool(args.dry_run))
+        payload = ingest_notes(
+            vault_dir,
+            path,
+            dry_run=bool(args.dry_run),
+            limits=configured_limits(
+                config,
+                max_files=args.max_files,
+                max_file_bytes=args.max_file_bytes,
+                max_total_bytes=args.max_total_bytes,
+            ),
+        )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(f"notes_sync={payload.get('status', 'unknown')}")
-    return 0
+        if payload.get("error_code"):
+            print(f"error_code={payload['error_code']}")
+    return 1 if payload.get("status") == "error" else 0
 
 
 if __name__ == "__main__":

@@ -41,6 +41,22 @@ def value_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def scan_text_shapes(text: str) -> dict[str, int]:
+    """Return high-confidence rule counts without returning matched values."""
+    if not any(token in text for token in PREFILTER):
+        return {}
+    counts: dict[str, int] = {}
+    for name, pattern in DETECT_PATTERNS.items():
+        count = 0
+        for match in pattern.finditer(text):
+            value = match.group(0)
+            if "[REDACTED" not in value:
+                count += 1
+        if count:
+            counts[name] = count
+    return dict(sorted(counts.items()))
+
+
 def scan_file(path: Path) -> dict[str, Any]:
     by_pattern: dict[str, int] = {}
     unique_hashes: dict[str, set] = {name: set() for name in DETECT_PATTERNS}
