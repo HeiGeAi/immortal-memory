@@ -37,20 +37,36 @@ import argparse
 def command_run(_args=None):
     return 0
 
+def command_claims_migrate(_args=None):
+    return 0
+
+def command_profile_attribution_audit(_args=None):
+    return 0
+
+def command_living_self_build(_args=None):
+    return 0
+
+def command_cards_build(_args=None):
+    return 0
+
+def command_context_preview(_args=None):
+    return 0
+
 PIPELINE_CAPABILITIES = {"run": command_run}
 
 def build_parser():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command")
-    for command in (
-        "run",
-        "claims-migrate",
-        "profile-attribution-audit",
-        "living-self-build",
-        "cards",
-        "context-preview",
-    ):
-        sub.add_parser(command)
+    handlers = {
+        "run": command_run,
+        "claims-migrate": command_claims_migrate,
+        "profile-attribution-audit": command_profile_attribution_audit,
+        "living-self-build": command_living_self_build,
+        "cards": command_cards_build,
+        "context-preview": command_context_preview,
+    }
+    for command, handler in handlers.items():
+        sub.add_parser(command).set_defaults(func=handler)
     return parser
 """.lstrip(),
         encoding="utf-8",
@@ -77,6 +93,17 @@ def test_registry_uses_the_planned_module_boundaries():
         "living-self-build": "living_self_service.py",
         "cards-build": "judgment_store.py",
         "context-preview": "context_compiler.py",
+    }
+    assert {
+        capability.stage_id: capability.host_handler_name
+        for capability in module.PIPELINE_CAPABILITIES
+    } == {
+        "run": "command_run",
+        "claims-migrate": "command_claims_migrate",
+        "profile-attribution-audit": "command_profile_attribution_audit",
+        "living-self-build": "command_living_self_build",
+        "cards-build": "command_cards_build",
+        "context-preview": "command_context_preview",
     }
 
 
@@ -115,7 +142,7 @@ def test_comments_and_unrelated_strings_do_not_register_a_command(tmp_path):
     immortal = tmp_path / "immortal.py"
     immortal.write_text(
         immortal.read_text(encoding="utf-8").replace(
-            '        "claims-migrate",\n',
+            '        "claims-migrate": command_claims_migrate,\n',
             '        # add_parser("claims-migrate") is not registration\n',
         ),
         encoding="utf-8",
@@ -128,6 +155,52 @@ def test_comments_and_unrelated_strings_do_not_register_a_command(tmp_path):
 
     assert status.ready is False
     assert status.reasons == ("subparser_missing",)
+
+
+def test_command_name_without_callable_host_handler_does_not_unlock(tmp_path):
+    module = capability_module()
+    write_ready_pipeline(tmp_path)
+    immortal = tmp_path / "immortal.py"
+    source = immortal.read_text(encoding="utf-8")
+    source = source.replace(
+        '        sub.add_parser(command).set_defaults(func=handler)\n',
+        '        parser_for_command = sub.add_parser(command)\n'
+        '        if command != "claims-migrate":\n'
+        '            parser_for_command.set_defaults(func=handler)\n',
+    )
+    immortal.write_text(source, encoding="utf-8")
+
+    status = {
+        item.stage_id: item
+        for item in module.pipeline_capability_status(tmp_path)
+    }["claims-migrate"]
+
+    assert status.ready is False
+    assert status.reasons == ("host_handler_missing",)
+
+
+def test_wrong_callable_host_handler_does_not_unlock(tmp_path):
+    module = capability_module()
+    write_ready_pipeline(tmp_path)
+    immortal = tmp_path / "immortal.py"
+    source = immortal.read_text(encoding="utf-8")
+    source = source.replace(
+        '        sub.add_parser(command).set_defaults(func=handler)\n',
+        '        parser_for_command = sub.add_parser(command)\n'
+        '        if command == "claims-migrate":\n'
+        '            parser_for_command.set_defaults(func=command_run)\n'
+        '        else:\n'
+        '            parser_for_command.set_defaults(func=handler)\n',
+    )
+    immortal.write_text(source, encoding="utf-8")
+
+    status = {
+        item.stage_id: item
+        for item in module.pipeline_capability_status(tmp_path)
+    }["claims-migrate"]
+
+    assert status.ready is False
+    assert status.reasons == ("host_handler_mismatch",)
 
 
 def test_non_callable_export_and_import_failure_fail_closed(tmp_path):

@@ -17,6 +17,7 @@ class PipelineCapability:
     stage_id: str
     command: str
     module_filename: str
+    host_handler_name: str
     compatibility_filename: Optional[str] = None
 
 
@@ -28,28 +29,37 @@ class CapabilityStatus:
 
 
 PIPELINE_CAPABILITIES = (
-    PipelineCapability("run", "run", "immortal.py"),
-    PipelineCapability("claims-migrate", "claims-migrate", "model_migration.py"),
+    PipelineCapability("run", "run", "immortal.py", "command_run"),
+    PipelineCapability(
+        "claims-migrate",
+        "claims-migrate",
+        "model_migration.py",
+        "command_claims_migrate",
+    ),
     PipelineCapability(
         "profile-attribution-audit",
         "profile-attribution-audit",
         "profile_attribution_audit.py",
+        "command_profile_attribution_audit",
     ),
     PipelineCapability(
         "living-self-build",
         "living-self-build",
         "living_self_service.py",
+        "command_living_self_build",
     ),
     PipelineCapability(
         "cards-build",
         "cards",
         "judgment_store.py",
+        "command_cards_build",
         compatibility_filename="cards.py",
     ),
     PipelineCapability(
         "context-preview",
         "context-preview",
         "context_compiler.py",
+        "command_context_preview",
     ),
 )
 
@@ -83,12 +93,13 @@ def _load_module(path: Path, purpose: str) -> Optional[ModuleType]:
         sys.modules.pop(module_name, None)
 
 
-def _subparser_commands(parser: argparse.ArgumentParser) -> set[str]:
-    commands: set[str] = set()
+def _subparser_handlers(parser: argparse.ArgumentParser) -> dict[str, object]:
+    handlers: dict[str, object] = {}
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
-            commands.update(str(name) for name in action.choices)
-    return commands
+            for name, subparser in action.choices.items():
+                handlers[str(name)] = subparser.get_default("func")
+    return handlers
 
 
 def _callable_export(module: ModuleType, stage_id: str) -> bool:
@@ -107,13 +118,23 @@ def pipeline_capability_status(skill_dir: Path) -> tuple[CapabilityStatus, ...]:
                 parser = build_parser()
             except Exception:
                 parser = None
-    commands = _subparser_commands(parser) if isinstance(parser, argparse.ArgumentParser) else set()
+    handlers = (
+        _subparser_handlers(parser)
+        if isinstance(parser, argparse.ArgumentParser)
+        else {}
+    )
 
     statuses: list[CapabilityStatus] = []
     for capability in PIPELINE_CAPABILITIES:
         reasons: list[str] = []
-        if capability.command not in commands:
+        if capability.command not in handlers:
             reasons.append("subparser_missing")
+        else:
+            handler = handlers[capability.command]
+            if not callable(handler):
+                reasons.append("host_handler_missing")
+            elif getattr(handler, "__name__", "") != capability.host_handler_name:
+                reasons.append("host_handler_mismatch")
 
         if capability.module_filename == "immortal.py":
             module = host
