@@ -177,6 +177,41 @@ def _is_ready_unlocked() -> bool:
         return False
 
 
+def ready_channels(
+    query: str,
+    limit: int = 20,
+    source: Optional[str] = None,
+    source_prefix: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    pool: Optional[int] = None,
+):
+    """Check readiness and query one immutable source/DB generation snapshot."""
+    if not INDEX_FILE.exists() or not DB_FILE.exists():
+        return (False, [], [])
+    try:
+        with index_lock_pair(
+            INDEX_FILE,
+            DB_FILE,
+            source_exclusive=False,
+            database_exclusive=False,
+        ):
+            if not _is_ready_unlocked():
+                return (False, [], [])
+            labels, rankings = _channels_unlocked(
+                query,
+                limit=limit,
+                source=source,
+                source_prefix=source_prefix,
+                since=since,
+                until=until,
+                pool=pool,
+            )
+            return (True, labels, rankings)
+    except OSError:
+        return (False, [], [])
+
+
 def _escape_match(q: str) -> str:
     # 包成 FTS5 短语，trigram 下等价于子串匹配；转义内部双引号
     return '"' + q.replace('"', '""') + '"'

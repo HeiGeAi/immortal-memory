@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from config import configured_vault_dir, load_config
+from index_writer import append_jsonl_records
 
 
 UTC = timezone.utc
@@ -326,9 +327,7 @@ def append_records(vault_dir: Path, records: list[dict[str, Any]]) -> None:
             for record in items:
                 clean = {k: v for k, v in record.items() if not k.startswith("_")}
                 handle.write(json.dumps(clean, ensure_ascii=False) + "\n")
-    with paths["index"].open("a", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_jsonl_records(paths["index"], records)
 
 
 def copy_history_db(history_path: Path) -> Path:

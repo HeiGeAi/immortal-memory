@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redact_common
-from index_locks import source_lock
+from index_writer import append_jsonl_records
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -456,17 +456,16 @@ def write_records(records: list[dict[str, Any]]) -> None:
 
     for day, items in sorted(buckets.items()):
         daily_file = DAILY_DIR / f"{day}.jsonl"
-        with open(daily_file, "a", encoding="utf-8") as daily, source_lock(
-            INDEX_FILE,
-            exclusive=True,
-        ), open(INDEX_FILE, "a", encoding="utf-8") as index:
+        clean_items = []
+        with open(daily_file, "a", encoding="utf-8") as daily:
             for item in items:
                 # 落盘前：去内部字段 + 递归脱敏（含 metadata 嵌套、文件名、去重键）
                 clean = {k: v for k, v in item.items() if not k.startswith("_")}
                 clean = redact_common.redact_tree(clean)
                 line = json.dumps(clean, ensure_ascii=False)
                 daily.write(line + "\n")
-                index.write(line + "\n")
+                clean_items.append(clean)
+        append_jsonl_records(INDEX_FILE, clean_items)
 
 
 class Collector:

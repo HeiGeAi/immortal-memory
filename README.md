@@ -118,7 +118,8 @@ immortal-memory agent-factory
 检索索引由每日采集编排中的 `index_db.py sync` 深度校验并同步。用户发起
 `recall` 时只读取已验证的 SQLite 索引和固定数量的水位元数据，不会临时扫描
 完整 `index.jsonl`、计算全文件摘要或触发重建。水位过期时查询会明确返回索引
-不可用，等待下一次同步，而不是用可能过期的结果冒充健康。
+不可用，等待下一次同步，而不是用可能过期的结果冒充健康。水位检查与 SQLite
+查询持有同一个 source→database 共享快照锁，采集写入不能插进两者之间。
 
 这里的 O(1) 可信水位建立在两个明确合同上：内置采集器都使用共同的 POSIX
 advisory lock 写入 source；文件系统提供可靠的 `st_ctime_ns`，并与 dev、inode、

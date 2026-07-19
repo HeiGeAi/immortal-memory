@@ -38,6 +38,7 @@ from config import (
 )
 from command_hints import cli_command
 from export_restore import create_export, get_backup_status, restore_check
+from index_writer import append_jsonl_records
 from state_store import mutate_state_atomic, update_state_atomic
 
 
@@ -1220,9 +1221,9 @@ def command_train(args) -> int:
         daily_dir = vault / "daily"
         daily_dir.mkdir(parents=True, exist_ok=True)
         date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for target in [vault / "index.jsonl", daily_dir / f"{date_key}.jsonl"]:
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(smoke_record, ensure_ascii=False) + "\n")
+        append_jsonl_records(vault / "index.jsonl", [smoke_record])
+        with (daily_dir / f"{date_key}.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(smoke_record, ensure_ascii=False) + "\n")
         mark_state("smoke")
         refresh_total_records()
         print(f"Smoke record written to {vault / 'index.jsonl'}")

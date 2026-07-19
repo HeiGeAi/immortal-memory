@@ -485,11 +485,11 @@ def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
     # ---- 快路径：持久化 SQLite 索引 ----
     try:
         import index_db
-        if not index_db.is_ready():
-            return ("index_unavailable", [])
-        labels, rankings = index_db.channels(
+        ready, labels, rankings = index_db.ready_channels(
             query, limit=limit, source=source, source_prefix=source_prefix,
             since=since, until=until)
+        if not ready:
+            return ("index_unavailable", [])
     except Exception:
         return ("index_unavailable", [])
 

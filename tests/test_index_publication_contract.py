@@ -13,6 +13,7 @@ import feishu_collect
 import index_db
 import index_integrity
 import index_locks
+import index_writer
 
 
 def record(rec_id, content):
@@ -375,7 +376,7 @@ def test_public_collectors_hold_exclusive_source_lock_for_index_append(
 
     monkeypatch.setattr(module, "DAILY_DIR", daily)
     monkeypatch.setattr(module, "INDEX_FILE", source)
-    monkeypatch.setattr(module, "source_lock", recording_lock)
+    monkeypatch.setattr(index_writer, "source_lock", recording_lock)
     if module is collect:
         module.write_records({"2026-07-19": [record("a", "alpha")]})
     else:
