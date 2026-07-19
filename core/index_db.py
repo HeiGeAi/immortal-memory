@@ -19,6 +19,7 @@ CLI:
 import sys
 import math
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,11 @@ from index_locks import database_lock, index_lock_pair
 IMMORTAL_DIR = Path.home() / ".immortal"
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DB_FILE = IMMORTAL_DIR / "search_index.db"
+
+
+class IndexQueryError(RuntimeError):
+    """The trusted SQLite generation could not execute a search query."""
+
 
 # 时间衰减收敛到 ranking_common（单一真源），与 search.py 共用，避免两通道打分口径漂移。
 import sys as _sys
@@ -198,15 +204,18 @@ def ready_channels(
         ):
             if not _is_ready_unlocked():
                 return (False, [], [])
-            labels, rankings = _channels_unlocked(
-                query,
-                limit=limit,
-                source=source,
-                source_prefix=source_prefix,
-                since=since,
-                until=until,
-                pool=pool,
-            )
+            try:
+                labels, rankings = _channels_unlocked(
+                    query,
+                    limit=limit,
+                    source=source,
+                    source_prefix=source_prefix,
+                    since=since,
+                    until=until,
+                    pool=pool,
+                )
+            except IndexQueryError:
+                return (False, [], [])
             return (True, labels, rankings)
     except OSError:
         return (False, [], [])
@@ -271,63 +280,59 @@ def _channels_unlocked(query: str, limit: int = 20, source: Optional[str] = None
 
     labels: ["bm25"/"like", "phrase"] 中非空的那些
     rankings: 与 labels 对应的 [(score, record), ...]
-    不可用或全空时返回 ([], [])。
+    查询成功但全空时返回 ([], [])；SQLite 查询失败时抛出 IndexQueryError。
     """
     if not DB_FILE.exists():
         return ([], [])
-    try:
-        con = _connect()
-        total = con.execute("SELECT count(*) FROM docs").fetchone()[0]
-    except Exception:
-        return ([], [])
-    if total == 0:
-        con.close()
-        return ([], [])
-
-    if pool is None:
-        pool = max(limit * 8, 80)
-    ql = query.strip()
-    if not ql:
-        con.close()
-        return ([], [])
-    clause, fparams = _build_filter(source, source_prefix, since, until)
-
     rows = []
     kw_label = None
     try:
-        if len(ql) >= 3:
-            # FTS5 trigram + bm25（>=3 字才能 MATCH）
-            sql = (
-                "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content, bm25(docs_fts) AS b "
-                "FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid "
-                "WHERE docs_fts MATCH ?" + clause + " ORDER BY b LIMIT ?"
+        with closing(_connect()) as con:
+            total = con.execute("SELECT count(*) FROM docs").fetchone()[0]
+            if total == 0:
+                return ([], [])
+            if pool is None:
+                pool = max(limit * 8, 80)
+            ql = query.strip()
+            if not ql:
+                return ([], [])
+            clause, fparams = _build_filter(
+                source,
+                source_prefix,
+                since,
+                until,
             )
-            rows = con.execute(sql, [_escape_match(ql)] + fparams + [pool]).fetchall()
-            kw_label = "bm25"
-        if not rows:
-            # 兜底：<3 字查询，或 FTS 未命中 -> LIKE 子串扫描
-            # 高频词命中可能上千条（实测：报价~1053、妙记~971、客户~6745）。
-            # 池子开到 5000 让常见 2 字词基本全覆盖，不漏相关老记录；
-            # 超高频词保留最近 5000 条（老记录本就被时间衰减压低）。
-            # 按时间倒序取，再交给 recency/phrase 通道精排。
-            like_pool = max(limit * 15, 5000)
-            sql = (
-                "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content "
-                "FROM docs d WHERE d.content LIKE ?" + clause +
-                " ORDER BY d.ts DESC LIMIT ?"
-            )
-            rows = con.execute(sql, ["%" + ql + "%"] + fparams + [like_pool]).fetchall()
-            # LIKE 行没有 bm25 列，补一个占位让下游统一处理
-            rows = [tuple(r) + (None,) for r in rows]
-            kw_label = "like"
-    except Exception:
-        con.close()
-        return ([], [])
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+            if len(ql) >= 3:
+                # FTS5 trigram + bm25（>=3 字才能 MATCH）
+                sql = (
+                    "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content, "
+                    "bm25(docs_fts) AS b FROM docs_fts JOIN docs d "
+                    "ON d.rowid = docs_fts.rowid WHERE docs_fts MATCH ?"
+                    + clause
+                    + " ORDER BY b LIMIT ?"
+                )
+                rows = con.execute(
+                    sql,
+                    [_escape_match(ql)] + fparams + [pool],
+                ).fetchall()
+                kw_label = "bm25"
+            if not rows:
+                # <3 字查询或 FTS 未命中时，用 LIKE 在完整读模型中兜底。
+                like_pool = max(limit * 15, 5000)
+                sql = (
+                    "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content "
+                    "FROM docs d WHERE d.content LIKE ?"
+                    + clause
+                    + " ORDER BY d.ts DESC LIMIT ?"
+                )
+                rows = con.execute(
+                    sql,
+                    ["%" + ql + "%"] + fparams + [like_pool],
+                ).fetchall()
+                rows = [tuple(row) + (None,) for row in rows]
+                kw_label = "like"
+    except (sqlite3.Error, OSError) as exc:
+        raise IndexQueryError("SQLite search query failed") from exc
 
     if not rows:
         return ([], [])
