@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from config import feishu_daily_sources, feishu_guard_args
 from process_utils import run_process
 from runtime_telemetry import RuntimeTelemetry
@@ -52,6 +53,39 @@ REQUIRED_FAILURE_PREFIXES = (
     "index integrity failed",
     "migration failed",
     "export verify failed",
+)
+
+REQUIRED_CORE_SCRIPTS = (
+    "collect.py",
+    "summary.py",
+    "distill.py",
+    "profile.py",
+    "profile_nuwa.py",
+    "profile_attribution_audit.py",
+    "people_index.py",
+    "index_db.py",
+    "relationship_index.py",
+    "quality_report.py",
+    "cards.py",
+    "export_restore.py",
+    "agent_bridge.py",
+    "cleanup.py",
+)
+
+OPTIONAL_CONNECTOR_SCRIPTS = (
+    "web_capture.py",
+    "feishu_collect.py",
+    "feishu_clean.py",
+    "feishu_distill.py",
+    "profile_auto_review.py",
+    "feishu_drive_mirror.py",
+    "obsidian_sync.py",
+    "getnote_sync.py",
+)
+
+INACTIVE_COMPATIBILITY_SCRIPTS = (
+    "daily_digest.py",
+    "product_brief.py",
 )
 
 DISTILL_INTERVAL_DAYS = 1  # 每天蒸馏一次（数据变化大的话有意义）
@@ -182,6 +216,15 @@ def orchestration_status(errors: list[str]) -> tuple[str, int]:
     if normalized:
         return "attention", 0
     return "success", 0
+
+
+def preflight_required_scripts(skill_dir: Optional[Path] = None) -> list[str]:
+    root = Path(skill_dir) if skill_dir is not None else SKILL_DIR
+    return [
+        name
+        for name in REQUIRED_CORE_SCRIPTS
+        if not (root / name).is_file()
+    ]
 
 
 def child_env() -> dict:
@@ -912,6 +955,18 @@ def main():
 
 
 def run_main():
+    missing_scripts = preflight_required_scripts()
+    if missing_scripts:
+        return {
+            "status": "failed",
+            "exit_code": 1,
+            "errors": [
+                f"required core script missing: {name}"
+                for name in missing_scripts
+            ],
+            "results": {},
+        }
+
     state = load_state()
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()

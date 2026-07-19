@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import shutil
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +24,106 @@ class FakeTelemetry:
 
     def heartbeat(self, **kwargs):
         self.calls.append(("heartbeat", kwargs))
+
+
+def static_orchestrator_script_targets() -> set[str]:
+    source = Path(orchestrator.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id not in {"run_script", "run_script_rc"}:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            targets.add(first.value)
+    return targets
+
+
+def populated_skill_dir(tmp_path: Path) -> Path:
+    skill_dir = tmp_path / "core"
+    skill_dir.mkdir()
+    for name in orchestrator.REQUIRED_CORE_SCRIPTS:
+        (skill_dir / name).write_text("# packaged test script\n", encoding="utf-8")
+    return skill_dir
+
+
+def test_every_static_orchestrator_script_has_an_explicit_required_or_optional_classification():
+    classified = (
+        set(orchestrator.REQUIRED_CORE_SCRIPTS)
+        | set(orchestrator.OPTIONAL_CONNECTOR_SCRIPTS)
+        | set(orchestrator.INACTIVE_COMPATIBILITY_SCRIPTS)
+    )
+
+    assert static_orchestrator_script_targets() == classified
+
+
+@pytest.mark.parametrize("missing_name", ["profile.py", "index_db.py"])
+def test_run_main_fails_before_collection_when_required_script_is_missing(
+    tmp_path,
+    monkeypatch,
+    missing_name,
+):
+    skill_dir = populated_skill_dir(tmp_path)
+    (skill_dir / missing_name).unlink()
+    calls = []
+    monkeypatch.setattr(orchestrator, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(orchestrator, "collect", lambda: calls.append("collect"))
+    monkeypatch.setattr(
+        orchestrator,
+        "run_script",
+        lambda *_args, **_kwargs: calls.append("run_script"),
+    )
+
+    outcome = orchestrator.run_main()
+
+    assert outcome == {
+        "status": "failed",
+        "exit_code": 1,
+        "errors": [f"required core script missing: {missing_name}"],
+        "results": {},
+    }
+    assert calls == []
+
+
+def test_main_reports_real_missing_script_preflight_as_failed_telemetry(
+    tmp_path,
+    monkeypatch,
+):
+    skill_dir = populated_skill_dir(tmp_path)
+    (skill_dir / "profile.py").unlink()
+    telemetry = FakeTelemetry()
+    monkeypatch.setattr(orchestrator, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(orchestrator, "RUNTIME_TELEMETRY", telemetry)
+    monkeypatch.setattr(orchestrator, "acquire_lock", lambda: True)
+    monkeypatch.setattr(orchestrator, "release_lock", lambda: None)
+    monkeypatch.setattr(orchestrator, "telemetry_finish_active", lambda _errors: None)
+    monkeypatch.setattr(
+        orchestrator,
+        "collect",
+        lambda: pytest.fail("collection must not start after failed script preflight"),
+    )
+
+    exit_code = orchestrator.main()
+
+    assert exit_code == 1
+    assert telemetry.calls[-1] == (
+        "finish_run",
+        {
+            "status": "failed",
+            "results": {},
+            "error": "required core script missing: profile.py",
+        },
+    )
+
+
+def test_damaged_packaged_core_copy_is_rejected_by_real_preflight(tmp_path):
+    packaged_core = tmp_path / "site-packages" / "immortal_memory"
+    shutil.copytree(Path(orchestrator.__file__).parent, packaged_core)
+    (packaged_core / "index_db.py").unlink()
+
+    assert orchestrator.preflight_required_scripts(packaged_core) == ["index_db.py"]
 
 
 def test_required_stage_failure_returns_nonzero_and_failed_telemetry(monkeypatch):
