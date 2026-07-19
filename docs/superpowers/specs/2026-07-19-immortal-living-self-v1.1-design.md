@@ -138,6 +138,7 @@ Immortal Memory 是一个有证据、会成长、可纠正、能在真实任务�
 12. SQLite 不可用或完整性未知时，产品 API 不得回退为全量扫描 1GB 级 JSONL。
 13. 任何注册到 CLI 或每日流水线的命令都必须存在于干净安装包，必需阶段失败必须返回非零退出码。
 14. 没有异盘、全量哈希和隔离恢复证据时，不得执行生产迁移。
+15. 日常 Notes 同步不得扫描完整 `index.jsonl` 或全部 `daily/`；跨文件恢复必须由持久事务元数据驱动。
 
 ### 5.1 已确认的 v1.0 生产 P0
 
@@ -151,6 +152,42 @@ Immortal Memory 是一个有证据、会成长、可纠正、能在真实任务�
 v1.1 编码前必须先增加索引完整性测试与 staging 全量重建能力。生产切换前必须完成 JSONL ID 与 staging SQLite ID 的双向对账，并用原子替换切换数据库。
 
 公开 v1.0 仓库还注册了 `cards.py`、`project.py`、`obsidian_notes_sync.py` 等缺失脚本，而 live 安装存在同名文件。v1.1 必须逐项决定公开安全实现或移除入口，禁止直接复制可能含私有逻辑的 live 文件。
+
+### 5.2 Notes 事务边界
+
+Obsidian 手工笔记仍写入 L0 的 `daily/*.jsonl` 与 `index.jsonl`，但日常同步不得把扫描全量事实层当作事务恢复机制。新增两类仅用于恢复的私有元数据：
+
+- `notes/manifest.json`：记录源文件指纹、最近成功事务、迁移状态和 bounded 统计；
+- `notes/transactions/<tx_id>.json`：记录待写事实的稳定 ID、严格校验后的 daily 相对路径、daily/index 预写偏移、序列化行长度、SHA256、事务阶段和时间。
+
+事务必须在统一 source lock 内执行：
+
+1. 读取目标文件当前长度，生成完整待写字节；
+2. 原子写入并 fsync `prepared` journal，同时 fsync journal 父目录；
+3. 在 journal 声明的精确偏移写 daily，fsync 后把阶段更新为 `daily_committed`；
+4. 在 journal 声明的精确偏移写 index，fsync 后把阶段更新为 `index_committed`；
+5. 原子更新 manifest，再把 journal 标记为完成或删除。
+
+恢复只读取未完成 journal，并检查声明偏移处的精确字节：
+
+- 字节完全相同则视为该侧已提交；
+- 文件长度等于预写偏移则补写；
+- 长度、哈希、目标路径或偏移不一致则 fail closed，不猜测、不覆盖。
+
+这使崩溃恢复成本与未完成事务数量相关，而不是与 1GB 级 index 或数千个 daily 文件相关。
+
+其他硬约束：
+
+- 目录遍历与文件读取必须由根目录 fd 锚定，每级使用 `dir_fd` 与 `O_NOFOLLOW`；
+- 总读取预算按实际读取字节计数，文件并发增长也不得突破剩余预算；
+- daily 日期必须经 `date.fromisoformat()` 严格解析，目标 resolved parent 必须等于 vault 的 `daily/`；
+- append helper 必须返回已写字节与 fsync 状态，`facts_committed` 只依据真实结果；
+- 错误状态必须原子覆盖旧成功，并保留 `last_success`、事务 ID、失败阶段和待修复方向；
+- capability 必须绑定到具体 subparser 的真实 handler 对象，命令名、注释、同名伪函数或无 handler 入口均不得解锁。
+
+历史重复、孤儿和旧版无 journal 写入由显式一次性 `notes-migrate` 处理。迁移使用磁盘上的临时 SQLite catalog 与 checkpoint，流式扫描受最大文件数、最大字节数和最大时长约束；冲突 fail closed；去重后的 daily/index 通过 staging 文件、校验和可恢复发布 journal 切换。
+
+新 vault 在初始化时创建 `migration_status=not_required` 的空 manifest。只要 vault 已有非空事实层但缺少兼容 manifest，或存在旧版 `notes/state.json`，`notes-sync` 就返回 `notes_migration_required`；它不得为了判断是否存在旧 Notes 记录而扫描全库。安装升级与生产切换必须显式运行并验证 `notes-migrate`，完成后写入版本化 migration marker。日常 `notes-sync` 不偷偷触发全库迁移。
 
 ## 6. 数据分层
 

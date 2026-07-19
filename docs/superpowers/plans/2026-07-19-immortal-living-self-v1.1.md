@@ -411,6 +411,102 @@ git add core tests/test_packaged_command_closure.py tests/test_orchestrator_rele
 git commit -m "fix: close packaged commands and orchestration status"
 ```
 
+### Preflight Task B2: Replace full-vault Notes reconciliation with a transaction journal
+
+**Files:**
+- Create: `core/notes_transactions.py`
+- Create: `core/notes_migration.py`
+- Create: `tests/test_notes_transaction_journal.py`
+- Create: `tests/test_notes_migration_checkpoint.py`
+- Modify: `core/notes_ingestion.py`
+- Modify: `core/obsidian_notes_sync.py`
+- Modify: `core/immortal.py`
+
+- [ ] **Step 1: Write failing transaction-journal tests**
+
+Cover:
+
+- journal is fsynced before either fact append;
+- crash before and after each append is recovered by exact offset and exact serialized bytes;
+- an offset mismatch or different bytes fails closed without appending;
+- the normal sync path never enumerates all daily files or scans the full index;
+- append results distinguish `bytes_written=0` from partial or fsynced writes;
+- `facts_committed` is false when the first append fails before writing;
+- a concurrent file growth cannot exceed or under-report the remaining read budget;
+- daily targets reject invalid dates and cannot escape `daily/`.
+
+- [ ] **Step 2: Implement bounded manifest and pending transactions**
+
+Use `notes/manifest.json` and `notes/transactions/<tx_id>.json`. Each prepared transaction records:
+
+```json
+{
+  "tx_id": "stable transaction id",
+  "record_id": "obsidian-note id",
+  "daily_relpath": "daily/2026-07-19.jsonl",
+  "daily_offset": 123,
+  "index_offset": 456,
+  "daily_length": 100,
+  "index_length": 140,
+  "daily_sha256": "hex",
+  "index_sha256": "hex",
+  "stage": "prepared"
+}
+```
+
+All journal and manifest state uses atomic replace plus file and parent-directory fsync. Recovery checks only the declared offsets. It never searches the complete destination files.
+
+- [ ] **Step 3: Write failing one-time migration tests**
+
+Cover:
+
+- identical physical duplicates compact to one record;
+- same ID with different payload fails closed;
+- daily-only and index-only legacy facts reconcile when the source changed or was deleted;
+- the catalog is disk-backed and memory use is independent of total fact count;
+- max files, max bytes, max seconds and checkpoint resume are authoritative;
+- staging rewrites preserve all non-Notes bytes and publish only after hash/count verification;
+- interrupted migration leaves production files unchanged and resumes from checkpoint.
+
+- [ ] **Step 4: Implement explicit `notes-migrate`**
+
+The migration is never implicit in `notes-sync`. It builds a temporary SQLite catalog, streams legacy Notes rows, validates strict dates and payload equality, writes staging projections, verifies them, then publishes under the source lock. A completed migration writes its version and evidence to the manifest.
+
+- [ ] **Step 5: Make daily sync fail closed on legacy ambiguity**
+
+If the vault has a non-empty fact layer but no compatible manifest, or an old `notes/state.json` exists without a completed migration marker, return:
+
+```json
+{
+  "status": "error",
+  "error_code": "notes_migration_required"
+}
+```
+
+Do not scan the full vault, do not auto-migrate, and do not report success.
+New-vault initialization creates an empty compatible manifest with `migration_status=not_required`.
+
+- [ ] **Step 6: Verify clean package and bounded production behavior**
+
+```bash
+PYTHONPATH=core python3 -m pytest \
+  tests/test_notes_transaction_journal.py \
+  tests/test_notes_migration_checkpoint.py \
+  tests/test_notes_ingestion.py \
+  tests/test_packaged_command_closure.py -q
+PYTHONPATH=core python3 -m pytest -q
+python3 tests/regression_p0.py
+```
+
+Also use an instrumented large temporary vault to prove the normal sync reads no unrelated daily content and no unrelated index bytes.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add core tests docs/superpowers
+git commit -m "fix: journal note ingestion transactions"
+```
+
 ### Preflight Task C: Enforce backup migration and release privacy gates
 
 **Files:**
