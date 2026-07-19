@@ -5,9 +5,9 @@
 
 - docs 表存正文与元数据；docs_fts(fts5 trigram) 给 >=3 字查询做 bm25 召回，
   <3 字中文查询(trigram 无法 MATCH)用 LIKE 兜底。
-- 按字节 offset 增量同步，append-only 友好；源文件缩小则自动全量重建。
+- 用前缀指纹验证 append-only，发现中段重写、缩小或 ID 漂移时安全重建。
 - channels() 返回多通道排序结果，交给 search.py 做 RRF 融合。
-- 设计为"可失败"：任何异常由调用方(search.py)回退到内存引擎，绝不影响 recall 可用性。
+- SQLite 是可重建读模型，index.jsonl 是事实源。
 
 CLI:
   python3 index_db.py reindex   # 全量重建
@@ -16,13 +16,9 @@ CLI:
   python3 index_db.py search <关键词>
 """
 
-import os
 import sys
-import json
 import math
 import sqlite3
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -37,23 +33,13 @@ from ranking_common import RECENCY_TAU_DAYS, RECENCY_BOOST, local_date, recency_
 
 
 def _connect() -> sqlite3.Connection:
-    # SQLite does not always honor busy_timeout while two first-use
-    # connections both try to switch journal_mode. Retry that narrow startup
-    # race; normal writer serialization is handled by BEGIN IMMEDIATE.
-    for attempt in range(5):
-        con = sqlite3.connect(str(DB_FILE), timeout=10)
-        con.execute("PRAGMA busy_timeout=10000")
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA synchronous=NORMAL")
-            con.create_function("immortal_local_date", 1, local_date, deterministic=True)
-            return con
-        except sqlite3.OperationalError as exc:
-            con.close()
-            if "locked" not in str(exc).lower() or attempt == 4:
-                raise
-            time.sleep(0.05 * (attempt + 1))
-    raise RuntimeError("unreachable")
+    # Query paths are strictly read-only. In particular, they must not create
+    # WAL sidecars that could race an atomic staging database replacement.
+    uri = DB_FILE.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=10)
+    con.execute("PRAGMA query_only=ON")
+    con.create_function("immortal_local_date", 1, local_date, deterministic=True)
+    return con
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
@@ -92,84 +78,19 @@ def _reset(con) -> None:
     _ensure_schema(con)
 
 
-def sync(verbose: bool = False) -> int:
-    """增量同步：只处理 index.jsonl 中上次 offset 之后的新行。
-
-    源文件比上次记录的体积还小（被 dedup/rotate 重写过）则全量重建。
-    返回本次新增条数。
-    """
+def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
+    """Reconcile the read model and return the number of inserted records."""
     if not INDEX_FILE.exists():
         return 0
+    from index_integrity import reconcile_index
 
-    con = _connect()
-    added = 0
-    try:
-        # Serialize metadata reads with writes. Reading the old offset before
-        # acquiring the writer lock lets two recall processes index the same
-        # byte range or makes one fail with "database is locked".
-        con.execute("BEGIN IMMEDIATE")
-        _ensure_schema(con)
-        last_offset = int(_meta_get(con, "last_offset", 0) or 0)
-        last_size = int(_meta_get(con, "last_size", 0) or 0)
-        fsize = INDEX_FILE.stat().st_size
-
-        if fsize < last_size:
-            if verbose:
-                print("源文件变小，触发全量重建索引")
-            _reset(con)
-            last_offset = 0
-
-        if fsize == last_size and last_offset >= fsize:
-            con.commit()
-            return 0
-
-        with open(INDEX_FILE, "rb") as f:
-            f.seek(last_offset)
-            while True:
-                line_start = f.tell()
-                raw = f.readline()
-                if not raw:
-                    break
-                # A collector may still be appending the final JSONL record.
-                # Keep the offset before that fragment so the next sync can
-                # parse the completed line instead of skipping it forever.
-                if not raw.endswith(b"\n"):
-                    f.seek(line_start)
-                    break
-                try:
-                    r = json.loads(raw.decode("utf-8", "ignore"))
-                except Exception:
-                    continue
-                content = r.get("content", "") or ""
-                cur = con.execute(
-                    "INSERT INTO docs(rec_id,ts,source,role,project,content) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (
-                        r.get("id", ""),
-                        r.get("timestamp", ""),
-                        r.get("source", ""),
-                        r.get("role", ""),
-                        r.get("project", ""),
-                        content,
-                    ),
-                )
-                con.execute(
-                    "INSERT INTO docs_fts(rowid,content) VALUES(?,?)",
-                    (cur.lastrowid, content),
-                )
-                added += 1
-                if verbose and added % 50000 == 0:
-                    print(f"  已索引 {added} 条...")
-            new_offset = f.tell()
-        _meta_set(con, "last_offset", new_offset)
-        _meta_set(con, "last_size", new_offset)
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
-    return added
+    result = reconcile_index(INDEX_FILE, DB_FILE, force_rebuild=force_rebuild)
+    if verbose:
+        print(
+            f"索引同步模式: {result['mode']}，原因: {result['reason']}，"
+            f"写入: {result['added']}"
+        )
+    return int(result["added"])
 
 
 def _escape_match(q: str) -> str:
@@ -332,14 +253,8 @@ def main():
         return
     cmd = sys.argv[1]
     if cmd == "reindex":
-        if DB_FILE.exists():
-            DB_FILE.unlink()
-        for ext in ("-wal", "-shm"):
-            p = Path(str(DB_FILE) + ext)
-            if p.exists():
-                p.unlink()
         print("开始全量构建索引（首次约 1-3 分钟）...")
-        n = sync(verbose=True)
+        n = sync(verbose=True, force_rebuild=True)
         print(f"完成，索引 {n} 条")
         stats()
     elif cmd == "sync":
