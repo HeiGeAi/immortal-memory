@@ -3,7 +3,10 @@ from __future__ import annotations
 import importlib
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 
 class LazyNotesIngestion:
@@ -226,6 +229,73 @@ def test_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
     assert recovered["totals"]["repaired_tails"] == 2
     assert len(jsonl_rows(daily)) == 2
     assert len(jsonl_rows(vault / "index.jsonl")) == 2
+
+
+def test_sync_preserves_complete_index_object_without_trailing_newline(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "new.md"
+    note.write_text("# New\n\nAppend after valid index fact.", encoding="utf-8")
+    index = vault / "index.jsonl"
+    index.parent.mkdir(parents=True)
+    existing = {"id": "existing-index-fact", "content": "preserve me"}
+    index.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+
+    result = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    rows = jsonl_rows(index)
+    assert result["status"] == "ok"
+    assert result["totals"]["repaired_tails"] == 1
+    assert rows[0] == existing
+    assert len(rows) == 2
+    assert index.read_bytes().endswith(b"\n")
+
+
+def test_sync_preserves_complete_daily_object_without_trailing_newline(tmp_path):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "new.md"
+    note.write_text("# New\n\nAppend after valid daily fact.", encoding="utf-8")
+    day = datetime.fromtimestamp(note.stat().st_mtime, tz=timezone.utc).date().isoformat()
+    daily = vault / "daily" / f"{day}.jsonl"
+    daily.parent.mkdir(parents=True)
+    existing = {"id": "existing-daily-fact", "content": "preserve me"}
+    daily.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+
+    result = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    rows = jsonl_rows(daily)
+    assert result["status"] == "ok"
+    assert result["totals"]["repaired_tails"] == 1
+    assert rows[0] == existing
+    assert len(rows) == 2
+    assert daily.read_bytes().endswith(b"\n")
+
+
+@pytest.mark.parametrize(
+    "invalid_tail",
+    [
+        {"content": "missing id"},
+        {"id": "", "content": "empty id"},
+        ["not", "an", "object"],
+    ],
+)
+def test_sync_truncates_complete_json_tail_that_is_not_a_valid_fact(
+    tmp_path,
+    invalid_tail,
+):
+    vault, obsidian = make_obsidian(tmp_path)
+    note = obsidian / "笔记" / "new.md"
+    note.write_text("# New\n\nReplace invalid tail.", encoding="utf-8")
+    index = vault / "index.jsonl"
+    index.parent.mkdir(parents=True)
+    index.write_text(json.dumps(invalid_tail), encoding="utf-8")
+
+    result = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
+
+    rows = jsonl_rows(index)
+    assert result["status"] == "ok"
+    assert result["totals"]["repaired_tails"] == 1
+    assert len(rows) == 1
+    assert rows[0]["title"] == "New"
 
 
 def test_state_write_failure_is_typed_and_preserves_committed_fact_for_retry(

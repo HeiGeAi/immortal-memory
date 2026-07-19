@@ -296,18 +296,31 @@ def _repair_partial_tail(path: Path) -> bool:
         handle.seek(-1, os.SEEK_END)
         if handle.read(1) == b"\n":
             return False
-        position = handle.tell() - 1
-        truncate_at = 0
-        while position > 0:
+        handle.seek(0, os.SEEK_END)
+        file_size = handle.tell()
+        position = file_size
+        tail_start = 0
+        while position:
             read_size = min(65536, position)
             position -= read_size
             handle.seek(position)
             chunk = handle.read(read_size)
             newline = chunk.rfind(b"\n")
             if newline >= 0:
-                truncate_at = position + newline + 1
+                tail_start = position + newline + 1
                 break
-        handle.truncate(truncate_at)
+        handle.seek(tail_start)
+        tail = handle.read(file_size - tail_start)
+        try:
+            row = json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            row = None
+        valid_id = row.get("id") if isinstance(row, dict) else None
+        if isinstance(valid_id, str) and valid_id.strip():
+            handle.seek(0, os.SEEK_END)
+            handle.write(b"\n")
+        else:
+            handle.truncate(tail_start)
         handle.flush()
         os.fsync(handle.fileno())
     return True
