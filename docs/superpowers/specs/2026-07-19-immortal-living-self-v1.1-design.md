@@ -1,10 +1,11 @@
 # Immortal Memory v1.1 Living Self 设计规格
 
-状态：待用户书面复核  
+状态：已批准，可进入实施计划
 方案：C，动态事实源＋结构化 Living Self＋按任务编译 Context Pack  
 目标版本：`1.1.0`  
 基线版本：`1.0.0`，commit `19c33251c39bdaa99ae19c4fed709b2071fef7ac`  
 设计确认：用户于 2026-07-19 明确回复「按你的推荐方案 c 来」
+审批授权：用户随后明确授权主代理自行审批并组织专家团复核；主代理依据专家审查修订本规格后批准进入实施
 
 ## 1. 目的
 
@@ -133,6 +134,23 @@ Immortal Memory 是一个有证据、会成长、可纠正、能在真实任务�
 8. 所有公开导出默认排除私有正文。
 9. 看板不得用静态假数据或仅前端状态模拟成功。
 10. HTTP 200、测试绿或字段齐全都不能单独证明生产可用。
+11. `index.jsonl` 与 SQLite 的 offset、size 相等不能证明索引完整，必须验证源前缀指纹和记录 ID 对账。
+12. SQLite 不可用或完整性未知时，产品 API 不得回退为全量扫描 1GB 级 JSONL。
+13. 任何注册到 CLI 或每日流水线的命令都必须存在于干净安装包，必需阶段失败必须返回非零退出码。
+14. 没有异盘、全量哈希和隔离恢复证据时，不得执行生产迁移。
+
+### 5.1 已确认的 v1.0 生产 P0
+
+2026-07-19 只读核查发现：
+
+- `index.jsonl` 为 471,912 行、1,056,490,555 字节；
+- `search_index.db` 的 `docs` 为 470,712 行；
+- SQLite `meta.last_offset` 与 `meta.last_size` 均等于 JSONL 当前字节数；
+- SQLite 比 JSONL 少 1,200 条，说明现有「offset 已追平」信号存在假绿。
+
+v1.1 编码前必须先增加索引完整性测试与 staging 全量重建能力。生产切换前必须完成 JSONL ID 与 staging SQLite ID 的双向对账，并用原子替换切换数据库。
+
+公开 v1.0 仓库还注册了 `cards.py`、`project.py`、`obsidian_notes_sync.py` 等缺失脚本，而 live 安装存在同名文件。v1.1 必须逐项决定公开安全实现或移除入口，禁止直接复制可能含私有逻辑的 live 文件。
 
 ## 6. 数据分层
 
@@ -153,6 +171,58 @@ L0 只负责：
 
 任何新模型均通过 `evidence_id` 引用 L0，不复制无边界的完整私密正文。
 
+SQLite 是可重建读模型，不是证据权威源。`evidence_id` 必须来自 JSONL 事实记录的稳定 ID，不能使用 SQLite rowid。
+
+新增 `EvidenceRef`：
+
+```json
+{
+  "evidence_id": "事实层稳定 ID",
+  "source": "codex|claude|feishu|local|web|custom",
+  "raw_id": "源端或 raw 层 ID，可为空",
+  "content_hash": "sha256:...",
+  "status": "available|source_broken|source_deleted",
+  "observed_at": "...",
+  "privacy": "private|restricted|context_safe|public"
+}
+```
+
+旧记录缺少稳定 ID 时，使用可重复的来源、时间和内容哈希生成迁移 ID，并保留 `source_broken` 或 `source_deleted`，不能伪装成可直接验证的证据。
+
+### 6.1.1 统一事件 envelope
+
+所有 v1.1 权威事件使用同一 envelope：
+
+```json
+{
+  "event_id": "evt_...",
+  "event_type": "claim.created",
+  "stream_id": "clm_...",
+  "stream_version": 1,
+  "schema_version": 1,
+  "request_id": "req_...",
+  "idempotency_key": "idem_...",
+  "actor": {
+    "kind": "owner|system|migration",
+    "id": "owner|service|migration-name"
+  },
+  "occurred_at": "...",
+  "expected_version": 0,
+  "payload": {},
+  "previous_status": null,
+  "migration_source": null
+}
+```
+
+事件要求：
+
+- 相同 idempotency key 与相同 payload 返回第一次结果；
+- 相同 idempotency key 与不同 payload 返回 `idempotency_conflict`；
+- `expected_version` 不匹配返回 `version_conflict`；
+- event append 是权威提交，current view 可以在崩溃后通过 replay 修复；
+- 尾部部分写入必须显式报错并进入恢复流程，不静默跳过；
+- 每个 current view 保存 `based_on_event_seq` 和 `stream_version`。
+
 ### 6.2 L1：Attribution Claims
 
 新增派生目录：
@@ -172,6 +242,8 @@ L0 只负责：
 
 ```json
 {
+  "schema_version": 1,
+  "revision": 1,
   "claim_id": "clm_...",
   "subject": {
     "kind": "owner",
@@ -187,15 +259,22 @@ L0 只负责：
   "counter_evidence_ids": [],
   "source_kind": "direct|quoted|observed|inferred|user_declared",
   "confidence": 0.0,
+  "confidence_basis": {
+    "speaker": 0.0,
+    "recurrence": 0.0,
+    "source_quality": 0.0,
+    "explanation": "..."
+  },
   "role_scope": ["personal|work|creator|family|custom"],
   "domain_scope": ["general|business|content|technical|relationship|project|risk|custom"],
+  "custom_scope_ids": [],
   "privacy": "private|restricted|context_safe|public",
   "valid_from": null,
   "valid_to": null,
   "status": "candidate|confirmed|rejected|superseded",
   "created_at": "...",
   "updated_at": "...",
-  "model_version": 1
+  "based_on_event_seq": 1
 }
 ```
 
@@ -204,8 +283,12 @@ L0 只负责：
 - `speaker.kind != owner` 时，除非内容明确是他人对用户的外部评价，否则不得生成 `subject.kind = owner` 的直接事实。
 - `source_kind = inferred` 的主张不能自动进入 `confirmed`。
 - `confidence` 不是 UI 百分比装饰，必须由可检查规则计算并保留计算原因。
+- `schema_version` 与对象 `revision` 分离，禁止使用 `model_version` 同时表达两者。
+- `custom` scope 必须带稳定的 `custom_scope_ids`，不能让所有自定义作用域互相匹配。
 - `privacy = private` 的正文不得进入 Context Pack。
-- 旧 `reviewed/profile_memories.jsonl` 只读迁移为 `Claim`，原文件不删除。
+- 旧 `reviewed/profile_memories.jsonl` 只读迁移为 `Claim candidate`，原文件不删除。
+- 旧 `profile_nuwa.accepted` 只能作为候选差异提示，不能迁为 confirmed。
+- 代码内 pinned item、fallback 文案和静态 reference 不能迁为 `user_declared`。
 
 ### 6.3 L2：Living Self
 
@@ -237,6 +320,8 @@ Living Self 包含八个模块：
 
 ```json
 {
+  "schema_version": 1,
+  "revision": 1,
   "item_id": "self_...",
   "kind": "mental_model",
   "title": "先形成独立预判，再使用 AI 交叉验证",
@@ -258,7 +343,23 @@ Living Self 包含八个模块：
   "valid_to": null,
   "status": "candidate|confirmed|rejected|superseded",
   "last_reviewed_at": "...",
-  "model_version": 3
+  "based_on_claim_seq": 47
+}
+```
+
+Living Self 版本容器：
+
+```json
+{
+  "version_id": "lsv_...",
+  "parent_version_id": "lsv_...|null",
+  "status": "candidate|confirmed|superseded",
+  "generation_reason": "migration|claim_change|manual_restore|scheduled_rebuild",
+  "content_hash": "sha256:...",
+  "based_on_claim_seq": 47,
+  "generated_at": "...",
+  "confirmed_at": null,
+  "sections": {}
 }
 ```
 
@@ -270,6 +371,7 @@ Living Self 生成规则：
 - 过期项目事实不进入长期身份，但可保留在时间线。
 - `expression_dna` 是独立适配器，默认不进入判断模型。
 - 每次生成产生不可变版本，`current` 只是指向最新确认版本的派生视图。
+- SelfModelItem 的 confirm、reject 和 correct 通过 Claim correction 与新 Living Self 版本完成，不直接原地修改版本内容。
 
 ### 6.4 L3：Judgment Memory
 
@@ -314,13 +416,29 @@ Living Self 生成规则：
 
 - 用户确认；
 - 有明确决定和后续结果证据；
-- 达到自动确认阈值且不涉及敏感、高风险或不可逆事项。
+- v1.1 首版默认关闭自动确认。未来启用时必须另行定义阈值和高风险分类。
 
 v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重建为 `judgment_store.py`、`judgment_service.py` 和受测试的 CLI/API，并保留旧 `cards` 命令兼容层。
 
 ### 6.5 L4：Context Pack
 
 现有 `agent-context` 保持为稳定入口，但内部升级为基于结构化数据的编译器。
+
+持久化目录：
+
+```text
+~/.immortal/contexts/
+  events.jsonl
+  current.jsonl
+  previews/
+    <preview-id>.json
+  packs/
+    <context-id>/
+      context.json
+      TASK_CONTEXT.md
+```
+
+`events.jsonl` 是上下文生命周期的权威源，`current.jsonl` 是可重建视图。预览会落盘到受 TTL 管理的私有 preview 区，但不会成为 Agent 可读取的正式 Context Pack。
 
 上下文包必须包含：
 
@@ -329,7 +447,8 @@ v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重�
   "context_id": "ctx_...",
   "task": "...",
   "mode": "advisor|writer|reviewer|business|project|custom",
-  "status": "preview|compiled|consumed|outcome_recorded|expired",
+  "lifecycle_status": "preview|compiled|consumed|outcome_recorded",
+  "availability_status": "active|expired",
   "budget": {
     "max_chars": 24000,
     "used_chars": 0
@@ -352,6 +471,15 @@ v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重�
     "excluded_count": 0,
     "reasons": []
   },
+  "source_revision": {
+    "claims_event_seq": 0,
+    "living_self_version": "lsv_...",
+    "judgments_event_seq": 0,
+    "compiler_version": "1.1.0",
+    "policy_version": 1
+  },
+  "preview_hash": "...",
+  "content_hash": "sha256:...",
   "generated_at": "...",
   "expires_at": "..."
 }
@@ -366,9 +494,12 @@ v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重�
 5. 选择相关判断卡和反例。
 6. 排除私密正文、凭证、无关人物和越权来源。
 7. 明确区分事实、归纳、推断和未知。
-8. 生成用户预览。
-9. 用户确认或调用 CLI 后落盘。
-10. 记录本次实际使用的模型与证据。
+8. 生成用户预览，持久化 `preview_id`、source revision、hash 和 TTL。
+9. 编译请求只提交 `preview_id`、`preview_hash` 和用户主动移除的 item IDs。
+10. 服务重新读取预览，验证 revision、hash、TTL 和移除 ID 子集后生成正式包。
+11. 记录本次实际使用的模型与证据。
+
+复制到剪贴板不等于 `consumed`。只有用户明确点击「已交给 Agent」，或 Agent Bridge 返回成功使用回执后，才能进入 consumed。
 
 默认预算：
 
@@ -396,8 +527,10 @@ v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重�
   "adopted": "yes|partial|no|unknown",
   "result": "positive|mixed|negative|unknown",
   "summary": "...",
-  "confirmed_item_ids": [],
-  "challenged_item_ids": [],
+  "confirmed_refs": [
+    {"kind": "claim|self_model|judgment", "id": "...", "revision": 1}
+  ],
+  "challenged_refs": [],
   "created_at": "..."
 }
 ```
@@ -408,6 +541,8 @@ v1.0 缺少的 `cards.py` 不直接补一个孤立脚本。v1.1 将其能力重�
 - 生成待确认修正；
 - 建议产生新版本；
 - 将失败案例加入反例。
+
+跨事件流更新不假装成单事务。每个派生视图保存 watermark。Claim correction 已提交但 Living Self 重建失败时，Living Self 标记 `stale`，信任页显示落后 event seq，旧 current 可继续只读，但不得声称已经吸收新纠正。
 
 ## 7. 状态机
 
@@ -441,14 +576,14 @@ confirmed -> candidate
 
 ### 7.3 Context Pack
 
+Context 使用两个正交状态：
+
 ```text
-preview -> compiled -> consumed -> outcome_recorded
-preview -> expired
-compiled -> expired
-consumed -> expired
+lifecycle: preview -> compiled -> consumed -> outcome_recorded
+availability: active -> expired
 ```
 
-只有 `compiled` 后才能提供给 Agent。预览被修改后必须重新编译并生成新哈希。
+只有 `compiled + active` 后才能首次提供给 Agent。`preview + expired` 不能编译，`compiled + expired` 不能再次分发。已经 consumed 的 Context 即使随后 expired，仍允许补录 outcome。用户不能直接修改预览正文，只能提交待移除 item IDs；服务基于原始预览重新生成正式包。
 
 ## 8. 服务边界
 
@@ -458,15 +593,40 @@ consumed -> expired
 |---|---|---|
 | `model_types.py` | 数据类型、枚举、校验 | 文件读写、HTTP |
 | `event_store.py` | 只追加事件、原子写、重放 | 业务状态转换 |
+| `evidence_catalog.py` | L0 ID 解析、证据存在性、断链状态 | 业务模型 |
+| `index_integrity.py` | staging reindex、ID 对账、原子切库 | 检索排序 |
 | `claim_store.py` | Claim 持久化与当前视图 | 自动归因 |
-| `attribution_service.py` | 说话人、对象、作用域和隐私判定 | UI |
+| `model_migration.py` | v1.0 到 v1.1 确定性转换、checkpoint、dry-run、报告 | 在线业务写入 |
+| `attribution_service.py` | 说话人、对象、作用域、隐私和 confidence basis | UI |
 | `living_self_service.py` | 模型生成、版本、差异和回滚 | 原始采集 |
 | `judgment_store.py` | 判断卡存储与状态 | Context 排序 |
-| `context_compiler.py` | 检索、过滤、预算、编译 | Agent 执行 |
+| `context_store.py` | preview、Context 事件、过期、幂等、current view | 检索排序 |
+| `context_compiler.py` | 检索、过滤、预算、编译 | 生命周期持久化、Agent 执行 |
 | `outcome_store.py` | 使用结果事件 | 自动修改确认模型 |
 | `product_data.py` | 面向产品的只读聚合 | 运维命令 |
 | `product_http.py` | `/api/v2` 路由、安全和错误协议 | HTML |
 | `product_ui.py` | 七模块界面 | 直接读 vault 文件 |
+
+前端静态资产使用原生 ES modules：
+
+```text
+core/product_assets/
+  product.css
+  api.js
+  app.js
+  router.js
+  dialog.js
+  views/
+    home.js
+    memories.js
+    self.js
+    judgments.js
+    contexts.js
+    trust.js
+    system.js
+```
+
+不引入 Node 构建。`product_ui.py` 只输出语义化 HTML 壳和本地资产引用。最终 CSP 移除 `unsafe-inline`。
 
 现有超大文件逐步瘦身：
 
@@ -485,9 +645,12 @@ consumed -> expired
 - `Content-Type: application/json`
 - 同源请求
 - `X-Immortal-Request-Id`
+- `Idempotency-Key`
+- `If-Match` 或请求体 `expected_version`
 - 明确动作
 - 审计事件
-- 幂等键用于重试
+- 请求体硬上限
+- 精确 scheme、host、port 同源
 
 ### 9.1 首页
 
@@ -523,6 +686,8 @@ consumed -> expired
 - `cursor`
 
 列表只返回摘要。详情只返回请求的单条记录，并执行脱敏。
+
+分页使用 opaque keyset cursor，禁止 offset 深分页。SQLite 完整性未知时返回 `index_unavailable`，不扫描完整 JSONL。
 
 ### 9.3 我
 
@@ -561,6 +726,8 @@ consumed -> expired
 - `POST /api/v2/contexts/{id}/outcomes`
 
 预览不写入正式 Context Pack。正式编译返回可读 Markdown、结构化清单和排除说明。
+
+预览响应必须包含 `preview_id`、`source_revision`、`preview_hash`、`expires_at`、入选项和排除原因。
 
 ### 9.6 信任
 
@@ -611,6 +778,9 @@ consumed -> expired
 - `stale_preview`
 - `idempotency_conflict`
 - `migration_required`
+- `index_unavailable`
+- `version_conflict`
+- `request_too_large`
 
 ## 10. 看板信息架构
 
@@ -744,6 +914,16 @@ consumed -> expired
 - 右侧证据或详情抽屉；
 - 宽表格仅用于记忆与审计，其他页面优先使用结构化卡片和时间线。
 
+交互约束：
+
+- 七个页面支持深链接、刷新、前进和后退；
+- 路由切换取消旧请求或使用 generation token，旧响应不得覆盖新页面；
+- modal 打开时焦点进入、背景 inert、Escape 关闭、焦点归还；
+- 所有输入有显式 label，触控目标至少 44px，移动输入字体至少 16px；
+- 导航使用 `aria-current`；
+- 响应设置 `Cache-Control: no-store`；
+- 全局产品健康、当前页面加载状态、数据完整度分开呈现。
+
 ## 12. 迁移策略
 
 ### 12.1 原则
@@ -766,6 +946,25 @@ consumed -> expired
 - `launchctl print`
 - 外部便携备份和恢复校验
 - 当前数据计数与哈希快照
+- live 与 public 同名文件逐文件差异和归因
+- CLI 注册命令与 wheel 文件闭包检查
+- JSONL 行数、唯一 ID、SQLite ID 的双向对账
+- 源前缀 SHA256 与 SQLite meta 验证
+- staging 全量 reindex，成功后再原子换库
+- 异盘备份，strict SHA256 全量通过
+- 隔离 HOME 恢复后运行 v1.0 health、preflight、agent-context
+
+当前 latest export 位于 vault 内或同盘、旧 manifest 只有 manifest-level 校验、存在凭证形态 warning 时，阶段 0 不通过。
+
+v1.1 私人灾备 manifest 必须记录：
+
+- 每个事件流 head sequence；
+- 每个 current view 的 `based_on_event_seq`；
+- schema version；
+- Context、Claim、Judgment、Outcome 事件文件哈希；
+- restore replay 结果。
+
+私人灾备可以保留经过授权的私密事实，但必须位于用户控制的异盘位置。公开 GitHub 导出是另一条严格脱敏链路，二者不能共用「为了公开而删除私人历史」的规则。
 
 #### 阶段 1：Claim 派生
 
@@ -835,6 +1034,9 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 - UI 首屏 JSON 建议小于 300KB，硬上限 1MB；
 - 高成本模型重建放入后台 job；
 - job 支持进度、取消、失败恢复和结构化日志。
+- 47 万条规模下 SQLite 不可用时返回明确错误，不做 JSONL 全扫；
+- 索引同步在源 prefix hash 变化时自动转 staging rebuild；
+- staging rebuild 完成后要求 JSONL 唯一 ID 集与 SQLite ID 集一致。
 
 ## 14. 安全与隐私
 
@@ -842,8 +1044,11 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 
 - 默认绑定 `127.0.0.1`；
 - 拒绝非 loopback Host；
+- 写请求必须精确匹配当前服务 scheme、host 和 port；
+- 拒绝错误 Content-Type、缺 request ID、缺幂等键、缺 expected version 和超大请求；
 - 禁止通配 CORS；
-- 保持 CSP、`X-Frame-Options`、`nosniff` 和 `no-referrer`；
+- 保持 CSP、`X-Frame-Options`、`nosniff`、`no-referrer` 和 `Cache-Control: no-store`；
+- 静态资产拆分后 CSP 不允许 `unsafe-inline`；
 - 写操作记录 request ID、动作、目标 ID、时间和结果，不记录私密正文。
 
 ### 14.2 输出
@@ -853,6 +1058,8 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 - Context Pack 默认只包含摘要和证据 ID；
 - 公开导出移除用户名、绝对路径、会话正文、open_id、token、cookie、客户名和本地数据；
 - 表达 DNA 导出不携带证据正文。
+- 隐私扫描覆盖源码、staged diff、wheel、sdist、ZIP 和最终 Release 资产内部；
+- 扫描至少识别 open_id、Cookie、Bearer、URL userinfo、AWS key、绝对 Home 路径和私钥；
 
 ### 14.3 生产数据
 
@@ -903,6 +1110,10 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 - 服务重启恢复；
 - v1.0 CLI 兼容；
 - 备份和恢复包含新增派生层。
+- 中间回填、同尺寸重写和增尺寸重写触发 staging reindex；
+- JSONL 与 SQLite ID 双向对账；
+- CLI 注册目标在源树、wheel 和安装目录全部存在；
+- orchestrator 必需阶段失败时 CLI 返回非零。
 
 ### 16.3 信任回归集
 
@@ -958,6 +1169,11 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 - 无脚本错误；
 - 无横向滚动；
 - `prefers-reduced-motion`。
+- 深链接、刷新、前进和后退；
+- 快速切页和慢响应不会发生旧响应覆盖；
+- 精确同源、请求体上限、expected version 和幂等重试；
+- CSP 不含 `unsafe-inline`；
+- 47 万条规模的 keyset cursor 无重复、遗漏和深分页退化。
 
 ### 16.6 生产验收
 
@@ -977,6 +1193,10 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 12. 外部备份恢复校验；
 13. 真实浏览器桌面与移动验收；
 14. 日志无凭证和私密正文。
+15. JSONL 与 SQLite 记录 ID 完整对账。
+16. live 与 public 漂移已逐文件处置。
+17. 异盘备份和隔离恢复通过。
+18. 当前 health、doctor 中的 Feishu mirror 错误已被证明修复或明确判定为可接受的实时边界。
 
 ## 17. 发布门禁
 
@@ -989,21 +1209,28 @@ v1.1 新目录不影响 v1.0 读取，因此不需要删除。
 - 全量 pytest 通过；
 - P0 回归 `8/8`；
 - 新增 Living Self P0 回归全过；
+- index JSONL 与 SQLite ID 集完全一致；
+- event replay 后 current watermarks 一致；
 - Python 3.9、3.10、3.11、3.12 CI 全绿；
 - `scripts/private_scan.py .` 无命中；
 - staged diff 人工逐文件检查；
 - 公开包包含所有 CLI 引用文件；
 - `cards` 兼容命令在干净安装中可用；
+- `project`、`notes-sync` 等注册命令具有公开安全实现或已从所有入口移除；
+- orchestrator 必需阶段失败返回非零；
 - 真实 vault 不进入 Git；
 - PR 合并；
 - tag 指向 main 合并 commit；
 - GitHub Release 版本、说明和资产一致；
 - 本地安装版本与 release 一致。
+- 最终资产由 main merge commit 构建，测试、扫描、生产安装和 Release 上传使用同一 SHA256；
+- GitHub Release 下载资产再次安装、扫描和命令闭包验证通过。
 
 ## 18. 实施分解
 
 ### 里程碑 A：可信数据内核
 
+- 索引完整性、包命令闭包、备份迁移门；
 - 类型、事件流、Claim、归因、迁移、信任 API；
 - 不改变默认 UI；
 - 完成信任回归集。
