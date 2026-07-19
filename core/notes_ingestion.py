@@ -315,8 +315,8 @@ def _repair_partial_tail(path: Path) -> bool:
             row = json.loads(tail.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             row = None
-        valid_id = row.get("id") if isinstance(row, dict) else None
-        if isinstance(valid_id, str) and valid_id.strip():
+        valid_id = str(row.get("id") or "").strip() if isinstance(row, dict) else ""
+        if valid_id:
             handle.seek(0, os.SEEK_END)
             handle.write(b"\n")
         else:

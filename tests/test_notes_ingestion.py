@@ -231,13 +231,14 @@ def test_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
     assert len(jsonl_rows(vault / "index.jsonl")) == 2
 
 
-def test_sync_preserves_complete_index_object_without_trailing_newline(tmp_path):
+@pytest.mark.parametrize("valid_id", [123, True])
+def test_sync_preserves_truthy_index_id_without_trailing_newline(tmp_path, valid_id):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "new.md"
     note.write_text("# New\n\nAppend after valid index fact.", encoding="utf-8")
     index = vault / "index.jsonl"
     index.parent.mkdir(parents=True)
-    existing = {"id": "existing-index-fact", "content": "preserve me"}
+    existing = {"id": valid_id, "content": "preserve me"}
     index.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
 
     result = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
