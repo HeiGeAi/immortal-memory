@@ -332,5 +332,10 @@ def main(argv: list[str] | None = None) -> int:
     return 2 if quarantined and not args.apply else 0
 
 
+PIPELINE_CAPABILITIES = {
+    "profile-attribution-audit": main,
+}
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

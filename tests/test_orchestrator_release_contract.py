@@ -193,8 +193,18 @@ def test_full_pipeline_declares_only_the_real_v11_stages():
     )
 
 
-def test_full_pipeline_fails_closed_before_any_command_when_v11_is_unavailable(tmp_path):
-    (tmp_path / "immortal.py").write_text('sub.add_parser("run")\n', encoding="utf-8")
+def test_full_pipeline_fails_closed_before_any_command_when_v11_is_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    missing = (
+        "claims-migrate",
+        "profile-attribution-audit",
+        "living-self-build",
+        "cards-build",
+        "context-preview",
+    )
+    monkeypatch.setattr(profile_review, "missing_pipeline_stages", lambda _root: missing)
     factory = FactoryStore(
         history_path=tmp_path / "jobs.json",
         skill_dir=tmp_path,
@@ -204,37 +214,11 @@ def test_full_pipeline_fails_closed_before_any_command_when_v11_is_unavailable(t
     with pytest.raises(profile_review.FullPipelineUnavailable) as error:
         factory._commands_for("full", {"goal": "真实闭环"})
 
-    assert error.value.missing_stages == (
-        "claims-migrate",
-        "profile-attribution-audit",
-        "living-self-build",
-        "cards-build",
-        "context-preview",
-    )
+    assert error.value.missing_stages == missing
 
 
-def test_full_pipeline_commands_and_summary_match_completed_stages(tmp_path):
-    for filename in (
-        "profile_attribution_audit.py",
-        "claim_migrate.py",
-        "living_self.py",
-        "cards.py",
-        "context_compiler.py",
-    ):
-        (tmp_path / filename).write_text("", encoding="utf-8")
-    (tmp_path / "immortal.py").write_text(
-        "\n".join(
-            (
-                'sub.add_parser("run")',
-                'sub.add_parser("claims-migrate")',
-                'sub.add_parser("profile-attribution-audit")',
-                'sub.add_parser("living-self-build")',
-                'sub.add_parser("cards")',
-                'sub.add_parser("context-preview")',
-            )
-        ),
-        encoding="utf-8",
-    )
+def test_full_pipeline_commands_and_summary_match_completed_stages(tmp_path, monkeypatch):
+    monkeypatch.setattr(profile_review, "missing_pipeline_stages", lambda _root: ())
     factory = FactoryStore(
         history_path=tmp_path / "jobs.json",
         skill_dir=tmp_path,
@@ -242,8 +226,8 @@ def test_full_pipeline_commands_and_summary_match_completed_stages(tmp_path):
     )
 
     commands = factory._commands_for("full", {"goal": "真实闭环"})
-    stages = factory._command_stages(commands)
-    summary = factory._success_summary("full", {"goal": "真实闭环"}, commands)
+    stages = [command.stage_id for command in commands]
+    summary = factory._success_summary("full", {"goal": "真实闭环"}, tuple(stages))
 
     assert stages == list(FactoryStore.FULL_PIPELINE_STAGES)
     assert "采集、清洗、蒸馏、画像" not in summary
@@ -252,19 +236,14 @@ def test_full_pipeline_commands_and_summary_match_completed_stages(tmp_path):
         assert stage in summary
 
 
-def test_full_pipeline_does_not_unlock_when_file_exists_but_cli_is_unregistered(tmp_path):
-    for filename in (
-        "profile_attribution_audit.py",
-        "claim_migrate.py",
-        "living_self.py",
-        "cards.py",
-        "context_compiler.py",
-    ):
-        (tmp_path / filename).write_text("", encoding="utf-8")
-    (tmp_path / "immortal.py").write_text(
-        'sub.add_parser("run")\nsub.add_parser("cards")\n',
-        encoding="utf-8",
+def test_full_pipeline_does_not_unlock_when_registry_reports_missing(tmp_path, monkeypatch):
+    missing = (
+        "claims-migrate",
+        "profile-attribution-audit",
+        "living-self-build",
+        "context-preview",
     )
+    monkeypatch.setattr(profile_review, "missing_pipeline_stages", lambda _root: missing)
     factory = FactoryStore(
         history_path=tmp_path / "jobs.json",
         skill_dir=tmp_path,
@@ -274,36 +253,14 @@ def test_full_pipeline_does_not_unlock_when_file_exists_but_cli_is_unregistered(
     with pytest.raises(profile_review.FullPipelineUnavailable) as error:
         factory._commands_for("full", {"goal": "真实闭环"})
 
-    assert error.value.missing_stages == (
-        "claims-migrate",
-        "profile-attribution-audit",
-        "living-self-build",
-        "context-preview",
-    )
+    assert error.value.missing_stages == missing
 
 
-def test_fail_closed_stub_does_not_unlock_cards_stage(tmp_path):
-    for filename in (
-        "profile_attribution_audit.py",
-        "claim_migrate.py",
-        "living_self.py",
-        "context_compiler.py",
-    ):
-        (tmp_path / filename).write_text("", encoding="utf-8")
-    (tmp_path / "cards.py").write_text("not_available_until_v11\n", encoding="utf-8")
-    (tmp_path / "immortal.py").write_text(
-        "\n".join(
-            f'sub.add_parser("{command}")'
-            for command in (
-                "run",
-                "claims-migrate",
-                "profile-attribution-audit",
-                "living-self-build",
-                "cards",
-                "context-preview",
-            )
-        ),
-        encoding="utf-8",
+def test_unready_cards_capability_does_not_unlock_cards_stage(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        profile_review,
+        "missing_pipeline_stages",
+        lambda _root: ("cards-build",),
     )
     factory = FactoryStore(
         history_path=tmp_path / "jobs.json",

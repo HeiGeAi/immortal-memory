@@ -11,6 +11,7 @@ import argparse
 
 
 UNAVAILABLE = "not_available_until_v11"
+CAPABILITY_READY = False
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
         "reason=event_backed_judgment_store_not_migrated"
     )
     return 3
+
+
+PIPELINE_CAPABILITIES = {
+    "cards-build": main,
+}
 
 
 if __name__ == "__main__":

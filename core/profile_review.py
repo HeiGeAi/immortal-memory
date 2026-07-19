@@ -20,6 +20,7 @@ import time
 import webbrowser
 import uuid
 import shutil
+from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,7 @@ from control_data import ControlData
 from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
+from pipeline_capabilities import missing_pipeline_stages
 
 
 HOME = Path.home()
@@ -80,6 +82,13 @@ ROLE_MODES = {
     "shadow",
     "custom",
 }
+
+
+@dataclass(frozen=True)
+class StageCommand:
+    stage_id: str
+    argv: tuple[str, ...]
+    timeout: int
 
 
 class FullPipelineUnavailable(RuntimeError):
@@ -551,23 +560,6 @@ class FactoryStore:
         "cards-build",
         "context-preview",
     )
-    FULL_PIPELINE_FILES = {
-        "run": "immortal.py",
-        "claims-migrate": "claim_migrate.py",
-        "profile-attribution-audit": "profile_attribution_audit.py",
-        "living-self-build": "living_self.py",
-        "cards-build": "cards.py",
-        "context-preview": "context_compiler.py",
-    }
-    FULL_PIPELINE_COMMANDS = {
-        "run": "run",
-        "claims-migrate": "claims-migrate",
-        "profile-attribution-audit": "profile-attribution-audit",
-        "living-self-build": "living-self-build",
-        "cards-build": "cards",
-        "context-preview": "context-preview",
-    }
-
     def __init__(
         self,
         history_path: Path = DEFAULT_CONTROL_JOBS,
@@ -742,10 +734,14 @@ class FactoryStore:
         self._update_job(job_id, status="running", started_at=now_local())
         try:
             commands = self._commands_for(kind, body)
-            self._update_job(job_id, commands=[self._display_cmd(cmd) for cmd, _timeout in commands])
+            self._update_job(
+                job_id,
+                commands=[self._display_cmd(command) for command in commands],
+            )
             last_code = 0
             attention = False
-            for cmd, timeout in commands:
+            completed_stage_ids: list[str] = []
+            for command in commands:
                 current = self.get_job(job_id) or {}
                 if current.get("status") == "cancel_requested":
                     self._update_job(
@@ -755,12 +751,15 @@ class FactoryStore:
                         summary="任务已在安全阶段边界停止。",
                     )
                     return
-                self._append_output(job_id, stdout=f"$ {self._display_cmd(cmd)}\n")
+                self._append_output(
+                    job_id,
+                    stdout=f"$ {self._display_cmd(command)}\n",
+                )
                 result = self.runner(
-                    cmd,
+                    list(command.argv),
                     capture_output=True,
                     text=True,
-                    timeout=timeout,
+                    timeout=command.timeout,
                     cwd=str(self.skill_dir),
                     env={
                         **os.environ,
@@ -781,10 +780,18 @@ class FactoryStore:
                     )
                     return
                 if result.returncode != 0:
-                    if result.returncode == 2 and any(part in {"profile-nuwa", "role-distill", "agent-build", "task-compile", "agent-session"} for part in cmd):
+                    if result.returncode == 2 and command.stage_id in {
+                        "profile-nuwa",
+                        "role-distill",
+                        "task-compile",
+                    }:
                         attention = True
                         continue
-                    raise RuntimeError(f"command failed with code {result.returncode}: {self._display_cmd(cmd)}")
+                    raise RuntimeError(
+                        f"command failed with code {result.returncode}: "
+                        f"{self._display_cmd(command)}"
+                    )
+                completed_stage_ids.append(command.stage_id)
             if kind in {"run", "collect", "full"}:
                 after_run = run_evidence_marker(self.immortal_dir / "runtime" / "current_run.json")
                 if not after_run or after_run == before_run or after_run[3] != "success":
@@ -800,7 +807,11 @@ class FactoryStore:
                 job_id,
                 status="attention" if attention else "success",
                 returncode=2 if attention else last_code,
-                summary=self._success_summary(kind, body, commands),
+                summary=self._success_summary(
+                    kind,
+                    body,
+                    tuple(completed_stage_ids),
+                ),
             )
         except FullPipelineUnavailable as exc:
             self._update_job(
@@ -823,64 +834,71 @@ class FactoryStore:
             self._update_job(job_id, finished_at=now_local(), elapsed_seconds=round(time.time() - started, 2))
             self._cancel_marker(job_id).unlink(missing_ok=True)
 
-    def _commands_for(self, kind: str, body: dict[str, Any]) -> list[tuple[list[str], int]]:
+    def _commands_for(self, kind: str, body: dict[str, Any]) -> list[StageCommand]:
         python = sys.executable
         immortal = str(self.skill_dir / "immortal.py")
         if kind == "collect":
-            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
+            return [
+                StageCommand(
+                    "run",
+                    (python, immortal, "run"),
+                    COMMAND_TIMEOUTS["collect"],
+                )
+            ]
         if kind == "clean":
             return [
-                ([python, immortal, "feishu-clean"], COMMAND_TIMEOUTS["clean"]),
-                ([python, immortal, "feishu-distill"], COMMAND_TIMEOUTS["distill"]),
-                ([python, immortal, "profile-auto-review", "--reconsider-rejected"], COMMAND_TIMEOUTS["profile_auto_review"]),
-                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
-                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
-                ([python, immortal, "people"], COMMAND_TIMEOUTS["people"]),
-                ([python, immortal, "relationships"], COMMAND_TIMEOUTS["relationships"]),
-                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
-                ([python, immortal, "digest"], COMMAND_TIMEOUTS["digest"]),
-                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
+                StageCommand("feishu-clean", (python, immortal, "feishu-clean"), COMMAND_TIMEOUTS["clean"]),
+                StageCommand("feishu-distill", (python, immortal, "feishu-distill"), COMMAND_TIMEOUTS["distill"]),
+                StageCommand(
+                    "profile-auto-review",
+                    (python, immortal, "profile-auto-review", "--reconsider-rejected"),
+                    COMMAND_TIMEOUTS["profile_auto_review"],
+                ),
+                StageCommand("profile", (python, immortal, "profile"), COMMAND_TIMEOUTS["profile"]),
+                StageCommand("profile-nuwa", (python, immortal, "profile-nuwa"), COMMAND_TIMEOUTS["profile_nuwa"]),
+                StageCommand("people", (python, immortal, "people"), COMMAND_TIMEOUTS["people"]),
+                StageCommand("relationships", (python, immortal, "relationships"), COMMAND_TIMEOUTS["relationships"]),
+                StageCommand("quality", (python, immortal, "quality"), COMMAND_TIMEOUTS["quality"]),
+                StageCommand("digest", (python, immortal, "digest"), COMMAND_TIMEOUTS["digest"]),
+                StageCommand(
+                    "dashboard",
+                    (python, str(self.skill_dir / "dashboard.py")),
+                    COMMAND_TIMEOUTS["dashboard"],
+                ),
             ]
         if kind == "full":
             goal = str(body.get("goal") or "当前任务").strip()[:120]
             mode = str(body.get("mode") or "auto")
             if mode not in ROLE_MODES:
                 mode = "auto"
-            immortal_source = ""
-            try:
-                immortal_source = (self.skill_dir / "immortal.py").read_text(encoding="utf-8")
-            except OSError:
-                pass
-            missing = []
-            for stage in self.FULL_PIPELINE_STAGES:
-                filename = self.FULL_PIPELINE_FILES[stage]
-                command = re.escape(self.FULL_PIPELINE_COMMANDS[stage])
-                registered = re.search(
-                    rf"""add_parser\(\s*["']{command}["']""",
-                    immortal_source,
-                )
-                implementation = self.skill_dir / filename
-                implementation_source = ""
-                try:
-                    implementation_source = implementation.read_text(encoding="utf-8")
-                except OSError:
-                    pass
-                fail_closed_stub = "not_available_until_v11" in implementation_source
-                if not implementation.is_file() or not registered or fail_closed_stub:
-                    missing.append(stage)
+            missing = missing_pipeline_stages(self.skill_dir)
             if missing:
-                raise FullPipelineUnavailable(tuple(missing))
+                raise FullPipelineUnavailable(missing)
             return [
-                ([python, immortal, "run"], COMMAND_TIMEOUTS["collect"]),
-                ([python, immortal, "claims-migrate"], COMMAND_TIMEOUTS["profile"]),
-                (
-                    [python, immortal, "profile-attribution-audit", "--apply"],
+                StageCommand("run", (python, immortal, "run"), COMMAND_TIMEOUTS["collect"]),
+                StageCommand(
+                    "claims-migrate",
+                    (python, immortal, "claims-migrate"),
                     COMMAND_TIMEOUTS["profile"],
                 ),
-                ([python, immortal, "living-self-build"], COMMAND_TIMEOUTS["profile"]),
-                ([python, immortal, "cards", "build"], COMMAND_TIMEOUTS["profile"]),
-                (
-                    [python, immortal, "context-preview", goal, "--mode", mode],
+                StageCommand(
+                    "profile-attribution-audit",
+                    (python, immortal, "profile-attribution-audit", "--apply"),
+                    COMMAND_TIMEOUTS["profile"],
+                ),
+                StageCommand(
+                    "living-self-build",
+                    (python, immortal, "living-self-build"),
+                    COMMAND_TIMEOUTS["profile"],
+                ),
+                StageCommand(
+                    "cards-build",
+                    (python, immortal, "cards", "build"),
+                    COMMAND_TIMEOUTS["profile"],
+                ),
+                StageCommand(
+                    "context-preview",
+                    (python, immortal, "context-preview", goal, "--mode", mode),
                     COMMAND_TIMEOUTS["task_compile"],
                 ),
             ]
@@ -891,24 +909,36 @@ class FactoryStore:
             mode = str(body.get("mode") or "auto")
             if mode not in ROLE_MODES:
                 raise ValueError("invalid mode")
-            cmd = [python, immortal, "task-compile", goal[:160], "--mode", mode]
-            return [(cmd, COMMAND_TIMEOUTS["task_compile"])]
+            return [
+                StageCommand(
+                    "task-compile",
+                    (python, immortal, "task-compile", goal[:160], "--mode", mode),
+                    COMMAND_TIMEOUTS["task_compile"],
+                )
+            ]
         if kind == "health":
-            return [([python, immortal, "health", "--max-age-hours", "30"], COMMAND_TIMEOUTS["health"])]
+            return [
+                StageCommand(
+                    "health",
+                    (python, immortal, "health", "--max-age-hours", "30"),
+                    COMMAND_TIMEOUTS["health"],
+                )
+            ]
         if kind == "run":
-            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
+            return [StageCommand("run", (python, immortal, "run"), COMMAND_TIMEOUTS["collect"])]
         if kind == "backup_verify":
             return [
-                (
-                    [python, immortal, "backup-status", "--verify", "--max-age-hours", "168"],
+                StageCommand(
+                    "backup-verify",
+                    (python, immortal, "backup-status", "--verify", "--max-age-hours", "168"),
                     COMMAND_TIMEOUTS["health"],
                 )
             ]
         if kind == "profile_refresh":
             return [
-                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
-                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
-                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
+                StageCommand("profile", (python, immortal, "profile"), COMMAND_TIMEOUTS["profile"]),
+                StageCommand("profile-nuwa", (python, immortal, "profile-nuwa"), COMMAND_TIMEOUTS["profile_nuwa"]),
+                StageCommand("quality", (python, immortal, "quality"), COMMAND_TIMEOUTS["quality"]),
             ]
         raise ValueError("unknown factory job kind")
 
@@ -960,8 +990,10 @@ class FactoryStore:
         self,
         kind: str,
         body: dict[str, Any],
-        commands: list[tuple[list[str], int]] | None = None,
+        completed_stage_ids: tuple[str, ...] | None = None,
     ) -> str:
+        if completed_stage_ids is not None:
+            return "已按真实命令完成：" + "、".join(completed_stage_ids) + "。"
         if kind == "collect":
             return "采集与自动链路已完成。"
         if kind == "clean":
@@ -969,8 +1001,7 @@ class FactoryStore:
         if kind in {"role", "session"}:
             return f"任务上下文已生成：{body.get('goal') or ''}"
         if kind == "full":
-            stages = self._command_stages(commands or [])
-            return "已按真实命令完成：" + "、".join(stages) + "。"
+            return "完整闭环已完成。"
         if kind == "health":
             return "健康检查已完成。"
         if kind == "run":
@@ -981,23 +1012,10 @@ class FactoryStore:
             return "长期画像和质量报告已刷新。"
         return "任务完成。"
 
-    def _command_stages(self, commands: list[tuple[list[str], int]]) -> list[str]:
-        stages: list[str] = []
-        for command, _timeout in commands:
-            args = [str(item) for item in command]
-            if "cards" in args and "build" in args:
-                stages.append("cards-build")
-                continue
-            for stage in self.FULL_PIPELINE_STAGES:
-                if stage in args:
-                    stages.append(stage)
-                    break
-        return stages
-
     @staticmethod
-    def _display_cmd(cmd: list[str]) -> str:
+    def _display_cmd(command: StageCommand) -> str:
         display = []
-        for item in cmd:
+        for item in command.argv:
             if item == sys.executable:
                 display.append("python3")
             else:

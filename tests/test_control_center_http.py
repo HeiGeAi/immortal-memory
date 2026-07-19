@@ -138,10 +138,10 @@ def test_control_action_commands_are_fixed_allowlist(tmp_path):
     backup = factory._commands_for("backup_verify", {})
     profile = factory._commands_for("profile_refresh", {})
 
-    assert health[0][0][-3:] == ["health", "--max-age-hours", "30"]
-    assert "backup-status" in backup[0][0]
-    assert "--verify" in backup[0][0]
-    assert [command[0][-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
+    assert list(health[0].argv[-3:]) == ["health", "--max-age-hours", "30"]
+    assert "backup-status" in backup[0].argv
+    assert "--verify" in backup[0].argv
+    assert [command.argv[-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
 
 
 def test_persisted_running_job_is_marked_interrupted_after_restart(tmp_path):

@@ -210,6 +210,15 @@ def run_script(script: str, args: list[str] | None = None) -> int:
     return subprocess.call(cmd)
 
 
+def command_run(_args=None) -> int:
+    return run_script("orchestrator.py")
+
+
+PIPELINE_CAPABILITIES = {
+    "run": command_run,
+}
+
+
 def iter_daily_files(days: int = 2) -> Iterable[Path]:
     if not DAILY_DIR.exists():
         return []
@@ -1795,9 +1804,10 @@ def build_parser() -> argparse.ArgumentParser:
     health = sub.add_parser("health", help="Check whether the daily automated memory loop is current")
     health.add_argument("--max-age-hours", type=float, default=30)
     health.set_defaults(func=command_health)
-    sub.add_parser("run", help="Run capture, summary, dashboard, distill, and cleanup orchestration").set_defaults(
-        func=lambda args: run_script("orchestrator.py")
-    )
+    sub.add_parser(
+        "run",
+        help="Run capture, summary, dashboard, distill, and cleanup orchestration",
+    ).set_defaults(func=command_run)
     backup = sub.add_parser("backup", help="Create a portable export and verify it immediately (real backup; no longer an alias for run)")
     backup.add_argument("--vault-dir", default=None)
     backup.add_argument("--output-dir", default=None, help="Export target; use an external disk or synced folder for real loss protection")
