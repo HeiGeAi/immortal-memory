@@ -1,5 +1,9 @@
+import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -76,6 +80,27 @@ def test_same_size_middle_rewrite_replaces_old_id_instead_of_appending(tmp_path)
     assert report["mode"] == "full_rebuild"
     assert report["reason"] == "prefix_mismatch"
     assert db_ids(database) == {"a", "c"}
+
+
+def test_same_count_database_id_replacement_forces_rebuild(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha"), record("b", "bravo")])
+    reconcile_index(source, database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute("UPDATE docs SET rec_id='c' WHERE rec_id='b'")
+        con.commit()
+
+    report = reconcile_index(source, database)
+
+    assert report["mode"] == "full_rebuild"
+    assert report["reason"] == "id_digest_mismatch"
+    assert report["missing_in_sqlite"] == []
+    assert report["missing_in_jsonl"] == []
+    assert db_ids(database) == {"a", "b"}
+    with sqlite3.connect(str(database)) as con:
+        meta = dict(con.execute("SELECT key,value FROM meta"))
+    assert meta["indexed_ids_sha256"] == index_integrity.ids_sha256({"a", "b"})
 
 
 def test_failed_staging_validation_preserves_live_database_bytes(tmp_path, monkeypatch):
@@ -238,6 +263,288 @@ def test_report_only_rejects_nonempty_wal_instead_of_ignoring_committed_data(tmp
         reconcile_index(source, database, report_only=True)
 
 
+def test_report_only_rejects_orphan_nonempty_wal_when_database_is_missing(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "missing.db"
+    write_records(source, [record("a", "alpha")])
+    Path(str(database) + "-wal").write_bytes(b"orphan")
+
+    with pytest.raises(
+        index_integrity.IndexIntegrityError,
+        match="non-empty WAL",
+    ):
+        reconcile_index(source, database, report_only=True)
+
+
+def test_sha256_prefix_rejects_early_eof(tmp_path):
+    source = tmp_path / "short.bin"
+    source.write_bytes(b"abc")
+
+    with pytest.raises(EOFError, match="wanted=4 read=3"):
+        index_integrity.sha256_prefix(source, 4)
+
+
+def test_source_revision_binds_identity_stat_and_content_hash(tmp_path):
+    source = tmp_path / "index.jsonl"
+    body = json.dumps(record("a", "alpha")) + "\n"
+    source.write_text(body, encoding="utf-8")
+
+    revision = index_integrity.source_revision(source)
+    stat = source.stat()
+
+    assert revision == {
+        "dev": stat.st_dev,
+        "ino": stat.st_ino,
+        "size": len(body.encode("utf-8")),
+        "mtime_ns": stat.st_mtime_ns,
+        "content_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "prefix_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    }
+
+
+def test_report_only_retries_source_change_then_succeeds(tmp_path, monkeypatch):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    reconcile_index(source, database)
+    original = index_integrity._scan_source_ids_once
+    calls = 0
+
+    def append_once(path):
+        nonlocal calls
+        ids, revision = original(path)
+        calls += 1
+        if calls == 1:
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record("b", "bravo")) + "\n")
+        return ids, revision
+
+    monkeypatch.setattr(index_integrity, "_scan_source_ids_once", append_once)
+
+    report = reconcile_index(source, database, report_only=True)
+
+    assert calls == 2
+    assert report["jsonl_unique_ids"] == 2
+    assert report["source_size"] == source.stat().st_size
+    assert report["missing_in_sqlite"] == ["b"]
+
+
+def test_report_only_fails_closed_when_source_keeps_changing(tmp_path, monkeypatch):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    reconcile_index(source, database)
+    original = index_integrity._scan_source_ids_once
+    calls = 0
+
+    def rewrite_after_every_scan(path):
+        nonlocal calls
+        ids, revision = original(path)
+        calls += 1
+        replacement = "bravo" if calls % 2 else "alpha"
+        write_records(source, [record("a", replacement)])
+        return ids, revision
+
+    monkeypatch.setattr(
+        index_integrity,
+        "_scan_source_ids_once",
+        rewrite_after_every_scan,
+    )
+
+    with pytest.raises(
+        index_integrity.SourceChangedError,
+        match="source changed during stable scan after 3 attempts",
+    ):
+        reconcile_index(source, database, report_only=True)
+
+    assert calls == 3
+
+
+def test_full_rebuild_retries_source_change_and_binds_final_revision(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    original = index_integrity._build_staging_once
+    calls = 0
+
+    def append_once(path, staging):
+        nonlocal calls
+        result = original(path, staging)
+        calls += 1
+        if calls == 1:
+            with source.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record("b", "bravo")) + "\n")
+        return result
+
+    monkeypatch.setattr(index_integrity, "_build_staging_once", append_once)
+
+    report = reconcile_index(source, database)
+
+    assert calls == 2
+    assert report["jsonl_unique_ids"] == 2
+    assert db_ids(database) == {"a", "b"}
+    revision = index_integrity.source_revision(source)
+    with sqlite3.connect(str(database)) as con:
+        meta = dict(con.execute("SELECT key,value FROM meta"))
+    assert int(meta["source_dev"]) == revision["dev"]
+    assert int(meta["source_ino"]) == revision["ino"]
+    assert int(meta["last_size"]) == revision["size"]
+    assert int(meta["source_mtime_ns"]) == revision["mtime_ns"]
+    assert meta["prefix_sha256"] == revision["content_sha256"]
+
+
+def test_full_rebuild_fails_closed_when_source_never_stabilizes(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("original", "alpha")])
+    reconcile_index(source, database)
+    before = database.read_bytes()
+    write_records(source, [record("replacement", "alpha")])
+    original = index_integrity._build_staging_once
+    calls = 0
+
+    def rewrite_after_every_build(path, staging):
+        nonlocal calls
+        result = original(path, staging)
+        calls += 1
+        content = "bravo" if calls % 2 else "alpha"
+        write_records(source, [record("replacement", content)])
+        return result
+
+    monkeypatch.setattr(
+        index_integrity,
+        "_build_staging_once",
+        rewrite_after_every_build,
+    )
+
+    with pytest.raises(
+        index_integrity.SourceChangedError,
+        match="source changed during staging replacement after 3 attempts",
+    ):
+        reconcile_index(source, database)
+
+    assert calls == 3
+    assert database.read_bytes() == before
+    assert db_ids(database) == {"original"}
+    assert not Path(str(database) + ".staging").exists()
+
+
+@pytest.mark.parametrize(
+    "collision_name",
+    [
+        "source",
+        "database",
+        "wal",
+        "shm",
+        "journal",
+        "lock",
+    ],
+)
+def test_staging_path_rejects_source_database_sidecars_and_lock_without_deleting(
+    tmp_path, collision_name
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    paths = {
+        "source": source,
+        "database": database,
+        "wal": Path(str(database) + "-wal"),
+        "shm": Path(str(database) + "-shm"),
+        "journal": Path(str(database) + "-journal"),
+        "lock": Path(str(database) + ".reconcile.lock"),
+    }
+    target = paths[collision_name]
+    before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="unsafe staging path"):
+        reconcile_index(source, database, staging_path=target)
+
+    assert source.read_bytes() == before
+    if collision_name != "source":
+        assert not target.exists()
+
+
+def test_staging_path_rejects_outside_directory_symlink_and_special_file(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    source = root / "index.jsonl"
+    database = root / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    outside = tmp_path / "outside.staging"
+    directory = root / "directory.staging"
+    directory.mkdir()
+    target = root / "target.db"
+    target.write_bytes(b"keep")
+    symlink = root / "symlink.staging"
+    symlink.symlink_to(target)
+    fifo = root / "fifo.staging"
+    os.mkfifo(fifo)
+
+    for staging in (outside, directory, symlink, fifo):
+        with pytest.raises(ValueError, match="unsafe staging path"):
+            reconcile_index(source, database, staging_path=staging)
+
+    assert target.read_bytes() == b"keep"
+    assert symlink.is_symlink()
+    assert directory.is_dir()
+    assert fifo.exists()
+
+
+def test_staging_path_rejects_hardlink_samefile_without_unlinking_source(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    staging = tmp_path / "hardlink.staging"
+    write_records(source, [record("a", "alpha")])
+    os.link(source, staging)
+    before = source.read_bytes()
+
+    with pytest.raises(ValueError, match="unsafe staging path"):
+        reconcile_index(source, database, staging_path=staging)
+
+    assert source.read_bytes() == before
+    assert staging.read_bytes() == before
+    assert os.path.samefile(source, staging)
+
+
+def test_report_only_cli_executes_real_arguments_without_creating_staging(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "missing.db"
+    staging = tmp_path / "must-not-exist.staging"
+    write_records(source, [record("a", "alpha")])
+    command = [
+        sys.executable,
+        str(Path(index_integrity.__file__).resolve()),
+        "--source",
+        str(source),
+        "--database",
+        str(database),
+        "--report-only",
+        "--staging-path",
+        str(staging),
+    ]
+
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads(completed.stdout)
+    assert report["mode"] == "report_only"
+    assert report["jsonl_unique_ids"] == 1
+    assert report["sqlite_ids"] == 0
+    assert report["missing_in_sqlite_count"] == 1
+    assert not database.exists()
+    assert not staging.exists()
+
+
 def test_missing_fingerprint_forces_staging_full_rebuild(tmp_path):
     source = tmp_path / "index.jsonl"
     database = tmp_path / "search_index.db"
@@ -299,7 +606,9 @@ def test_fact_layer_audit_includes_aggregate_search_index_reconciliation(tmp_pat
     report = integrity_audit.audit(daily, source, database)
 
     assert report["search_index"] == {
-        "status": "ok",
+        "status": "degraded",
+        "check_status": "ok",
+        "integrity_status": "degraded",
         "database_exists": True,
         "reason": "id_set_mismatch",
         "jsonl_unique_ids": 2,
@@ -310,3 +619,20 @@ def test_fact_layer_audit_includes_aggregate_search_index_reconciliation(tmp_pat
     serialized = json.dumps(report["search_index"])
     assert '"a"' not in serialized
     assert '"b"' not in serialized
+
+
+def test_fact_layer_audit_marks_in_sync_search_index_healthy(tmp_path):
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    reconcile_index(source, database)
+
+    report = integrity_audit.audit(daily, source, database)
+    markdown = integrity_audit.render_markdown(report)
+
+    assert report["search_index"]["check_status"] == "ok"
+    assert report["search_index"]["integrity_status"] == "healthy"
+    assert report["search_index"]["status"] == "healthy"
+    assert "Integrity status: healthy" in markdown

@@ -82,11 +82,22 @@ def _search_index_summary(index_file: Path, database: Path) -> Dict:
     except (IndexIntegrityError, OSError) as exc:
         return {
             "status": "error",
+            "check_status": "error",
+            "integrity_status": "error",
             "database_exists": database.exists(),
             "error": str(exc),
         }
+    healthy = (
+        bool(report["database_exists"])
+        and report["reason"] == "in_sync"
+        and not report["missing_in_sqlite"]
+        and not report["missing_in_jsonl"]
+    )
+    integrity_status = "healthy" if healthy else "degraded"
     return {
-        "status": "ok",
+        "status": integrity_status,
+        "check_status": "ok",
+        "integrity_status": integrity_status,
         "database_exists": bool(report["database_exists"]),
         "reason": report["reason"],
         "jsonl_unique_ids": int(report["jsonl_unique_ids"]),
@@ -163,10 +174,11 @@ def render_markdown(report: Dict) -> str:
         "",
         "## Search index read model",
         "",
-        f"- Status: {search_index['status']}",
+        f"- Check status: {search_index['check_status']}",
+        f"- Integrity status: {search_index['integrity_status']}",
         f"- Database exists: {search_index['database_exists']}",
     ]
-    if search_index["status"] == "ok":
+    if search_index["check_status"] == "ok":
         lines.extend(
             [
                 f"- Reason: {search_index['reason']}",
