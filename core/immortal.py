@@ -788,6 +788,20 @@ def _recall_json(args) -> int:
         source_prefix=source_prefix, since=args.since)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
+    if mode == "index_unavailable":
+        print(json.dumps({
+            "ok": False,
+            "engine": "unavailable",
+            "elapsed_ms": elapsed_ms,
+            "hits": [],
+            "error": {
+                "code": "index_unavailable",
+                "message": search_engine.INDEX_UNAVAILABLE_MESSAGE,
+                "retryable": True,
+            },
+        }, ensure_ascii=False))
+        return 2
+
     engine = "fusion" if mode.startswith("fusion") else "tfidf"
     hits = []
     for score, record in results:

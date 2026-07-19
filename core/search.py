@@ -27,6 +27,9 @@ from ranking_common import RECENCY_TAU_DAYS, RECENCY_BOOST, local_date, recency_
 IMMORTAL_DIR = Path.home() / ".immortal"
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 EMBEDDINGS_FILE = IMMORTAL_DIR / "embeddings.jsonl"
+INDEX_UNAVAILABLE_MESSAGE = (
+    "搜索索引不可用。请先运行 index_db.py sync 更新持久化索引后重试。"
+)
 EMBEDDINGS_DIR = IMMORTAL_DIR / "embeddings"
 
 
@@ -605,8 +608,12 @@ def main():
 
     mode, results = unified_search(query, limit=20, source=source,
                                    source_prefix=source_prefix, since=since, until=until)
+    if mode == "index_unavailable":
+        print(INDEX_UNAVAILABLE_MESSAGE, file=sys.stderr)
+        return 2
     print(format_results(results, query, mode))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
