@@ -203,6 +203,32 @@ def test_wrong_callable_host_handler_does_not_unlock(tmp_path):
     assert status.reasons == ("host_handler_mismatch",)
 
 
+def test_same_named_decoy_host_handler_does_not_unlock(tmp_path):
+    module = capability_module()
+    write_ready_pipeline(tmp_path)
+    immortal = tmp_path / "immortal.py"
+    source = immortal.read_text(encoding="utf-8")
+    source = source.replace(
+        'PIPELINE_CAPABILITIES = {"run": command_run}\n',
+        "def decoy(_args=None):\n"
+        "    return 0\n\n"
+        'decoy.__name__ = "command_claims_migrate"\n\n'
+        'PIPELINE_CAPABILITIES = {"run": command_run}\n',
+    ).replace(
+        '        "claims-migrate": command_claims_migrate,\n',
+        '        "claims-migrate": decoy,\n',
+    )
+    immortal.write_text(source, encoding="utf-8")
+
+    status = {
+        item.stage_id: item
+        for item in module.pipeline_capability_status(tmp_path)
+    }["claims-migrate"]
+
+    assert status.ready is False
+    assert status.reasons == ("host_handler_mismatch",)
+
+
 def test_non_callable_export_and_import_failure_fail_closed(tmp_path):
     module = capability_module()
     write_ready_pipeline(tmp_path)

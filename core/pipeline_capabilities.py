@@ -131,9 +131,16 @@ def pipeline_capability_status(skill_dir: Path) -> tuple[CapabilityStatus, ...]:
             reasons.append("subparser_missing")
         else:
             handler = handlers[capability.command]
+            expected_handler = (
+                getattr(host, capability.host_handler_name, None)
+                if host is not None
+                else None
+            )
             if not callable(handler):
                 reasons.append("host_handler_missing")
-            elif getattr(handler, "__name__", "") != capability.host_handler_name:
+            elif not callable(expected_handler):
+                reasons.append("host_handler_missing")
+            elif handler is not expected_handler:
                 reasons.append("host_handler_mismatch")
 
         if capability.module_filename == "immortal.py":
