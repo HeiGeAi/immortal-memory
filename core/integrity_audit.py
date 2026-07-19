@@ -90,8 +90,8 @@ def _search_index_summary(index_file: Path, database: Path) -> Dict:
     healthy = (
         bool(report["database_exists"])
         and report["reason"] == "in_sync"
-        and not report["missing_in_sqlite"]
-        and not report["missing_in_jsonl"]
+        and int(report["missing_in_sqlite_count"]) == 0
+        and int(report["missing_in_jsonl_count"]) == 0
     )
     integrity_status = "healthy" if healthy else "degraded"
     return {
@@ -102,8 +102,8 @@ def _search_index_summary(index_file: Path, database: Path) -> Dict:
         "reason": report["reason"],
         "jsonl_unique_ids": int(report["jsonl_unique_ids"]),
         "sqlite_ids": int(report["sqlite_ids"]),
-        "missing_in_sqlite_count": len(report["missing_in_sqlite"]),
-        "missing_in_jsonl_count": len(report["missing_in_jsonl"]),
+        "missing_in_sqlite_count": int(report["missing_in_sqlite_count"]),
+        "missing_in_jsonl_count": int(report["missing_in_jsonl_count"]),
     }
 
 

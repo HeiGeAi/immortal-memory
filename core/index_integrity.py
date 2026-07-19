@@ -11,8 +11,23 @@ import stat as stat_module
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
+from index_locks import (
+    database_lock_path,
+    index_lock_pair,
+    source_lock,
+    source_lock_path,
+)
+from index_publication import (
+    RecoveryError,
+    cleanup_rollback_artifacts,
+    create_rollback_artifacts,
+    replace_database,
+    restore_rollback_artifacts,
+)
+
 
 SOURCE_STABILITY_ATTEMPTS = 3
+MISSING_ID_SAMPLE_LIMIT = 100
 
 
 class IndexIntegrityError(RuntimeError):
@@ -52,8 +67,14 @@ def sha256_prefix(path: Path, length: int) -> str:
     return digest.hexdigest()
 
 
-def _stat_signature(value: os.stat_result) -> Tuple[int, int, int, int]:
-    return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+def _stat_signature(value: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _revision(
@@ -65,6 +86,7 @@ def _revision(
         "ino": value.st_ino,
         "size": value.st_size,
         "mtime_ns": value.st_mtime_ns,
+        "ctime_ns": value.st_ctime_ns,
         "content_sha256": content_sha256,
         "prefix_sha256": content_sha256,
     }
@@ -111,6 +133,23 @@ def source_revision(
             continue
     raise SourceChangedError(
         f"source changed during revision scan after {max_attempts} attempts"
+    )
+
+
+def _revision_stat_matches(
+    path: Path,
+    revision: Dict[str, object],
+) -> bool:
+    try:
+        value = Path(path).stat()
+    except OSError:
+        return False
+    return _stat_signature(value) == (
+        int(revision["dev"]),
+        int(revision["ino"]),
+        int(revision["size"]),
+        int(revision["mtime_ns"]),
+        int(revision["ctime_ns"]),
     )
 
 
@@ -237,6 +276,20 @@ def _database_ids(database: Path, immutable: bool = False) -> Set[str]:
         ) from exc
 
 
+def _database_snapshot(
+    database: Path,
+    immutable: bool = False,
+) -> Tuple[Set[str], Dict[str, object]]:
+    if not database.exists():
+        return set(), _empty_db_state(False)
+    with _readonly_connect(database, immutable=immutable) as con:
+        database_ids = {
+            str(row[0])
+            for row in con.execute("SELECT rec_id FROM docs")
+        }
+        return database_ids, _db_state_from_connection(con, database_ids)
+
+
 def _scan_jsonl_once(
     source: Path,
     connection: Optional[sqlite3.Connection] = None,
@@ -299,6 +352,10 @@ def _empty_db_state(exists: bool) -> Dict[str, object]:
         "indexed_id_count": None,
         "indexed_ids_sha256": None,
         "actual_ids_sha256": ids_sha256(set()),
+        "source_dev": None,
+        "source_ino": None,
+        "source_mtime_ns": None,
+        "source_ctime_ns": None,
     }
 
 
@@ -306,17 +363,29 @@ def _db_state(database: Path, immutable: bool = False) -> Dict[str, object]:
     if not database.exists():
         return _empty_db_state(False)
     try:
-        with _readonly_connect(database, immutable=immutable) as con:
-            return _db_state_from_connection(con)
+        _database_ids_value, state = _database_snapshot(
+            database,
+            immutable=immutable,
+        )
+        return state
     except (sqlite3.DatabaseError, ValueError):
         return _empty_db_state(True)
 
 
-def _rebuild_reason(source: Path, state: Dict[str, object]) -> Optional[str]:
+def _rebuild_reason(
+    source: Path,
+    state: Dict[str, object],
+    revision: Optional[Dict[str, object]] = None,
+) -> Optional[str]:
     if not state["exists"]:
         return "database_missing"
     last_size = int(state["last_size"])
-    if source.stat().st_size < last_size:
+    source_size = (
+        int(revision["size"])
+        if revision is not None
+        else source.stat().st_size
+    )
+    if source_size < last_size:
         return "source_shrank"
     if not state["prefix_sha256"]:
         return "fingerprint_missing"
@@ -330,10 +399,13 @@ def _rebuild_reason(source: Path, state: Dict[str, object]) -> Optional[str]:
         return "id_digest_missing"
     if state["indexed_ids_sha256"] != state["actual_ids_sha256"]:
         return "id_digest_mismatch"
-    try:
-        current_prefix = sha256_prefix(source, last_size)
-    except EOFError:
-        return "source_shrank"
+    if revision is not None and source_size == last_size:
+        current_prefix = str(revision["content_sha256"])
+    else:
+        try:
+            current_prefix = sha256_prefix(source, last_size)
+        except EOFError:
+            return "source_shrank"
     if current_prefix != state["prefix_sha256"]:
         return "prefix_mismatch"
     return None
@@ -353,6 +425,7 @@ def _write_metadata(
     _meta_set(con, "source_dev", revision["dev"])
     _meta_set(con, "source_ino", revision["ino"])
     _meta_set(con, "source_mtime_ns", revision["mtime_ns"])
+    _meta_set(con, "source_ctime_ns", revision["ctime_ns"])
     _meta_set(con, "prefix_sha256", revision["content_sha256"])
     _meta_set(con, "indexed_id_count", id_count)
     _meta_set(con, "indexed_ids_sha256", ids_sha256(ids))
@@ -367,6 +440,31 @@ def _parity_result(source_ids: Set[str], database_ids: Set[str]) -> Dict:
         "sqlite_ids": len(database_ids),
         "missing_in_sqlite": sorted(source_only),
         "missing_in_jsonl": sorted(database_only),
+        "source_unique_ids": len(source_ids),
+        "database_unique_ids": len(database_ids),
+        "source_only_ids": len(source_only),
+        "database_only_ids": len(database_only),
+    }
+
+
+def _bounded_parity_result(
+    source_ids: Set[str],
+    database_ids: Set[str],
+    sample_limit: int = MISSING_ID_SAMPLE_LIMIT,
+) -> Dict:
+    source_only = source_ids - database_ids
+    database_only = database_ids - source_ids
+    source_sample = sorted(source_only)[:sample_limit]
+    database_sample = sorted(database_only)[:sample_limit]
+    return {
+        "jsonl_unique_ids": len(source_ids),
+        "sqlite_ids": len(database_ids),
+        "missing_in_sqlite": source_sample,
+        "missing_in_jsonl": database_sample,
+        "missing_in_sqlite_count": len(source_only),
+        "missing_in_jsonl_count": len(database_only),
+        "missing_in_sqlite_truncated": len(source_only) > len(source_sample),
+        "missing_in_jsonl_truncated": len(database_only) > len(database_sample),
         "source_unique_ids": len(source_ids),
         "database_unique_ids": len(database_ids),
         "source_only_ids": len(source_only),
@@ -464,33 +562,70 @@ def _build_and_replace_staging(
         raise ValueError("max_attempts must be positive")
     staging.parent.mkdir(parents=True, exist_ok=True)
     source_changed_after_replace = False
+    rollback_artifacts: Optional[Dict[Path, Optional[Path]]] = None
     for _attempt in range(max_attempts):
         _cleanup_staging(staging)
         try:
             result, scanned_revision = _build_staging_once(source, staging)
-            pre_replace_revision = source_revision(source, max_attempts=1)
         except SourceChangedError:
             _cleanup_staging(staging)
             continue
         except Exception:
             _cleanup_staging(staging)
+            if rollback_artifacts is not None:
+                cleanup_rollback_artifacts(
+                    database,
+                    rollback_artifacts,
+                    _fsync_directory,
+                )
             raise
-        if scanned_revision != pre_replace_revision:
+        if not _revision_stat_matches(source, scanned_revision):
             _cleanup_staging(staging)
             continue
-        _replace_database(staging, database)
+        if rollback_artifacts is None:
+            rollback_artifacts = create_rollback_artifacts(
+                database,
+                _fsync_directory,
+            )
         try:
-            post_replace_revision = source_revision(source, max_attempts=1)
-        except SourceChangedError:
-            source_changed_after_replace = True
-            continue
-        if scanned_revision != post_replace_revision:
+            _replace_database(staging, database)
+        except Exception:
+            restore_rollback_artifacts(
+                database,
+                rollback_artifacts,
+                _fsync_file,
+                _fsync_directory,
+            )
+            cleanup_rollback_artifacts(
+                database,
+                rollback_artifacts,
+                _fsync_directory,
+            )
+            raise
+        if not _revision_stat_matches(source, scanned_revision):
             # This proves point-in-time parity at return. A writer that does not
             # share this reconciler's lock can still append after this check.
+            restore_rollback_artifacts(
+                database,
+                rollback_artifacts,
+                _fsync_file,
+                _fsync_directory,
+            )
             source_changed_after_replace = True
             continue
+        cleanup_rollback_artifacts(
+            database,
+            rollback_artifacts,
+            _fsync_directory,
+        )
         return result
     _cleanup_staging(staging)
+    if rollback_artifacts is not None:
+        cleanup_rollback_artifacts(
+            database,
+            rollback_artifacts,
+            _fsync_directory,
+        )
     if source_changed_after_replace:
         raise SourceChangedError(
             f"source changed after staging replace after {max_attempts} attempts"
@@ -501,17 +636,12 @@ def _build_and_replace_staging(
 
 
 def _replace_database(staging: Path, database: Path) -> None:
-    # Do not checkpoint the current database here. A checkpoint would mutate
-    # its bytes before the atomic replacement and break loss-free rollback if
-    # os.replace fails. The staging database is a complete DELETE-journal
-    # snapshot, so legacy WAL contents are neither needed nor copied.
-    os.replace(str(staging), str(database))
-    for suffix in ("-wal", "-shm"):
-        sidecar = Path(str(database) + suffix)
-        if sidecar.exists():
-            sidecar.unlink()
-    _fsync_file(database)
-    _fsync_directory(database.parent)
+    replace_database(
+        staging,
+        database,
+        _fsync_file,
+        _fsync_directory,
+    )
 
 
 def _incremental_sync(
@@ -519,21 +649,14 @@ def _incremental_sync(
     database: Path,
     expected_source_ids: Set[str],
     expected_revision: Dict[str, object],
+    state: Dict[str, object],
+    existing_ids: Set[str],
 ) -> Dict:
     with sqlite3.connect(str(database), timeout=30) as con:
         con.execute("PRAGMA busy_timeout=30000")
         con.execute("BEGIN IMMEDIATE")
-        fresh = _db_state_from_connection(con)
-        reason = _rebuild_reason(source, fresh)
-        if reason:
-            con.rollback()
-            return {"retry_rebuild": reason}
-        last_size = int(fresh["last_size"])
-        last_line = int(fresh["last_line"])
-        existing_ids = {
-            str(row[0])
-            for row in con.execute("SELECT rec_id FROM docs").fetchall()
-        }
+        last_size = int(state["last_size"])
+        last_line = int(state["last_line"])
         added, processed_offset, ids = _load_source(
             con,
             source,
@@ -541,12 +664,6 @@ def _incremental_sync(
             start_line_number=last_line,
             known_ids=existing_ids,
         )
-        # Recheck the indexed prefix after reading the append range. If a
-        # non-cooperating writer rewrote earlier bytes during this transaction,
-        # never bless the mixed view with a new fingerprint.
-        if sha256_prefix(source, last_size) != fresh["prefix_sha256"]:
-            con.rollback()
-            return {"retry_rebuild": "prefix_mismatch"}
         docs_count = int(con.execute("SELECT count(*) FROM docs").fetchone()[0])
         unique_count = int(
             con.execute("SELECT count(DISTINCT rec_id) FROM docs").fetchone()[0]
@@ -555,22 +672,20 @@ def _incremental_sync(
         if docs_count != len(ids) or unique_count != len(ids) or fts_count != len(ids):
             con.rollback()
             return {"retry_rebuild": "id_count_mismatch"}
-        database_ids = {
-            str(row[0])
-            for row in con.execute("SELECT rec_id FROM docs").fetchall()
-        }
-        if database_ids != expected_source_ids:
+        if ids != expected_source_ids:
             con.rollback()
             return {"retry_rebuild": "id_set_mismatch"}
-        revision = source_revision(source, max_attempts=1)
-        if revision != expected_revision or int(revision["size"]) != processed_offset:
+        if int(expected_revision["size"]) != processed_offset:
             con.rollback()
             raise SourceChangedError(
                 "source changed after incremental scan"
             )
-        _write_metadata(con, revision, database_ids)
+        if not _revision_stat_matches(source, expected_revision):
+            con.rollback()
+            raise SourceChangedError("source changed after incremental scan")
+        _write_metadata(con, expected_revision, ids)
         con.commit()
-    parity = _parity_result(expected_source_ids, database_ids)
+    parity = _parity_result(expected_source_ids, ids)
     return {
         "mode": "incremental" if added else "current",
         "action": "incremental" if added else "current",
@@ -580,13 +695,40 @@ def _incremental_sync(
     }
 
 
-def _db_state_from_connection(con: sqlite3.Connection) -> Dict[str, object]:
-    database_ids = [
-        str(row[0])
-        for row in con.execute("SELECT rec_id FROM docs").fetchall()
-    ]
-    count = len(database_ids)
-    unique_count = len(set(database_ids))
+def _mark_current(
+    source: Path,
+    database: Path,
+    revision: Dict[str, object],
+    ids: Set[str],
+) -> Dict:
+    with sqlite3.connect(str(database), timeout=30) as con:
+        con.execute("PRAGMA busy_timeout=30000")
+        con.execute("BEGIN IMMEDIATE")
+        if not _revision_stat_matches(source, revision):
+            con.rollback()
+            raise SourceChangedError("source changed before current watermark")
+        _write_metadata(con, revision, ids)
+        con.commit()
+    return {
+        "mode": "current",
+        "action": "current",
+        "reason": "in_sync",
+        "added": 0,
+        **_parity_result(ids, ids),
+    }
+
+
+def _db_state_from_connection(
+    con: sqlite3.Connection,
+    database_ids: Optional[Set[str]] = None,
+) -> Dict[str, object]:
+    if database_ids is None:
+        database_ids = {
+            str(row[0])
+            for row in con.execute("SELECT rec_id FROM docs")
+        }
+    count = int(con.execute("SELECT count(*) FROM docs").fetchone()[0])
+    unique_count = len(database_ids)
     fts_count = int(con.execute("SELECT count(*) FROM docs_fts").fetchone()[0])
     indexed = _meta_get(con, "indexed_id_count")
     return {
@@ -600,14 +742,17 @@ def _db_state_from_connection(con: sqlite3.Connection) -> Dict[str, object]:
         "indexed_id_count": int(indexed) if indexed is not None else None,
         "indexed_ids_sha256": _meta_get(con, "indexed_ids_sha256"),
         "actual_ids_sha256": ids_sha256(database_ids),
+        "source_dev": _meta_get(con, "source_dev"),
+        "source_ino": _meta_get(con, "source_ino"),
+        "source_mtime_ns": _meta_get(con, "source_mtime_ns"),
+        "source_ctime_ns": _meta_get(con, "source_ctime_ns"),
     }
 
 
 def _report_only(source: Path, database: Path) -> Dict:
     source_ids, revision = _scan_source_ids_once(source)
-    database_ids = _database_ids(database, immutable=True)
-    state = _db_state(database, immutable=True)
-    reason = _rebuild_reason(source, state)
+    database_ids, state = _database_snapshot(database, immutable=True)
+    reason = _rebuild_reason(source, state, revision)
     source_only = source_ids - database_ids
     database_only = database_ids - source_ids
     if source_only or database_only:
@@ -616,14 +761,7 @@ def _report_only(source: Path, database: Path) -> Dict:
         "mode": "report_only",
         "action": "report_only",
         "reason": reason or "in_sync",
-        "jsonl_unique_ids": len(source_ids),
-        "sqlite_ids": len(database_ids),
-        "missing_in_sqlite": sorted(source_only),
-        "missing_in_jsonl": sorted(database_only),
-        "source_unique_ids": len(source_ids),
-        "database_unique_ids": len(database_ids),
-        "source_only_ids": len(source_only),
-        "database_only_ids": len(database_only),
+        **_bounded_parity_result(source_ids, database_ids),
         "source_size": revision["size"],
         "database_exists": database.exists(),
         "_source_revision": revision,
@@ -634,11 +772,23 @@ def report_index_integrity(source: Path, database: Path) -> Dict:
     """Return a strictly read-only bidirectional source/database report."""
     source = Path(source)
     database = Path(database)
+    if database.parent.exists():
+        with index_lock_pair(
+            source,
+            database,
+            source_exclusive=False,
+            database_exclusive=False,
+        ):
+            return _report_index_integrity_locked(source, database)
+    with source_lock(source, exclusive=False):
+        return _report_index_integrity_locked(source, database)
+
+
+def _report_index_integrity_locked(source: Path, database: Path) -> Dict:
     for _attempt in range(SOURCE_STABILITY_ATTEMPTS):
         before = _strict_snapshot_signature(database)
         try:
             report = _report_only(source, database)
-            final_source_revision = source_revision(source, max_attempts=1)
         except SourceChangedError:
             continue
         after = _strict_snapshot_signature(database)
@@ -647,7 +797,7 @@ def report_index_integrity(source: Path, database: Path) -> Dict:
                 "search index changed during strict read-only report"
             )
         scanned_revision = report.pop("_source_revision")
-        if scanned_revision == final_source_revision:
+        if _revision_stat_matches(source, scanned_revision):
             return report
     raise SourceChangedError(
         "source changed during stable scan after "
@@ -703,6 +853,8 @@ def _validate_staging_path(
         Path(str(database) + "-shm"),
         Path(str(database) + "-journal"),
         lock_path,
+        source_lock_path(source),
+        database_lock_path(database),
     )
     artifacts = (
         staging,
@@ -747,49 +899,67 @@ def reconcile_index(
     )
     staging = _validate_staging_path(source, database, staging, lock_path)
     database.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as lock:
-        _acquire_lock(lock)
-        if force_rebuild:
-            reason = "forced"
-        elif not database.exists():
-            reason = "database_missing"
-        else:
-            try:
-                source_ids, revision = _scan_source_ids_once(source)
-                database_ids = _database_ids(database)
-                state = _db_state(database)
-                reason = _rebuild_reason(source, state)
-                source_only = source_ids - database_ids
-                database_only = database_ids - source_ids
-                if reason is None and (
-                    database_only or (source_only and not database_ids < source_ids)
-                ):
-                    reason = "id_set_mismatch"
-                if reason is None:
-                    incremental = _incremental_sync(
-                        source,
-                        database,
-                        source_ids,
-                        revision,
-                    )
-                else:
-                    incremental = {"retry_rebuild": reason}
-            except sqlite3.DatabaseError:
-                reason = "database_invalid"
+    with index_lock_pair(
+        source,
+        database,
+        source_exclusive=False,
+        database_exclusive=True,
+    ):
+        with lock_path.open("a+b") as lock:
+            _acquire_lock(lock)
+            if force_rebuild:
+                reason = "forced"
+            elif not database.exists():
+                reason = "database_missing"
             else:
-                retry_reason = incremental.pop("retry_rebuild", None)
-                if retry_reason is None:
-                    return incremental
-                reason = retry_reason
+                try:
+                    source_ids, revision = _scan_source_ids_once(source)
+                    database_ids, state = _database_snapshot(database)
+                    reason = _rebuild_reason(source, state, revision)
+                    source_only = source_ids - database_ids
+                    database_only = database_ids - source_ids
+                    sets_match = not source_only and not database_only
+                    append_candidate = (
+                        bool(source_only)
+                        and not database_only
+                        and database_ids < source_ids
+                    )
+                    if sets_match and reason is None:
+                        return _mark_current(
+                            source,
+                            database,
+                            revision,
+                            database_ids,
+                        )
+                    if append_candidate and reason is None:
+                        incremental = _incremental_sync(
+                            source,
+                            database,
+                            source_ids,
+                            revision,
+                            state,
+                            database_ids,
+                        )
+                    else:
+                        if reason is None:
+                            reason = "id_set_mismatch"
+                        incremental = {"retry_rebuild": reason}
+                except sqlite3.DatabaseError:
+                    reason = "database_invalid"
+                else:
+                    retry_reason = incremental.pop("retry_rebuild", None)
+                    if retry_reason is None:
+                        return incremental
+                    reason = retry_reason
 
-        parity = _build_and_replace_staging(source, staging, database)
-        return {
-            "mode": "full_rebuild",
-            "action": "rebuilt",
-            "reason": reason,
-            "added": parity["database_unique_ids"],
-            **parity,
-        }
+            parity = _build_and_replace_staging(source, staging, database)
+            return {
+                "mode": "full_rebuild",
+                "action": "rebuilt",
+                "reason": reason,
+                "added": parity["database_unique_ids"],
+                **parity,
+            }
 
 
 def main(argv=None) -> int:
@@ -807,7 +977,8 @@ def main(argv=None) -> int:
     )
     printable = dict(report)
     for key in ("missing_in_sqlite", "missing_in_jsonl"):
-        printable[key + "_count"] = len(printable.pop(key, []))
+        sample = printable.pop(key, [])
+        printable.setdefault(key + "_count", len(sample))
     print(json.dumps(printable, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

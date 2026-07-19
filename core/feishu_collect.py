@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redact_common
+from index_locks import source_lock
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -455,7 +456,10 @@ def write_records(records: list[dict[str, Any]]) -> None:
 
     for day, items in sorted(buckets.items()):
         daily_file = DAILY_DIR / f"{day}.jsonl"
-        with open(daily_file, "a", encoding="utf-8") as daily, open(INDEX_FILE, "a", encoding="utf-8") as index:
+        with open(daily_file, "a", encoding="utf-8") as daily, source_lock(
+            INDEX_FILE,
+            exclusive=True,
+        ), open(INDEX_FILE, "a", encoding="utf-8") as index:
             for item in items:
                 # 落盘前：去内部字段 + 递归脱敏（含 metadata 嵌套、文件名、去重键）
                 clean = {k: v for k, v in item.items() if not k.startswith("_")}

@@ -1026,6 +1026,9 @@ def run_main():
     if search_index_sync():
         state["last_search_index_sync"] = now_iso
     else:
+        # Boundary: Task A records this required-stage failure in state and
+        # telemetry. Making the scheduler process exit nonzero belongs to the
+        # separate Preflight Task B and is intentionally not claimed here.
         errors.append("search index sync failed")
 
     people_index_ok = people_index()

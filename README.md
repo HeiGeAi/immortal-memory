@@ -120,6 +120,12 @@ immortal-memory agent-factory
 完整 `index.jsonl`、计算全文件摘要或触发重建。水位过期时查询会明确返回索引
 不可用，等待下一次同步，而不是用可能过期的结果冒充健康。
 
+这里的 O(1) 可信水位建立在两个明确合同上：内置采集器都使用共同的 POSIX
+advisory lock 写入 source；文件系统提供可靠的 `st_ctime_ns`，并与 dev、inode、
+size、mtime 一起写入水位。外部手工改写即使恢复 mtime，也会因 ctime 失配而让
+索引变为不可用。本实现依赖 `fcntl.flock`，当前支持 macOS 和 Linux，不支持
+Windows 原生运行。
+
 ## 让任何 agent 用上它
 
 给本地 agent 一段这样的交接说明就行：

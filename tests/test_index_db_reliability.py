@@ -88,29 +88,22 @@ class IndexDbReliabilityTest(unittest.TestCase):
         with self.index_file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record("two", "second"), ensure_ascii=False) + "\n")
         start_barrier = threading.Barrier(2)
-        original_acquire = index_integrity._acquire_lock
-
-        def synchronized_acquire(lock):
-            start_barrier.wait(timeout=5)
-            original_acquire(lock)
 
         results = []
         errors = []
 
         def worker():
             try:
+                start_barrier.wait(timeout=5)
                 results.append(index_db.sync())
             except Exception as exc:
                 errors.append(exc)
 
-        with mock.patch.object(
-            index_integrity, "_acquire_lock", side_effect=synchronized_acquire
-        ):
-            threads = [threading.Thread(target=worker) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])

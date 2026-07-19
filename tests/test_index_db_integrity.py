@@ -201,13 +201,13 @@ def test_invalid_source_is_rejected_with_line_number_and_preserves_database(
     assert db_ids(database) == {"safe"}
 
 
-def test_report_only_does_not_create_database_lock_or_staging(tmp_path):
+def test_report_only_creates_only_shared_lock_files_not_database_or_staging(
+    tmp_path,
+):
     source = tmp_path / "index.jsonl"
     database = tmp_path / "missing.db"
     staging = tmp_path / "custom.staging"
     write_records(source, [record("a", "alpha")])
-    before = sorted(path.name for path in tmp_path.iterdir())
-
     report = reconcile_index(
         source,
         database,
@@ -220,7 +220,14 @@ def test_report_only_does_not_create_database_lock_or_staging(tmp_path):
     assert report["sqlite_ids"] == 0
     assert report["missing_in_sqlite"] == ["a"]
     assert report["missing_in_jsonl"] == []
-    assert sorted(path.name for path in tmp_path.iterdir()) == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "index.jsonl",
+        "index.jsonl.source.lock",
+        "missing.db.generation.lock",
+    ]
+    assert not database.exists()
+    assert not staging.exists()
+    assert not Path(str(database) + ".reconcile.lock").exists()
 
 
 def test_report_only_opens_existing_database_in_read_only_mode(
@@ -319,6 +326,7 @@ def test_source_revision_binds_identity_stat_and_content_hash(tmp_path):
         "ino": stat.st_ino,
         "size": len(body.encode("utf-8")),
         "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
         "content_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
         "prefix_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }

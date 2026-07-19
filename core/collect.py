@@ -22,6 +22,7 @@ import sys
 import uuid
 import hashlib
 import redact_common
+from index_locks import source_lock
 from typing import Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,12 +212,13 @@ def write_records(records_by_date: dict):
             for clean, _ in clean_pairs:
                 f.write(json.dumps(clean, ensure_ascii=False) + "\n")
 
-        with open(INDEX_FILE, "a", encoding="utf-8") as f:
-            for clean, dedup_key in clean_pairs:
-                indexed = dict(clean)
-                if dedup_key is not None:
-                    indexed["_dedup_key"] = dedup_key
-                f.write(json.dumps(indexed, ensure_ascii=False) + "\n")
+        with source_lock(INDEX_FILE, exclusive=True):
+            with open(INDEX_FILE, "a", encoding="utf-8") as f:
+                for clean, dedup_key in clean_pairs:
+                    indexed = dict(clean)
+                    if dedup_key is not None:
+                        indexed["_dedup_key"] = dedup_key
+                    f.write(json.dumps(indexed, ensure_ascii=False) + "\n")
 
 
 def copy_to_immortal(src: Path, category: str, date_str: str) -> Optional[str]:

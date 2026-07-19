@@ -1,5 +1,8 @@
 import argparse
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 
 import immortal
@@ -89,3 +92,41 @@ def test_recall_json_keeps_normal_zero_hits_successful(monkeypatch, capsys):
     assert payload["ok"] is True
     assert payload["hits"] == []
     assert "error" not in payload
+
+
+def test_real_search_cli_exits_nonzero_when_index_is_unavailable(tmp_path):
+    core = Path(search.__file__).resolve().parent
+    completed = subprocess.run(
+        [sys.executable, str(core / "search.py"), "needle"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "搜索索引不可用" in completed.stderr
+
+
+def test_real_recall_json_cli_emits_machine_readable_error(tmp_path):
+    core = Path(immortal.__file__).resolve().parent
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(core / "immortal.py"),
+            "recall",
+            "needle",
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is False
+    assert payload["engine"] == "unavailable"
+    assert payload["error"]["code"] == "index_unavailable"

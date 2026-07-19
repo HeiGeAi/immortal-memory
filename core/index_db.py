@@ -22,6 +22,8 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from index_locks import database_lock, index_lock_pair
+
 IMMORTAL_DIR = Path.home() / ".immortal"
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DB_FILE = IMMORTAL_DIR / "search_index.db"
@@ -97,6 +99,21 @@ def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
 
 
 def is_ready() -> bool:
+    if not INDEX_FILE.exists() or not DB_FILE.exists():
+        return False
+    try:
+        with index_lock_pair(
+            INDEX_FILE,
+            DB_FILE,
+            source_exclusive=False,
+            database_exclusive=False,
+        ):
+            return _is_ready_unlocked()
+    except OSError:
+        return False
+
+
+def _is_ready_unlocked() -> bool:
     """Return trusted index readiness using only source stat and fixed metadata."""
     if not INDEX_FILE.exists() or not DB_FILE.exists():
         return False
@@ -108,7 +125,8 @@ def is_ready() -> bool:
             con.execute(
                 "SELECT key,value FROM meta WHERE key IN "
                 "('parity_status','last_size','source_dev','source_ino',"
-                "'source_mtime_ns','indexed_id_count','indexed_ids_sha256')"
+                "'source_mtime_ns','source_ctime_ns','indexed_id_count',"
+                "'indexed_ids_sha256')"
             ).fetchall()
         )
         source_after = INDEX_FILE.stat()
@@ -123,6 +141,7 @@ def is_ready() -> bool:
         "source_dev",
         "source_ino",
         "source_mtime_ns",
+        "source_ctime_ns",
         "indexed_id_count",
         "indexed_ids_sha256",
     }
@@ -133,12 +152,14 @@ def is_ready() -> bool:
         source_before.st_ino,
         source_before.st_size,
         source_before.st_mtime_ns,
+        source_before.st_ctime_ns,
     )
     after_signature = (
         source_after.st_dev,
         source_after.st_ino,
         source_after.st_size,
         source_after.st_mtime_ns,
+        source_after.st_ctime_ns,
     )
     if before_signature != after_signature:
         return False
@@ -148,6 +169,7 @@ def is_ready() -> bool:
             and int(rows["source_dev"]) == source_after.st_dev
             and int(rows["source_ino"]) == source_after.st_ino
             and int(rows["source_mtime_ns"]) == source_after.st_mtime_ns
+            and int(rows["source_ctime_ns"]) == source_after.st_ctime_ns
             and int(rows["indexed_id_count"]) >= 0
             and bool(rows["indexed_ids_sha256"])
         )
@@ -193,6 +215,23 @@ def _row_to_rec(row) -> dict:
 def channels(query: str, limit: int = 20, source: Optional[str] = None,
              source_prefix: Optional[str] = None, since: Optional[str] = None,
              until: Optional[str] = None, pool: Optional[int] = None):
+    if not DB_FILE.exists():
+        return ([], [])
+    with database_lock(DB_FILE, exclusive=False):
+        return _channels_unlocked(
+            query,
+            limit=limit,
+            source=source,
+            source_prefix=source_prefix,
+            since=since,
+            until=until,
+            pool=pool,
+        )
+
+
+def _channels_unlocked(query: str, limit: int = 20, source: Optional[str] = None,
+                       source_prefix: Optional[str] = None, since: Optional[str] = None,
+                       until: Optional[str] = None, pool: Optional[int] = None):
     """返回 (labels, rankings) 供 RRF 融合。
 
     labels: ["bm25"/"like", "phrase"] 中非空的那些
@@ -294,6 +333,14 @@ def channels(query: str, limit: int = 20, source: Optional[str] = None,
 
 
 def stats() -> None:
+    if not DB_FILE.exists():
+        print("索引未构建。运行: python3 index_db.py reindex")
+        return
+    with database_lock(DB_FILE, exclusive=False):
+        _stats_unlocked()
+
+
+def _stats_unlocked() -> None:
     if not DB_FILE.exists():
         print("索引未构建。运行: python3 index_db.py reindex")
         return
