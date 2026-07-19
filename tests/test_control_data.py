@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import pytest
 
@@ -95,7 +96,10 @@ def test_v1_overview_reuses_truth_snapshot(tmp_path):
 
     assert legacy_status == 200
     assert v1_status == 200
+    legacy_generated_at = datetime.fromisoformat(legacy.pop("generated_at"))
+    v1_generated_at = datetime.fromisoformat(v1.pop("generated_at"))
     assert v1 == legacy
+    assert abs((v1_generated_at - legacy_generated_at).total_seconds()) <= 2
 
 
 def write_index(root, count=60):
