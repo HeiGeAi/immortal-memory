@@ -39,8 +39,31 @@ MAX_REPORT_SAMPLES = 50
 REPORTING_SPEECH_RE = re.compile(
     r"(?:^|[\s，,。！？!?；;：:“”\"'‘’（）()\[\]])"
     r"(?P<author>[A-Za-z0-9_\u4e00-\u9fff·.-]{1,32})"
-    r"(?:说(?!明|服|法|辞|话)|表示|认为|指出|反馈|提到|评价)"
+    r"(?P<verb>说(?!明|服|法|辞|话)|表示|认为|指出|反馈|提到|评价)"
     r"(?:\s*[,，:：\"'“‘]?\s*)"
+)
+SELF_UTTERANCE_SAY_AUTHORS = frozenset(
+    {
+        "一般来",
+        "总的来",
+        "换句话",
+        "也就是",
+        "不得不",
+        "可以",
+        "应该",
+        "比如",
+        "话",
+        "我想",
+        "我不得不",
+        "我可以",
+        "我应该",
+    }
+)
+OWNER_SPEECH_MODIFIERS = frozenset(
+    {"之前", "刚才", "曾经", "当时", "本人", "自己", "也"}
+)
+OWNER_REFERENCE_TOKENS = frozenset(
+    {"我", "我们", "咱们", "用户", "本人"}
 )
 ONE_OFF_RE = re.compile(r"(这一次|这次|本次|今天|现在|临时|先暂时)")
 REQUEST_RE = re.compile(r"(请|帮我|麻烦|需要|先|立刻|马上|尽快|这一次|这次)")
@@ -70,26 +93,6 @@ PRIVACY_RANK = {
     "restricted": 2,
     "private": 3,
 }
-ORGANIZATION_ROLE_RE = re.compile(
-    r"^(?:我的)?(?:"
-    r"(?:产品|项目|部门|技术|业务|运营|内容)?"
-    r"(?:负责人|主管|经理)"
-    r"|老板|领导|上级|顾问|老师|医生"
-    r")"
-)
-KINSHIP_ROLE_RE = re.compile(
-    r"^(?:我的)?(?:"
-    r"配偶|妻子|丈夫|爱人|伴侣|"
-    r"(?:亲|堂|表)?(?:哥哥|姐姐|弟弟|妹妹)|"
-    r"爸爸|妈妈|父亲|母亲|家人"
-    r")"
-)
-SOCIAL_ROLE_RE = re.compile(
-    r"^(?:我的)?(?:"
-    r"同事|朋友|客户|对方|外部|第三方|"
-    r"有人|别人|大家|他|她|他们|她们"
-    r")"
-)
 
 
 def _clean_text(value: Any) -> str:
@@ -105,64 +108,19 @@ def _stable_other_id(value: str) -> str:
 
 def _is_owner_reference(author: str, aliases: Set[str]) -> bool:
     normalized = _clean_text(author).casefold()
-    if normalized in aliases or normalized in {
-        "我",
-        "我们",
-        "咱们",
-        "用户",
-        "本人",
-    }:
+    references = aliases | OWNER_REFERENCE_TOKENS
+    if normalized in references:
         return True
-    if re.fullmatch(
-        r"(?:我|我们|咱们)(?:之前|刚才|曾经|当时|个人|自己)?",
-        normalized,
-    ):
-        return True
-    for alias in aliases:
+    for alias in references:
         if re.fullmatch(
             re.escape(alias)
-            + r"\s*(?:之前|刚才|曾经|当时|本人|自己|也)?",
+            + r"\s*(?:之前|刚才|曾经|当时|个人|本人|自己|也)?",
             normalized,
         ):
             return True
     return bool(
         re.fullmatch(
             r"(?:这是|这就是|那是|那就是|按|依|对|对于)?我(?:个人)?",
-            normalized,
-        )
-    )
-
-
-def _is_explicit_third_party_author(author: str) -> bool:
-    normalized = _clean_text(author).casefold()
-    if re.fullmatch(r"[a-z][a-z0-9_.-]{0,31}", normalized):
-        return normalized not in {"owner", "system", "tool", "bot"}
-    return bool(
-        ORGANIZATION_ROLE_RE.match(normalized)
-        or KINSHIP_ROLE_RE.match(normalized)
-        or SOCIAL_ROLE_RE.match(normalized)
-        or re.match(r"^(?:父母|兄弟|姐妹)", normalized)
-        or re.fullmatch(
-            r"[赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕"
-            r"施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛"
-            r"范彭郎鲁韦昌马苗凤花方俞任袁柳唐罗薛雷贺倪"
-            r"汤滕殷郝邬安常乐于时傅皮卞齐康伍余元卜顾孟"
-            r"平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成"
-            r"戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强"
-            r"贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊"
-            r"胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣"
-            r"贲邓郁单杭洪包诸左石崔吉龚程嵇邢滑裴陆荣翁"
-            r"荀羊甄魏家封芮羿储靳汲邴糜松井段富巫乌焦巴"
-            r"弓牧隗山谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴"
-            r"甘钭厉戎祖武符刘景詹束龙叶幸司韶郜黎蓟薄印"
-            r"宿白怀蒲邰从鄂索咸籍赖卓蔺屠蒙池乔阴胥能苍"
-            r"双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍郤璩桑桂"
-            r"濮牛寿通边扈燕冀郏浦尚农温别庄晏柴瞿阎充慕"
-            r"连茹习宦艾鱼容向古易慎戈廖庾终暨居衡步都耿"
-            r"满弘匡国文寇广禄阙东欧殳沃利蔚越夔隆师巩厍"
-            r"聂晁勾敖融冷訾辛阚那简饶空曾毋沙乜养鞠须丰"
-            r"巢关蒯相查后荆红游竺权逯盖益桓公]"
-            r"[\u4e00-\u9fff]{1,3}",
             normalized,
         )
     )
@@ -276,8 +234,27 @@ class AttributionService:
             author = _clean_text(match.group("author"))
             if _is_owner_reference(author, self.owner_aliases):
                 continue
-            if _is_explicit_third_party_author(author):
-                return author
+            if author.casefold() in OWNER_SPEECH_MODIFIERS:
+                prefix = content[: match.start("author")].rstrip().casefold()
+                if any(
+                    re.search(
+                        r"(?:^|[\s，,。！？!?；;：:])"
+                        + re.escape(alias)
+                        + r"$",
+                        prefix,
+                    )
+                    for alias in (
+                        self.owner_aliases | OWNER_REFERENCE_TOKENS
+                    )
+                ):
+                    continue
+            verb = _clean_text(match.group("verb"))
+            if (
+                verb == "说"
+                and author.casefold() in SELF_UTTERANCE_SAY_AUTHORS
+            ):
+                continue
+            return author
         return ""
 
     def _speaker(
