@@ -1365,6 +1365,14 @@ def command_notes_migrate(args) -> int:
     )
 
 
+def command_notes_migrate_reset(args) -> int:
+    vault = configured_vault_dir(load_config())
+    forwarded = ["--vault-dir", str(vault), "--reset-scratch", "--run-id", args.run_id]
+    if args.json:
+        forwarded.append("--json")
+    return run_script("notes_migration.py", forwarded)
+
+
 def command_obsidian_sync(args) -> int:
     code = run_script("obsidian_sync.py", ["sync", *args.obsidian_args])
     if code == 0 and "--dry-run" not in args.obsidian_args:
@@ -1917,6 +1925,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     notes_migrate.add_argument("notes_migrate_args", nargs=argparse.REMAINDER)
     notes_migrate.set_defaults(func=command_notes_migrate)
+    notes_migrate_reset = sub.add_parser(
+        "notes-migrate-reset",
+        help="Discard only unpublished migration scratch after an explicit run-id check",
+    )
+    notes_migrate_reset.add_argument("--run-id", required=True)
+    notes_migrate_reset.add_argument("--json", action="store_true")
+    notes_migrate_reset.set_defaults(func=command_notes_migrate_reset)
 
     obsidian_sync = sub.add_parser("obsidian-sync", help="Generate Obsidian reading-layer indexes and link health")
     obsidian_sync.add_argument("obsidian_args", nargs=argparse.REMAINDER)

@@ -5,6 +5,7 @@ import gzip
 import json
 import os
 import fcntl
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -282,7 +283,8 @@ def test_active_source_signature_change_fails_closed_on_resume(tmp_path):
 
     assert partial["status"] == "partial"
     assert resumed["status"] == "error"
-    assert resumed["error_code"] == "notes_migration_conflict"
+    assert resumed["error_code"] == "notes_migration_reset_required"
+    assert resumed["run_id"]
 
 
 def test_migration_hashes_large_staging_without_read_bytes(tmp_path, monkeypatch):
@@ -549,7 +551,8 @@ def test_resume_rejects_source_plan_addition(tmp_path):
 
     assert partial["status"] == "partial"
     assert resumed["status"] == "error"
-    assert resumed["error_code"] == "notes_migration_conflict"
+    assert resumed["error_code"] == "notes_migration_reset_required"
+    assert resumed["run_id"]
 
 
 def test_concurrent_migration_lock_fails_closed(tmp_path):
@@ -708,4 +711,302 @@ def test_pending_publication_blocks_direct_index_writer(tmp_path):
         )
 
     assert failed["status"] == "error"
+    assert (vault / "index.jsonl").read_bytes() == before
+
+
+def test_catalog_stores_non_note_payload_only_once(tmp_path):
+    module = migration()
+    catalog = tmp_path / "catalog.sqlite3"
+
+    connection = module._connect_catalog(catalog, reset=True)
+    try:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert "non_notes" not in tables
+    finally:
+        connection.close()
+
+
+def test_gzip_scan_never_seeks_and_reports_physical_work(tmp_path, monkeypatch):
+    module = migration()
+    vault = tmp_path / "vault"
+    payload = note("gzip-linear", "linear")
+    write_gzip_rows(vault / "daily" / "2026-07-19.jsonl.gz", [payload])
+    write_rows(vault / "index.jsonl", [payload])
+
+    monkeypatch.setattr(
+        module.gzip.GzipFile,
+        "seek",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("gzip seek is forbidden")
+        ),
+    )
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "ok"
+    assert result["compressed_bytes_processed"] > 0
+    assert result["expanded_bytes_processed"] > 0
+
+
+def test_capacity_gate_fails_closed_with_exact_fields(tmp_path, monkeypatch):
+    module = migration()
+    vault = tmp_path / "vault"
+    original = note("one", "one")
+    write_rows(vault / "index.jsonl", [original, original])
+    before = (vault / "index.jsonl").read_bytes()
+
+    monkeypatch.setattr(module, "_available_bytes", lambda _path: 1)
+    result = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(
+            max_files=10,
+            max_bytes=10_000,
+            max_seconds=30,
+            reserve_bytes=2,
+        ),
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "migration_insufficient_scratch_space"
+    assert result["required_bytes"] > result["available_bytes"]
+    assert result["production_changed"] is False
+    assert (vault / "index.jsonl").read_bytes() == before
+
+
+def test_source_plan_conflict_returns_safe_reset_contract(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "one")])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=1, max_bytes=10, max_seconds=30),
+    )
+    write_rows(vault / "daily" / "2026-07-18.jsonl", [note("late", "late", "2026-07-18")])
+
+    conflict = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert conflict["error_code"] == "notes_migration_reset_required"
+    assert conflict["run_id"]
+    assert "notes-migrate-reset" in conflict["reset_command"]
+
+
+def test_scratch_reset_requires_matching_run_id_and_preserves_production(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "one")])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=1, max_bytes=10, max_seconds=30),
+    )
+    checkpoint = json.loads(
+        (vault / "notes" / "migration" / "checkpoint.json").read_text()
+    )
+    before = (vault / "index.jsonl").read_bytes()
+
+    rejected = module.reset_migration_scratch(vault, run_id="wrong")
+    reset = module.reset_migration_scratch(vault, run_id=checkpoint["run_id"])
+
+    assert partial["status"] == "partial"
+    assert rejected["error_code"] == "notes_migration_reset_run_id_mismatch"
+    assert reset["status"] == "ok"
+    assert reset["production_changed"] is False
+    assert (vault / "index.jsonl").read_bytes() == before
+    assert not (vault / "notes" / "migration" / "checkpoint.json").exists()
+    assert not (vault / "notes" / "migration" / "catalog.sqlite3").exists()
+
+
+def test_scratch_reset_refuses_pending_publication(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    root = vault / "notes" / "migration"
+    root.mkdir(parents=True)
+    (root / "checkpoint.json").write_text(
+        json.dumps({"migration_version": module.MIGRATION_VERSION, "run_id": "run"}),
+        encoding="utf-8",
+    )
+    (root / "publication.json").write_text(
+        json.dumps({"schema_version": 1, "stage": "prepared", "entries": []}),
+        encoding="utf-8",
+    )
+
+    result = module.reset_migration_scratch(vault, run_id="run")
+
+    assert result["error_code"] == "notes_migration_reset_unsafe_publication_exists"
+    assert (root / "checkpoint.json").exists()
+
+
+def test_legacy_scratch_fails_closed_and_requires_reset(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "one")])
+    checkpoint = vault / "notes" / "migration" / "checkpoint.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text(
+        json.dumps({"migration_version": module.MIGRATION_VERSION - 1}),
+        encoding="utf-8",
+    )
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_legacy_scratch"
+    assert result["production_changed"] is False
+    assert "notes-migrate-reset" in result["reset_command"]
+    reset = module.reset_migration_scratch(vault, run_id=result["run_id"])
+    assert reset["status"] == "ok"
+
+
+def test_same_size_restored_mtime_source_change_is_detected(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    source = vault / "index.jsonl"
+    write_rows(source, [note("one", "aaaa")])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=1, max_bytes=10, max_seconds=30),
+    )
+    original_stat = source.stat()
+    data = source.read_bytes()
+    source.write_bytes(data.replace(b"aaaa", b"bbbb"))
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    result = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert result["error_code"] == "notes_migration_reset_required"
+
+
+def test_missing_rows_follow_first_seen_file_and_offset_order(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    first = note("z-first", "first")
+    second = note("a-second", "second")
+    write_rows(vault / "daily" / "2026-07-19.jsonl", [first, second])
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "ok"
+    assert [row["id"] for row in rows(vault / "index.jsonl")] == [
+        "z-first",
+        "a-second",
+    ]
+
+
+def test_missing_rows_preserve_first_seen_order_across_gzip_and_plain(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    first = note("z-gzip-first", "first", "2026-07-18")
+    second = note("a-plain-second", "second", "2026-07-19")
+    write_gzip_rows(vault / "daily" / "2026-07-18.jsonl.gz", [first])
+    write_rows(vault / "daily" / "2026-07-19.jsonl", [second])
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "ok"
+    assert [row["id"] for row in rows(vault / "index.jsonl")] == [
+        "z-gzip-first",
+        "a-plain-second",
+    ]
+
+
+def test_gzip_resume_does_not_reinflate_completed_sources(tmp_path, monkeypatch):
+    module = migration()
+    vault = tmp_path / "vault"
+    first = note("first", "first", "2026-07-18")
+    second = note("second", "second", "2026-07-19")
+    write_gzip_rows(vault / "daily" / "2026-07-18.jsonl.gz", [first])
+    write_gzip_rows(vault / "daily" / "2026-07-19.jsonl.gz", [second])
+    calls: list[str] = []
+    real_inflate = module._inflate_gzip_source
+
+    def count_inflate(_vault, relative, *args, **kwargs):
+        calls.append(relative)
+        return real_inflate(_vault, relative, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_inflate_gzip_source", count_inflate)
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(
+            max_files=1,
+            max_bytes=100_000,
+            max_seconds=30,
+        ),
+    )
+    completed = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert completed["status"] == "ok"
+    assert calls.count("daily/2026-07-18.jsonl.gz") == 1
+    assert calls.count("daily/2026-07-19.jsonl.gz") == 1
+    assert partial["compressed_bytes_processed"] > 0
+    assert partial["expanded_bytes_processed"] > 0
+
+
+def test_gzip_expansion_limit_fails_closed(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    archive = vault / "daily" / "2026-07-19.jsonl.gz"
+    payload = note("bomb", "x" * 100_000)
+    write_gzip_rows(archive, [payload])
+    before = archive.read_bytes()
+
+    result = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(
+            max_files=10,
+            max_bytes=200_000,
+            max_seconds=30,
+            max_gzip_expanded_bytes=1024,
+        ),
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "migration_gzip_expansion_limit"
+    assert result["production_changed"] is False
+    assert archive.read_bytes() == before
+
+
+def test_publication_capacity_gate_fails_before_replace(tmp_path, monkeypatch):
+    module = migration()
+    vault = tmp_path / "vault"
+    duplicate = note("one", "one")
+    write_rows(vault / "index.jsonl", [duplicate, duplicate])
+    before = (vault / "index.jsonl").read_bytes()
+    real_require_capacity = module._require_capacity
+
+    def fail_publication(path, *, phase, additional_bytes, reserve_bytes):
+        if phase == "publication":
+            raise module.MigrationCapacity(
+                phase=phase,
+                required_bytes=additional_bytes + reserve_bytes,
+                available_bytes=1,
+                reserve_bytes=reserve_bytes,
+            )
+        return real_require_capacity(
+            path,
+            phase=phase,
+            additional_bytes=additional_bytes,
+            reserve_bytes=reserve_bytes,
+        )
+
+    monkeypatch.setattr(module, "_require_capacity", fail_publication)
+
+    result = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(
+            max_files=10,
+            max_bytes=100_000,
+            max_seconds=30,
+            reserve_bytes=2,
+        ),
+    )
+
+    assert result["error_code"] == "migration_insufficient_scratch_space"
+    assert result["error_stage"] == "publication"
+    assert result["production_changed"] is False
     assert (vault / "index.jsonl").read_bytes() == before

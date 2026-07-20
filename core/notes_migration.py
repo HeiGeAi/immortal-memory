@@ -13,6 +13,7 @@ import shutil
 import sqlite3
 import stat
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -30,7 +31,7 @@ from notes_transactions import (
 )
 
 
-MIGRATION_VERSION = 1
+MIGRATION_VERSION = 2
 MAX_MANIFEST_SOURCES = 1000
 DAILY_RELATIVE_PATTERN = re.compile(
     r"^daily/(\d{4}-\d{2}-\d{2})\.jsonl(?:\.gz)?$"
@@ -39,6 +40,49 @@ DAILY_RELATIVE_PATTERN = re.compile(
 
 class MigrationConflict(RuntimeError):
     pass
+
+
+class MigrationCapacity(RuntimeError):
+    def __init__(
+        self,
+        *,
+        phase: str,
+        required_bytes: int,
+        available_bytes: int,
+        reserve_bytes: int,
+    ) -> None:
+        super().__init__("migration_insufficient_scratch_space")
+        self.phase = phase
+        self.required_bytes = required_bytes
+        self.available_bytes = available_bytes
+        self.reserve_bytes = reserve_bytes
+
+
+class MigrationExpansionLimit(RuntimeError):
+    pass
+
+
+class _CompressedBudgetReached(RuntimeError):
+    pass
+
+
+class _BoundedCountingReader:
+    def __init__(self, handle: Any, limit: int) -> None:
+        self.handle = handle
+        self.remaining = limit
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining <= 0:
+            raise _CompressedBudgetReached()
+        requested = self.remaining if size < 0 else min(size, self.remaining)
+        payload = self.handle.read(requested)
+        self.bytes_read += len(payload)
+        self.remaining -= len(payload)
+        return payload
+
+    def tell(self) -> int:
+        return self.handle.tell()
 
 
 def after_catalog_commit_before_checkpoint() -> None:
@@ -50,9 +94,19 @@ class MigrationLimits:
     max_files: int = 10000
     max_bytes: int = 2 * 1024 * 1024 * 1024
     max_seconds: float = 3600.0
+    max_compressed_bytes: int = 2 * 1024 * 1024 * 1024
+    reserve_bytes: int = 64 * 1024 * 1024
+    max_gzip_expanded_bytes: int = 8 * 1024 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        if self.max_files < 1 or self.max_bytes < 1 or self.max_seconds < 0:
+        if (
+            self.max_files < 1
+            or self.max_bytes < 1
+            or self.max_seconds < 0
+            or self.max_compressed_bytes < 1
+            or self.reserve_bytes < 0
+            or self.max_gzip_expanded_bytes < 1
+        ):
             raise ValueError("migration limits must be non-negative and bounded")
 
 
@@ -66,6 +120,32 @@ def _checkpoint_path(vault: Path) -> Path:
 
 def _catalog_path(vault: Path) -> Path:
     return _migration_dir(vault) / "catalog.sqlite3"
+
+
+def _inflate_dir(vault: Path) -> Path:
+    return _migration_dir(vault) / "inflate"
+
+
+def _available_bytes(path: Path) -> int:
+    return int(shutil.disk_usage(path).free)
+
+
+def _require_capacity(
+    path: Path,
+    *,
+    phase: str,
+    additional_bytes: int,
+    reserve_bytes: int,
+) -> None:
+    available = _available_bytes(path)
+    required = max(0, int(additional_bytes)) + max(0, int(reserve_bytes))
+    if available < required:
+        raise MigrationCapacity(
+            phase=phase,
+            required_bytes=required,
+            available_bytes=available,
+            reserve_bytes=reserve_bytes,
+        )
 
 
 def _now() -> str:
@@ -118,7 +198,9 @@ def _connect_catalog(path: Path, *, reset: bool) -> sqlite3.Connection:
           source_relative TEXT,
           source_timestamp TEXT,
           seen_index INTEGER NOT NULL DEFAULT 0,
-          seen_daily INTEGER NOT NULL DEFAULT 0
+          seen_daily INTEGER NOT NULL DEFAULT 0,
+          first_seen_file INTEGER NOT NULL,
+          first_seen_seq INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS file_rows(
           file_rel TEXT NOT NULL,
@@ -127,12 +209,6 @@ def _connect_catalog(path: Path, *, reset: bool) -> sqlite3.Connection:
           record_id TEXT,
           raw BLOB,
           emit INTEGER NOT NULL,
-          PRIMARY KEY(file_rel, seq)
-        );
-        CREATE TABLE IF NOT EXISTS non_notes(
-          file_rel TEXT NOT NULL,
-          seq INTEGER NOT NULL,
-          raw BLOB NOT NULL,
           PRIMARY KEY(file_rel, seq)
         );
         CREATE TABLE IF NOT EXISTS scanned_files(
@@ -189,6 +265,7 @@ def _catalog_row(
     file_rel: str,
     raw: bytes,
     seq: int,
+    file_order: int,
 ) -> None:
     raw_sha256 = hashlib.sha256(raw).hexdigest()
     processed = con.execute(
@@ -213,10 +290,6 @@ def _catalog_row(
     if not isinstance(row, dict):
         raise MigrationConflict("invalid_legacy_jsonl")
     if row.get("source") != "obsidian-note":
-        con.execute(
-            "INSERT OR REPLACE INTO non_notes(file_rel,seq,raw) VALUES(?,?,?)",
-            (file_rel, seq, raw),
-        )
         con.execute(
             "INSERT OR REPLACE INTO file_rows(file_rel,seq,kind,record_id,raw,emit) "
             "VALUES(?,?,?,?,?,?)",
@@ -249,8 +322,9 @@ def _catalog_row(
     if existing is None:
         con.execute(
             "INSERT INTO facts(id,public_json,index_json,daily_relpath,"
-            "source_relative,source_timestamp,seen_index,seen_daily) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "source_relative,source_timestamp,seen_index,seen_daily,"
+            "first_seen_file,first_seen_seq) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
             (
                 record_id,
                 public_json,
@@ -260,6 +334,8 @@ def _catalog_row(
                 source_timestamp,
                 1 if is_index else 0,
                 0 if is_index else 1,
+                file_order,
+                seq,
             ),
         )
         con.execute(
@@ -329,9 +405,23 @@ def _signature(path: Path) -> dict[str, int]:
     return {
         "size": metadata.st_size,
         "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
         "dev": metadata.st_dev,
         "ino": metadata.st_ino,
     }
+
+
+def _source_fingerprint(path: Path) -> dict[str, Any]:
+    fingerprint: dict[str, Any] = dict(_signature(path))
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    fingerprint["sha256"] = digest.hexdigest()
+    return fingerprint
 
 
 def _validate_completed_sources(
@@ -342,8 +432,105 @@ def _validate_completed_sources(
     by_rel = dict(files)
     for relative, expected in signatures.items():
         path = by_rel.get(relative)
-        if path is None or _signature(path) != expected:
+        expected_metadata = {
+            key: value for key, value in expected.items() if key != "sha256"
+        }
+        if path is None or _signature(path) != expected_metadata:
             raise MigrationConflict("legacy_source_changed")
+
+
+def _inflate_spool_path(vault: Path, relative: str) -> Path:
+    digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+    return _inflate_dir(vault) / f"{digest}.jsonl"
+
+
+def _inflate_gzip_source(
+    vault: Path,
+    relative: str,
+    source: Path,
+    checkpoint: dict[str, Any],
+    limits: MigrationLimits,
+    *,
+    started: float,
+    clock: Callable[[], float],
+    compressed_used: int,
+    expanded_used: int,
+) -> tuple[Optional[Path], int, int, Optional[str]]:
+    completed = checkpoint.setdefault("inflated_sources", {}).get(relative)
+    spool = _inflate_spool_path(vault, relative)
+    if isinstance(completed, dict):
+        if (
+            completed.get("source_signature") != _signature(source)
+            or not spool.is_file()
+            or _hash_file(spool)
+            != (completed.get("sha256"), int(completed.get("expanded_bytes") or -1))
+        ):
+            raise MigrationConflict("legacy_source_changed")
+        return spool, 0, 0, None
+
+    root = spool.parent
+    root.mkdir(parents=True, exist_ok=True)
+    partial = spool.with_suffix(".partial")
+    try:
+        partial.unlink()
+    except FileNotFoundError:
+        pass
+    digest = hashlib.sha256()
+    expanded_this_run = 0
+    raw_handle = source.open("rb")
+    counting_handle = _BoundedCountingReader(
+        raw_handle,
+        limits.max_compressed_bytes - compressed_used,
+    )
+    zipped = gzip.GzipFile(fileobj=counting_handle, mode="rb")
+    try:
+        with partial.open("wb") as output:
+            try:
+                while True:
+                    if clock() - started >= limits.max_seconds:
+                        return None, counting_handle.bytes_read, expanded_this_run, "time"
+                    remaining_expanded = limits.max_bytes - expanded_used - expanded_this_run
+                    if remaining_expanded <= 0:
+                        return None, counting_handle.bytes_read, expanded_this_run, "expanded"
+                    chunk = zipped.read(min(1024 * 1024, remaining_expanded))
+                    if not chunk:
+                        output.flush()
+                        os.fsync(output.fileno())
+                        break
+                    if expanded_this_run + len(chunk) > limits.max_gzip_expanded_bytes:
+                        raise MigrationExpansionLimit("migration_gzip_expansion_limit")
+                    _require_capacity(
+                        vault,
+                        phase="gzip_inflate",
+                        additional_bytes=len(chunk),
+                        reserve_bytes=limits.reserve_bytes,
+                    )
+                    output.write(chunk)
+                    digest.update(chunk)
+                    expanded_this_run += len(chunk)
+            except _CompressedBudgetReached:
+                return None, counting_handle.bytes_read, expanded_this_run, "compressed"
+        os.replace(partial, spool)
+        _fsync_parent(spool)
+        metadata = {
+            "source_signature": _signature(source),
+            "sha256": digest.hexdigest(),
+            "expanded_bytes": expanded_this_run,
+            "compressed_bytes": counting_handle.bytes_read,
+        }
+        checkpoint.setdefault("inflated_sources", {})[relative] = metadata
+        _write_checkpoint(vault, checkpoint)
+        return (
+            spool,
+            counting_handle.bytes_read,
+            expanded_this_run,
+            None,
+        )
+    finally:
+        zipped.close()
+        raw_handle.close()
+        if partial.exists():
+            partial.unlink()
 
 
 def _scan_catalog(
@@ -359,6 +546,7 @@ def _scan_catalog(
     offset = int(checkpoint.get("offset") or 0)
     files_started = 0
     bytes_read = 0
+    compressed_read = 0
     rows_since_checkpoint = 0
     bytes_since_checkpoint = 0
     _validate_completed_sources(files, checkpoint)
@@ -386,19 +574,48 @@ def _scan_catalog(
         if clock() - started >= limits.max_seconds:
             break
         try:
-            raw_handle = path.open("rb")
-            handle = (
-                gzip.GzipFile(fileobj=raw_handle, mode="rb")
-                if relative.endswith(".gz")
-                else raw_handle
-            )
+            is_gzip = relative.endswith(".gz")
+            scan_path = path
+            if is_gzip:
+                scan_path, compressed_delta, expanded_delta, limit_kind = (
+                    _inflate_gzip_source(
+                        vault,
+                        relative,
+                        path,
+                        checkpoint,
+                        limits,
+                        started=started,
+                        clock=clock,
+                        compressed_used=compressed_read,
+                        expanded_used=bytes_read,
+                    )
+                )
+                compressed_read += compressed_delta
+                bytes_read += expanded_delta
+                if scan_path is None:
+                    checkpoint["file_index"] = file_index
+                    checkpoint["offset"] = offset
+                    _write_checkpoint(vault, checkpoint)
+                    return False, {
+                        "files_processed": files_started,
+                        "bytes_processed": bytes_read,
+                        "expanded_bytes_processed": bytes_read,
+                        "compressed_bytes_processed": compressed_read,
+                        "limit_kind": str(limit_kind),
+                    }
+            raw_handle = Path(scan_path).open("rb")
+            handle = raw_handle
             try:
                 handle.seek(offset)
                 seq = offset
                 while True:
                     if clock() - started >= limits.max_seconds:
                         break
-                    remaining = limits.max_bytes - bytes_read
+                    remaining = (
+                        1024 * 1024
+                        if is_gzip
+                        else limits.max_bytes - bytes_read
+                    )
                     if remaining <= 0:
                         break
                     raw = handle.readline(remaining)
@@ -408,7 +625,7 @@ def _scan_catalog(
                         offset = 0
                         checkpoint.setdefault("completed_signatures", {})[
                             relative
-                        ] = _signature(path)
+                        ] = _source_fingerprint(path)
                         con.execute(
                             "INSERT OR REPLACE INTO scanned_files(file_rel,size,mtime_ns) "
                             "VALUES(?,?,?)",
@@ -425,16 +642,26 @@ def _scan_catalog(
                         checkpoint["offset"] = 0
                         checkpoint.pop("active_file", None)
                         checkpoint.pop("active_signature", None)
+                        if is_gzip:
+                            checkpoint.setdefault("inflated_sources", {}).pop(
+                                relative, None
+                            )
                         _write_checkpoint(vault, checkpoint)
+                        if is_gzip:
+                            try:
+                                Path(scan_path).unlink()
+                            except FileNotFoundError:
+                                pass
                         rows_since_checkpoint = 0
                         bytes_since_checkpoint = 0
                         break
-                    bytes_read += len(raw)
+                    if not is_gzip:
+                        bytes_read += len(raw)
                     if not raw.endswith(b"\n"):
                         break
                     bytes_since_checkpoint += len(raw)
                     rows_since_checkpoint += 1
-                    _catalog_row(con, relative, raw, seq)
+                    _catalog_row(con, relative, raw, seq, file_index)
                     offset += len(raw)
                     seq = offset
                     checkpoint["file_index"] = file_index
@@ -448,7 +675,11 @@ def _scan_catalog(
                         _write_checkpoint(vault, checkpoint)
                         rows_since_checkpoint = 0
                         bytes_since_checkpoint = 0
-                if offset != 0 or bytes_read >= limits.max_bytes:
+                if (
+                    offset != 0
+                    or bytes_read >= limits.max_bytes
+                    or compressed_read >= limits.max_compressed_bytes
+                ):
                     con.commit()
                     after_catalog_commit_before_checkpoint()
                     checkpoint["file_index"] = file_index
@@ -456,8 +687,6 @@ def _scan_catalog(
                     _write_checkpoint(vault, checkpoint)
                     break
             finally:
-                if handle is not raw_handle:
-                    handle.close()
                 raw_handle.close()
         except (OSError, EOFError, gzip.BadGzipFile) as exc:
             raise MigrationConflict("invalid_legacy_gzip") from exc
@@ -465,6 +694,8 @@ def _scan_catalog(
     return complete, {
         "files_processed": files_started,
         "bytes_processed": bytes_read,
+        "expanded_bytes_processed": bytes_read,
+        "compressed_bytes_processed": compressed_read,
     }
 
 
@@ -491,6 +722,7 @@ def _write_staging(
     vault: Path,
     con: sqlite3.Connection,
     files: list[tuple[str, Path]],
+    limits: MigrationLimits,
 ) -> list[dict[str, Any]]:
     root = _migration_dir(vault) / "staging"
     if root.exists():
@@ -517,6 +749,21 @@ def _write_staging(
             if relative.endswith(".gz")
             else raw_handle
         )
+        unchecked_bytes = 0
+
+        def write_payload(payload: bytes) -> None:
+            nonlocal unchecked_bytes
+            unchecked_bytes += len(payload)
+            if unchecked_bytes >= 1024 * 1024:
+                _require_capacity(
+                    vault,
+                    phase="staging",
+                    additional_bytes=unchecked_bytes,
+                    reserve_bytes=limits.reserve_bytes,
+                )
+                unchecked_bytes = 0
+            handle.write(payload)
+
         try:
             for kind, raw, record_id, emit in con.execute(
                 "SELECT kind,raw,record_id,emit FROM file_rows "
@@ -524,7 +771,7 @@ def _write_staging(
                 (relative,),
             ):
                 if kind == "non_note":
-                    handle.write(bytes(raw))
+                    write_payload(bytes(raw))
                 elif int(emit):
                     if relative == "index.jsonl":
                         payload = con.execute(
@@ -536,18 +783,29 @@ def _write_staging(
                             "SELECT public_json FROM facts WHERE id=?",
                             (record_id,),
                         ).fetchone()[0]
-                    handle.write((str(payload) + "\n").encode("utf-8"))
+                    write_payload((str(payload) + "\n").encode("utf-8"))
             if relative == "index.jsonl":
-                query = "SELECT COALESCE(index_json,public_json) FROM facts WHERE seen_index=0 ORDER BY id"
+                query = (
+                    "SELECT COALESCE(index_json,public_json) FROM facts "
+                    "WHERE seen_index=0 ORDER BY first_seen_file,first_seen_seq"
+                )
                 params: tuple[Any, ...] = ()
             else:
                 query = (
                     "SELECT public_json FROM facts "
-                    "WHERE daily_relpath=? AND seen_daily=0 ORDER BY id"
+                    "WHERE daily_relpath=? AND seen_daily=0 "
+                    "ORDER BY first_seen_file,first_seen_seq"
                 )
                 params = (relative,)
             for (payload,) in con.execute(query, params):
-                handle.write((str(payload) + "\n").encode("utf-8"))
+                write_payload((str(payload) + "\n").encode("utf-8"))
+            if unchecked_bytes:
+                _require_capacity(
+                    vault,
+                    phase="staging",
+                    additional_bytes=unchecked_bytes,
+                    reserve_bytes=limits.reserve_bytes,
+                )
             handle.flush()
         finally:
             if handle is not raw_handle:
@@ -630,8 +888,13 @@ def _derived_publication_paths(
     return target, staging, backup
 
 
-def _source_snapshot(files: list[tuple[str, Path]]) -> dict[str, dict[str, int]]:
-    return {relative: _signature(path) for relative, path in files}
+def _source_snapshot(
+    files: list[tuple[str, Path]],
+    *,
+    include_hash: bool = False,
+) -> dict[str, dict[str, Any]]:
+    fingerprint = _source_fingerprint if include_hash else _signature
+    return {relative: fingerprint(path) for relative, path in files}
 
 
 def _validate_source_snapshot(
@@ -639,7 +902,7 @@ def _validate_source_snapshot(
     expected: dict[str, Any],
 ) -> None:
     current_files = _source_files(vault)
-    current = _source_snapshot(current_files)
+    current = _source_snapshot(current_files, include_hash=True)
     if current != expected:
         raise MigrationConflict("legacy_source_changed_before_publication")
 
@@ -912,11 +1175,36 @@ def _migrate_notes_locked(
     discovered_files = _source_files(vault)
     checkpoint = _load_checkpoint(vault)
     resumed = checkpoint is not None
-    if checkpoint is None or checkpoint.get("migration_version") != MIGRATION_VERSION:
+    if _checkpoint_path(vault).exists() and checkpoint is None:
+        return {
+            "status": "error",
+            "error_code": "notes_migration_scratch_invalid",
+            "production_changed": False,
+        }
+    if checkpoint is not None and checkpoint.get("migration_version") != MIGRATION_VERSION:
+        reset_run_id = checkpoint.get("reset_run_id")
+        if not isinstance(reset_run_id, str) or not reset_run_id:
+            reset_run_id = uuid.uuid4().hex
+            checkpoint["reset_run_id"] = reset_run_id
+            _write_checkpoint(vault, checkpoint)
+        return {
+            "status": "error",
+            "error_code": "notes_migration_legacy_scratch",
+            "found_version": checkpoint.get("migration_version"),
+            "required_version": MIGRATION_VERSION,
+            "run_id": reset_run_id,
+            "reset_command": (
+                "immortal notes-migrate-reset --run-id "
+                f"{reset_run_id} --json"
+            ),
+            "production_changed": False,
+        }
+    if checkpoint is None:
         source_plan = [relative for relative, _path in discovered_files]
         source_signatures = _source_snapshot(discovered_files)
         checkpoint = {
             "migration_version": MIGRATION_VERSION,
+            "run_id": uuid.uuid4().hex,
             "file_index": 0,
             "offset": 0,
             "completed_signatures": {},
@@ -936,7 +1224,12 @@ def _migrate_notes_locked(
         ):
             return {
                 "status": "error",
-                "error_code": "notes_migration_conflict",
+                "error_code": "notes_migration_reset_required",
+                "run_id": checkpoint.get("run_id"),
+                "reset_command": (
+                    "immortal notes-migrate-reset --run-id "
+                    f"{checkpoint.get('run_id')} --json"
+                ),
                 "production_changed": False,
             }
         reset = False
@@ -955,6 +1248,23 @@ def _migrate_notes_locked(
                 limits,
                 clock,
             )
+        except MigrationCapacity as exc:
+            return {
+                "status": "error",
+                "error_code": "migration_insufficient_scratch_space",
+                "error_stage": exc.phase,
+                "required_bytes": exc.required_bytes,
+                "available_bytes": exc.available_bytes,
+                "reserve_bytes": exc.reserve_bytes,
+                "production_changed": False,
+            }
+        except MigrationExpansionLimit:
+            return {
+                "status": "error",
+                "error_code": "migration_gzip_expansion_limit",
+                "error_stage": "gzip_inflate",
+                "production_changed": False,
+            }
         except MigrationConflict:
             return {
                 "status": "error",
@@ -993,7 +1303,14 @@ def _migrate_notes_locked(
                 "production_changed": False,
             }
         try:
-            entries = _write_staging(vault, con, files)
+            staging_upper_bound = sum(path.stat().st_size for _relative, path in files)
+            _require_capacity(
+                vault,
+                phase="staging",
+                additional_bytes=staging_upper_bound,
+                reserve_bytes=limits.reserve_bytes,
+            )
+            entries = _write_staging(vault, con, files, limits)
             publication_source_snapshot = dict(
                 checkpoint.get("completed_signatures") or {}
             )
@@ -1002,6 +1319,16 @@ def _migrate_notes_locked(
             }:
                 raise MigrationConflict("source_plan_incomplete")
             callback("staging_verified")
+        except MigrationCapacity as exc:
+            return {
+                "status": "error",
+                "error_code": "migration_insufficient_scratch_space",
+                "error_stage": exc.phase,
+                "required_bytes": exc.required_bytes,
+                "available_bytes": exc.available_bytes,
+                "reserve_bytes": exc.reserve_bytes,
+                "production_changed": False,
+            }
         except Exception as exc:
             return {
                 "status": "error",
@@ -1011,6 +1338,17 @@ def _migrate_notes_locked(
                 "production_changed": False,
             }
         try:
+            publication_bytes = sum(
+                (vault / str(entry["relative"])).stat().st_size
+                for entry in entries
+                if (vault / str(entry["relative"])).is_file()
+            )
+            _require_capacity(
+                vault,
+                phase="publication",
+                additional_bytes=publication_bytes,
+                reserve_bytes=limits.reserve_bytes,
+            )
             _publish(
                 vault,
                 entries,
@@ -1019,6 +1357,16 @@ def _migrate_notes_locked(
             )
             callback("published")
             _completed_manifest(vault, con, payload=manifest_payload)
+        except MigrationCapacity as exc:
+            return {
+                "status": "error",
+                "error_code": "migration_insufficient_scratch_space",
+                "error_stage": exc.phase,
+                "required_bytes": exc.required_bytes,
+                "available_bytes": exc.available_bytes,
+                "reserve_bytes": exc.reserve_bytes,
+                "production_changed": False,
+            }
         except Exception as exc:
             return {
                 "status": "error",
@@ -1037,6 +1385,7 @@ def _migrate_notes_locked(
             "duplicates_compacted": duplicates,
             "index_rebuild_required": True,
             "production_changed": True,
+            **run_stats,
         }
     finally:
         con.close()
@@ -1091,22 +1440,138 @@ def migrate_notes(
                 os.close(directory_fd)
 
 
+def reset_migration_scratch(vault_dir: Path, *, run_id: str) -> dict[str, Any]:
+    vault = Path(vault_dir)
+    root = _migration_dir(vault)
+    root.mkdir(parents=True, exist_ok=True)
+    lock_path = root / "migration.lock"
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_fd: Optional[int] = None
+    try:
+        directory_fd = _open_directory_fd(root, create=True)
+        fd = os.open(lock_path.name, flags, 0o600, dir_fd=directory_fd)
+    except OSError:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        return {
+            "status": "error",
+            "error_code": "notes_migration_busy",
+            "production_changed": False,
+        }
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "status": "error",
+                "error_code": "notes_migration_busy",
+                "production_changed": False,
+            }
+        publication = root / "publication.json"
+        if publication.exists():
+            return {
+                "status": "error",
+                "error_code": "notes_migration_reset_unsafe_publication_exists",
+                "production_changed": False,
+            }
+        checkpoint = _load_checkpoint(vault)
+        expected = (
+            checkpoint.get("run_id") or checkpoint.get("reset_run_id")
+            if isinstance(checkpoint, dict)
+            else None
+        )
+        if not expected or run_id != expected:
+            return {
+                "status": "error",
+                "error_code": "notes_migration_reset_run_id_mismatch",
+                "production_changed": False,
+            }
+        removed: list[str] = []
+        catalog = _catalog_path(vault)
+        for candidate in (
+            _checkpoint_path(vault),
+            catalog,
+            Path(f"{catalog}-wal"),
+            Path(f"{catalog}-shm"),
+        ):
+            try:
+                candidate.unlink()
+                removed.append(str(candidate.relative_to(vault)))
+            except FileNotFoundError:
+                pass
+        for directory in (
+            _inflate_dir(vault),
+            root / "staging",
+            root / "backups",
+        ):
+            if directory.exists():
+                shutil.rmtree(directory)
+                removed.append(str(directory.relative_to(vault)))
+        _fsync_parent(root / "checkpoint.json")
+        return {
+            "status": "ok",
+            "reset_run_id": run_id,
+            "removed": removed,
+            "production_changed": False,
+        }
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Migrate legacy Obsidian note facts")
     parser.add_argument("--vault-dir", required=True)
     parser.add_argument("--max-files", type=int, default=10000)
     parser.add_argument("--max-bytes", type=int, default=2 * 1024 * 1024 * 1024)
     parser.add_argument("--max-seconds", type=float, default=3600.0)
+    parser.add_argument(
+        "--max-compressed-bytes",
+        type=int,
+        default=2 * 1024 * 1024 * 1024,
+    )
+    parser.add_argument("--reserve-bytes", type=int, default=64 * 1024 * 1024)
+    parser.add_argument(
+        "--max-gzip-expanded-bytes",
+        type=int,
+        default=8 * 1024 * 1024 * 1024,
+    )
+    parser.add_argument("--reset-scratch", action="store_true")
+    parser.add_argument("--run-id")
     parser.add_argument("--json", action="store_true")
     return parser
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    result = migrate_notes(
-        Path(args.vault_dir),
-        limits=MigrationLimits(args.max_files, args.max_bytes, args.max_seconds),
-    )
+    if args.reset_scratch:
+        result = (
+            reset_migration_scratch(Path(args.vault_dir), run_id=args.run_id)
+            if args.run_id
+            else {
+                "status": "error",
+                "error_code": "notes_migration_reset_run_id_required",
+                "production_changed": False,
+            }
+        )
+    else:
+        result = migrate_notes(
+            Path(args.vault_dir),
+            limits=MigrationLimits(
+                args.max_files,
+                args.max_bytes,
+                args.max_seconds,
+                args.max_compressed_bytes,
+                args.reserve_bytes,
+                args.max_gzip_expanded_bytes,
+            ),
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2) if args.json else result["status"])
     return 0 if result["status"] == "ok" else 2
 
