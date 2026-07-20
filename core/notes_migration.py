@@ -62,6 +62,20 @@ class MigrationExpansionLimit(RuntimeError):
     pass
 
 
+class MigrationDeadline(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _Deadline:
+    clock: Callable[[], float]
+    expires_at: float
+
+    def check(self) -> None:
+        if self.clock() >= self.expires_at:
+            raise MigrationDeadline("migration_deadline_reached")
+
+
 class _CompressedBudgetReached(RuntimeError):
     pass
 
@@ -152,25 +166,67 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _source_files(vault: Path) -> list[tuple[str, Path]]:
-    files: list[tuple[str, Path]] = []
-    index = Path(vault) / "index.jsonl"
-    if index.is_file():
-        files.append(("index.jsonl", index))
-    daily = Path(vault) / "daily"
+def _source_files(
+    vault: Path,
+    *,
+    deadline: Optional[_Deadline] = None,
+) -> list[tuple[str, Path]]:
+    if deadline is not None:
+        deadline.check()
+    vault = Path(vault)
     try:
-        with os.scandir(daily) as entries:
-            names = sorted(
-                entry.name
-                for entry in entries
-                if (
-                    entry.name.endswith(".jsonl")
-                    or entry.name.endswith(".jsonl.gz")
-                )
-                and entry.is_file(follow_symlinks=False)
-                and not entry.is_symlink()
-            )
+        vault_metadata = os.lstat(vault)
+    except FileNotFoundError as exc:
+        raise MigrationConflict("vault_root_invalid") from exc
+    if stat.S_ISLNK(vault_metadata.st_mode) or not stat.S_ISDIR(
+        vault_metadata.st_mode
+    ):
+        raise MigrationConflict("vault_root_invalid")
+    files: list[tuple[str, Path]] = []
+    index = vault / "index.jsonl"
+    try:
+        index_metadata = os.lstat(index)
     except FileNotFoundError:
+        index_metadata = None
+    if index_metadata is not None:
+        if stat.S_ISLNK(index_metadata.st_mode) or not stat.S_ISREG(
+            index_metadata.st_mode
+        ):
+            raise MigrationConflict("index_source_invalid")
+        files.append(("index.jsonl", index))
+    daily = vault / "daily"
+    try:
+        daily_metadata = os.lstat(daily)
+    except FileNotFoundError:
+        daily_metadata = None
+    if daily_metadata is not None:
+        if stat.S_ISLNK(daily_metadata.st_mode) or not stat.S_ISDIR(
+            daily_metadata.st_mode
+        ):
+            raise MigrationConflict("daily_source_invalid")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        daily_fd = os.open(daily, flags)
+        try:
+            with os.scandir(daily_fd) as entries:
+                names = []
+                for entry in entries:
+                    if deadline is not None:
+                        deadline.check()
+                    if (
+                        (
+                            entry.name.endswith(".jsonl")
+                            or entry.name.endswith(".jsonl.gz")
+                        )
+                        and entry.is_file(follow_symlinks=False)
+                        and not entry.is_symlink()
+                    ):
+                        names.append(entry.name)
+                names.sort()
+        finally:
+            os.close(daily_fd)
+    else:
         names = []
     for name in names:
         files.append((f"daily/{name}", daily / name))
@@ -178,14 +234,55 @@ def _source_files(vault: Path) -> list[tuple[str, Path]]:
 
 
 def _connect_catalog(path: Path, *, reset: bool) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if reset:
-        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+    path = Path(path)
+    parent_fd = _open_directory_fd(path.parent, create=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        candidates = (path, Path(f"{path}-wal"), Path(f"{path}-shm"))
+        for candidate in candidates:
             try:
-                candidate.unlink()
+                metadata = os.stat(
+                    candidate.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
             except FileNotFoundError:
-                pass
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError("migration_catalog_not_regular")
+        if reset:
+            for candidate in candidates:
+                try:
+                    os.unlink(candidate.name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+        catalog_fd = os.open(path.name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            catalog_metadata = os.fstat(catalog_fd)
+            if not stat.S_ISREG(catalog_metadata.st_mode):
+                raise OSError("migration_catalog_not_regular")
+            catalog_identity = (
+                catalog_metadata.st_dev,
+                catalog_metadata.st_ino,
+            )
+        finally:
+            os.close(catalog_fd)
+    finally:
+        os.close(parent_fd)
     con = sqlite3.connect(path)
+    try:
+        current_metadata = os.lstat(path)
+        if (
+            not stat.S_ISREG(current_metadata.st_mode)
+            or (current_metadata.st_dev, current_metadata.st_ino)
+            != catalog_identity
+        ):
+            raise OSError("migration_catalog_replaced")
+    except Exception:
+        con.close()
+        raise
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=FULL")
     con.executescript(
@@ -386,11 +483,11 @@ def _catalog_row(
 
 def _load_checkpoint(vault: Path) -> Optional[dict[str, Any]]:
     path = _checkpoint_path(vault)
-    if not path.is_file():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = _secure_read_json(path)
+    except FileNotFoundError:
+        return None
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -411,15 +508,23 @@ def _signature(path: Path) -> dict[str, int]:
     }
 
 
-def _source_fingerprint(path: Path) -> dict[str, Any]:
+def _source_fingerprint(
+    path: Path,
+    *,
+    deadline: Optional[_Deadline] = None,
+) -> dict[str, Any]:
     fingerprint: dict[str, Any] = dict(_signature(path))
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while True:
+            if deadline is not None:
+                deadline.check()
             chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
+    if deadline is not None:
+        deadline.check()
     fingerprint["sha256"] = digest.hexdigest()
     return fingerprint
 
@@ -427,10 +532,13 @@ def _source_fingerprint(path: Path) -> dict[str, Any]:
 def _validate_completed_sources(
     files: list[tuple[str, Path]],
     checkpoint: dict[str, Any],
+    *,
+    deadline: _Deadline,
 ) -> None:
     signatures = checkpoint.get("completed_signatures") or {}
     by_rel = dict(files)
     for relative, expected in signatures.items():
+        deadline.check()
         path = by_rel.get(relative)
         expected_metadata = {
             key: value for key, value in expected.items() if key != "sha256"
@@ -451,8 +559,7 @@ def _inflate_gzip_source(
     checkpoint: dict[str, Any],
     limits: MigrationLimits,
     *,
-    started: float,
-    clock: Callable[[], float],
+    deadline: _Deadline,
     compressed_used: int,
     expanded_used: int,
 ) -> tuple[Optional[Path], int, int, Optional[str]]:
@@ -487,7 +594,9 @@ def _inflate_gzip_source(
         with partial.open("wb") as output:
             try:
                 while True:
-                    if clock() - started >= limits.max_seconds:
+                    try:
+                        deadline.check()
+                    except MigrationDeadline:
                         return None, counting_handle.bytes_read, expanded_this_run, "time"
                     remaining_expanded = limits.max_bytes - expanded_used - expanded_this_run
                     if remaining_expanded <= 0:
@@ -539,9 +648,8 @@ def _scan_catalog(
     files: list[tuple[str, Path]],
     checkpoint: dict[str, Any],
     limits: MigrationLimits,
-    clock: Callable[[], float],
+    deadline: _Deadline,
 ) -> tuple[bool, dict[str, int]]:
-    started = clock()
     file_index = int(checkpoint.get("file_index") or 0)
     offset = int(checkpoint.get("offset") or 0)
     files_started = 0
@@ -549,7 +657,7 @@ def _scan_catalog(
     compressed_read = 0
     rows_since_checkpoint = 0
     bytes_since_checkpoint = 0
-    _validate_completed_sources(files, checkpoint)
+    _validate_completed_sources(files, checkpoint, deadline=deadline)
     while file_index < len(files):
         relative, path = files[file_index]
         if offset == 0:
@@ -571,7 +679,9 @@ def _scan_catalog(
             or checkpoint.get("active_signature") != _signature(path)
         ):
             raise MigrationConflict("legacy_source_changed")
-        if clock() - started >= limits.max_seconds:
+        try:
+            deadline.check()
+        except MigrationDeadline:
             break
         try:
             is_gzip = relative.endswith(".gz")
@@ -584,8 +694,7 @@ def _scan_catalog(
                         path,
                         checkpoint,
                         limits,
-                        started=started,
-                        clock=clock,
+                        deadline=deadline,
                         compressed_used=compressed_read,
                         expanded_used=bytes_read,
                     )
@@ -609,7 +718,9 @@ def _scan_catalog(
                 handle.seek(offset)
                 seq = offset
                 while True:
-                    if clock() - started >= limits.max_seconds:
+                    try:
+                        deadline.check()
+                    except MigrationDeadline:
                         break
                     remaining = (
                         1024 * 1024
@@ -625,7 +736,7 @@ def _scan_catalog(
                         offset = 0
                         checkpoint.setdefault("completed_signatures", {})[
                             relative
-                        ] = _source_fingerprint(path)
+                        ] = _source_fingerprint(path, deadline=deadline)
                         con.execute(
                             "INSERT OR REPLACE INTO scanned_files(file_rel,size,mtime_ns) "
                             "VALUES(?,?,?)",
@@ -705,16 +816,24 @@ def _staging_path(root: Path, relative: str) -> Path:
     return root / f"{digest}{suffix}"
 
 
-def _hash_file(path: Path) -> tuple[str, int]:
+def _hash_file(
+    path: Path,
+    *,
+    deadline: Optional[_Deadline] = None,
+) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     with Path(path).open("rb") as handle:
         while True:
+            if deadline is not None:
+                deadline.check()
             chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
             size += len(chunk)
+    if deadline is not None:
+        deadline.check()
     return digest.hexdigest(), size
 
 
@@ -723,6 +842,7 @@ def _write_staging(
     con: sqlite3.Connection,
     files: list[tuple[str, Path]],
     limits: MigrationLimits,
+    deadline: _Deadline,
 ) -> list[dict[str, Any]]:
     root = _migration_dir(vault) / "staging"
     if root.exists():
@@ -736,6 +856,7 @@ def _write_staging(
     )
     entries: list[dict[str, Any]] = []
     for relative in sorted(targets):
+        deadline.check()
         _validate_fact_relative(relative)
         staging = _staging_path(root, relative)
         raw_handle = staging.open("wb")
@@ -753,6 +874,7 @@ def _write_staging(
 
         def write_payload(payload: bytes) -> None:
             nonlocal unchecked_bytes
+            deadline.check()
             unchecked_bytes += len(payload)
             if unchecked_bytes >= 1024 * 1024:
                 _require_capacity(
@@ -813,7 +935,7 @@ def _write_staging(
             raw_handle.flush()
             os.fsync(raw_handle.fileno())
             raw_handle.close()
-        digest, length = _hash_file(staging)
+        digest, length = _hash_file(staging, deadline=deadline)
         entries.append(
             {
                 "relative": relative,
@@ -892,25 +1014,65 @@ def _source_snapshot(
     files: list[tuple[str, Path]],
     *,
     include_hash: bool = False,
+    deadline: Optional[_Deadline] = None,
 ) -> dict[str, dict[str, Any]]:
-    fingerprint = _source_fingerprint if include_hash else _signature
-    return {relative: fingerprint(path) for relative, path in files}
+    if include_hash:
+        return {
+            relative: _source_fingerprint(path, deadline=deadline)
+            for relative, path in files
+        }
+    return {relative: _signature(path) for relative, path in files}
 
 
 def _validate_source_snapshot(
     vault: Path,
     expected: dict[str, Any],
+    *,
+    deadline: Optional[_Deadline] = None,
 ) -> None:
-    current_files = _source_files(vault)
-    current = _source_snapshot(current_files, include_hash=True)
+    current_files = _source_files(vault, deadline=deadline)
+    current = _source_snapshot(
+        current_files,
+        include_hash=True,
+        deadline=deadline,
+    )
     if current != expected:
         raise MigrationConflict("legacy_source_changed_before_publication")
+
+
+def _publication_changed(vault: Path, journal: dict[str, Any]) -> bool:
+    entries = journal.get("entries")
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("replace_started"):
+            continue
+        try:
+            relative = _validate_fact_relative(str(entry.get("relative") or ""))
+            target = Path(vault) / relative
+            before = entry.get("target_generation_before")
+            if target.is_symlink() or not target.is_file():
+                continue
+            if "target_generation_before" not in entry:
+                expected = (str(entry["sha256"]), int(entry["length"]))
+                if _hash_file(target) == expected:
+                    return True
+                continue
+            current = _signature(target)
+            if before is None or (
+                isinstance(before, dict) and current != before
+            ):
+                return True
+        except (OSError, TypeError, ValueError, MigrationConflict):
+            continue
+    return False
 
 
 def _recover_publication(
     vault: Path,
     *,
     boundary: Callable[[str], None],
+    deadline: Optional[_Deadline] = None,
 ) -> Optional[dict[str, Any]]:
     journal_path = _migration_dir(vault) / "publication.json"
     try:
@@ -935,6 +1097,9 @@ def _recover_publication(
         }
     ):
         raise MigrationConflict("publication_journal_invalid")
+    roll_forward_required = _publication_changed(vault, journal)
+    if deadline is not None and not roll_forward_required:
+        deadline.check()
     if journal["stage"] == "publishing":
         journal["stage"] = "publishing_zero"
         durable_atomic_json(journal_path, journal)
@@ -942,7 +1107,11 @@ def _recover_publication(
     index.parent.mkdir(parents=True, exist_ok=True)
     with source_lock(index, exclusive=True):
         if journal["stage"] == "prepared":
-            _validate_source_snapshot(vault, source_snapshot)
+            _validate_source_snapshot(
+                vault,
+                source_snapshot,
+                deadline=None if roll_forward_required else deadline,
+            )
             journal["stage"] = "publishing_zero"
             durable_atomic_json(journal_path, journal)
         if journal["stage"] == "publishing_zero" and entries:
@@ -957,19 +1126,37 @@ def _recover_publication(
                 int(first.get("length") or 0),
             )
             first_hash = (
-                _hash_file(first_target) if first_target.is_file() else None
+                _hash_file(
+                    first_target,
+                    deadline=None if roll_forward_required else deadline,
+                )
+                if first_target.is_file()
+                else None
             )
             if first.get("replace_started") and first_hash == first_expected:
                 first["published"] = True
                 journal["stage"] = "publishing_started"
                 durable_atomic_json(journal_path, journal)
             else:
-                _validate_source_snapshot(vault, source_snapshot)
+                _validate_source_snapshot(
+                    vault,
+                    source_snapshot,
+                    deadline=None if roll_forward_required else deadline,
+                )
         for position, entry in enumerate(entries):
+            if deadline is not None and not roll_forward_required:
+                deadline.check()
             if not isinstance(entry, dict):
                 raise MigrationConflict("publication_journal_invalid")
             target, staging, backup = _derived_publication_paths(vault, entry)
-            target_hash = _hash_file(target) if target.is_file() else None
+            target_hash = (
+                _hash_file(
+                    target,
+                    deadline=None if roll_forward_required else deadline,
+                )
+                if target.is_file()
+                else None
+            )
             try:
                 expected = (str(entry["sha256"]), int(entry["length"]))
             except (KeyError, TypeError, ValueError) as exc:
@@ -982,7 +1169,10 @@ def _recover_publication(
                 continue
             if entry.get("published"):
                 raise MigrationConflict("published_target_changed")
-            if not staging.is_file() or _hash_file(staging) != expected:
+            if not staging.is_file() or _hash_file(
+                staging,
+                deadline=None if roll_forward_required else deadline,
+            ) != expected:
                 raise MigrationConflict("publication_staging_missing")
             target.parent.mkdir(parents=True, exist_ok=True)
             backup.parent.mkdir(parents=True, exist_ok=True)
@@ -990,10 +1180,20 @@ def _recover_publication(
                 shutil.copy2(target, backup)
                 _fsync_parent(backup)
             if position == 0 and journal["stage"] == "publishing_zero":
-                entry["replace_started"] = True
-                durable_atomic_json(journal_path, journal)
-                _validate_source_snapshot(vault, source_snapshot)
+                _validate_source_snapshot(
+                    vault,
+                    source_snapshot,
+                    deadline=None if roll_forward_required else deadline,
+                )
+            if deadline is not None and not roll_forward_required:
+                deadline.check()
+            entry["target_generation_before"] = (
+                _signature(target) if target.exists() else None
+            )
+            entry["replace_started"] = True
+            durable_atomic_json(journal_path, journal)
             os.replace(staging, target)
+            roll_forward_required = True
             _fsync_parent(target)
             boundary(f"publication_replaced:{entry['relative']}")
             if _hash_file(target) != expected:
@@ -1013,6 +1213,7 @@ def _publish(
     *,
     source_snapshot: dict[str, dict[str, int]],
     boundary: Callable[[str], None],
+    deadline: _Deadline,
 ) -> None:
     journal_path = _migration_dir(vault) / "publication.json"
     journal = {
@@ -1022,7 +1223,7 @@ def _publish(
         "entries": entries,
     }
     durable_atomic_json(journal_path, journal)
-    _recover_publication(vault, boundary=boundary)
+    _recover_publication(vault, boundary=boundary, deadline=deadline)
 
 
 def _manifest_payload(con: sqlite3.Connection) -> dict[str, Any]:
@@ -1094,6 +1295,7 @@ def _migrate_notes_locked(
     *,
     limits: Optional[MigrationLimits] = None,
     boundary: Optional[Callable[[str], None]] = None,
+    deadline: _Deadline,
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     vault = Path(vault_dir)
@@ -1115,6 +1317,11 @@ def _migrate_notes_locked(
             recovered_publication = _recover_publication(
                 vault,
                 boundary=callback,
+                deadline=deadline,
+            )
+            publication_changed = bool(
+                recovered_publication
+                and _publication_changed(vault, recovered_publication)
             )
             catalog = _connect_catalog(_catalog_path(vault), reset=False)
             try:
@@ -1141,15 +1348,35 @@ def _migrate_notes_locked(
                 "publication_recovered": recovered_publication is not None,
                 "duplicates_compacted": duplicates,
                 "index_rebuild_required": True,
-                "production_changed": True,
+                "production_changed": publication_changed,
+            }
+        except MigrationDeadline:
+            try:
+                deadline_journal = _secure_read_json(
+                    _migration_dir(vault) / "publication.json"
+                )
+                deadline_changed = _publication_changed(vault, deadline_journal)
+            except Exception:
+                deadline_changed = False
+            return {
+                "status": "partial",
+                "error_code": "migration_limit_reached",
+                "error_stage": "publication",
+                "limit_kind": "time",
+                "production_changed": deadline_changed,
             }
         except Exception as exc:
+            try:
+                failed_journal = _secure_read_json(publication_path)
+                production_changed = _publication_changed(vault, failed_journal)
+            except Exception:
+                production_changed = False
             return {
                 "status": "error",
                 "error_code": "migration_publication_failed",
                 "error_stage": "publication",
                 "error_type": type(exc).__name__,
-                "production_changed": True,
+                "production_changed": production_changed,
             }
     existing_manifest_path = manifest_path(vault)
     try:
@@ -1172,10 +1399,33 @@ def _migrate_notes_locked(
                 ),
                 "production_changed": False,
             }
-    discovered_files = _source_files(vault)
-    checkpoint = _load_checkpoint(vault)
+    try:
+        deadline.check()
+        discovered_files = _source_files(vault)
+    except MigrationDeadline:
+        return {
+            "status": "partial",
+            "error_code": "migration_limit_reached",
+            "limit_kind": "time",
+            "production_changed": False,
+        }
+    except (MigrationConflict, OSError):
+        return {
+            "status": "error",
+            "error_code": "notes_migration_source_invalid",
+            "production_changed": False,
+        }
+    try:
+        checkpoint = _load_checkpoint(vault)
+        checkpoint_exists = _secure_regular_exists(_checkpoint_path(vault))
+    except OSError:
+        return {
+            "status": "error",
+            "error_code": "notes_migration_scratch_invalid",
+            "production_changed": False,
+        }
     resumed = checkpoint is not None
-    if _checkpoint_path(vault).exists() and checkpoint is None:
+    if checkpoint_exists and checkpoint is None:
         return {
             "status": "error",
             "error_code": "notes_migration_scratch_invalid",
@@ -1237,7 +1487,14 @@ def _migrate_notes_locked(
         (relative, vault / _validate_fact_relative(str(relative)))
         for relative in checkpoint["source_plan"]
     ]
-    con = _connect_catalog(_catalog_path(vault), reset=reset)
+    try:
+        con = _connect_catalog(_catalog_path(vault), reset=reset)
+    except (OSError, sqlite3.DatabaseError):
+        return {
+            "status": "error",
+            "error_code": "notes_migration_scratch_invalid",
+            "production_changed": False,
+        }
     try:
         try:
             complete, run_stats = _scan_catalog(
@@ -1246,7 +1503,7 @@ def _migrate_notes_locked(
                 files,
                 checkpoint,
                 limits,
-                clock,
+                deadline,
             )
         except MigrationCapacity as exc:
             return {
@@ -1264,6 +1521,14 @@ def _migrate_notes_locked(
                 "error_code": "migration_gzip_expansion_limit",
                 "error_stage": "gzip_inflate",
                 "production_changed": False,
+            }
+        except MigrationDeadline:
+            return {
+                "status": "partial",
+                "error_code": "migration_limit_reached",
+                "limit_kind": "time",
+                "production_changed": False,
+                "checkpoint_resumed": resumed,
             }
         except MigrationConflict:
             return {
@@ -1310,7 +1575,7 @@ def _migrate_notes_locked(
                 additional_bytes=staging_upper_bound,
                 reserve_bytes=limits.reserve_bytes,
             )
-            entries = _write_staging(vault, con, files, limits)
+            entries = _write_staging(vault, con, files, limits, deadline)
             publication_source_snapshot = dict(
                 checkpoint.get("completed_signatures") or {}
             )
@@ -1319,6 +1584,7 @@ def _migrate_notes_locked(
             }:
                 raise MigrationConflict("source_plan_incomplete")
             callback("staging_verified")
+            deadline.check()
         except MigrationCapacity as exc:
             return {
                 "status": "error",
@@ -1329,7 +1595,29 @@ def _migrate_notes_locked(
                 "reserve_bytes": exc.reserve_bytes,
                 "production_changed": False,
             }
+        except MigrationDeadline:
+            try:
+                deadline_journal = _secure_read_json(
+                    _migration_dir(vault) / "publication.json"
+                )
+                deadline_changed = _publication_changed(vault, deadline_journal)
+            except Exception:
+                deadline_changed = False
+            return {
+                "status": "partial",
+                "error_code": "migration_limit_reached",
+                "error_stage": "staging_verified",
+                "limit_kind": "time",
+                "production_changed": deadline_changed,
+            }
         except Exception as exc:
+            try:
+                failed_journal = _secure_read_json(
+                    _migration_dir(vault) / "publication.json"
+                )
+                failed_changed = _publication_changed(vault, failed_journal)
+            except Exception:
+                failed_changed = False
             return {
                 "status": "error",
                 "error_code": "migration_interrupted",
@@ -1354,6 +1642,7 @@ def _migrate_notes_locked(
                 entries,
                 source_snapshot=publication_source_snapshot,
                 boundary=callback,
+                deadline=deadline,
             )
             callback("published")
             _completed_manifest(vault, con, payload=manifest_payload)
@@ -1367,13 +1656,35 @@ def _migrate_notes_locked(
                 "reserve_bytes": exc.reserve_bytes,
                 "production_changed": False,
             }
+        except MigrationDeadline:
+            try:
+                deadline_journal = _secure_read_json(
+                    _migration_dir(vault) / "publication.json"
+                )
+                deadline_changed = _publication_changed(vault, deadline_journal)
+            except Exception:
+                deadline_changed = False
+            return {
+                "status": "partial",
+                "error_code": "migration_limit_reached",
+                "error_stage": "publication",
+                "limit_kind": "time",
+                "production_changed": deadline_changed,
+            }
         except Exception as exc:
+            try:
+                failed_journal = _secure_read_json(
+                    _migration_dir(vault) / "publication.json"
+                )
+                failed_changed = _publication_changed(vault, failed_journal)
+            except Exception:
+                failed_changed = False
             return {
                 "status": "error",
                 "error_code": "migration_publication_failed",
                 "error_stage": "publication",
                 "error_type": type(exc).__name__,
-                "production_changed": any(entry.get("published") for entry in entries),
+                "production_changed": failed_changed,
             }
         checkpoint["stage"] = "complete"
         _write_checkpoint(vault, checkpoint)
@@ -1399,6 +1710,24 @@ def migrate_notes(
     clock: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     vault = Path(vault_dir)
+    try:
+        vault_metadata = os.lstat(vault)
+    except FileNotFoundError:
+        vault_metadata = None
+    if vault_metadata is not None and (
+        stat.S_ISLNK(vault_metadata.st_mode)
+        or not stat.S_ISDIR(vault_metadata.st_mode)
+    ):
+        return {
+            "status": "error",
+            "error_code": "notes_migration_source_invalid",
+            "production_changed": False,
+        }
+    resolved_limits = limits or MigrationLimits()
+    deadline = _Deadline(
+        clock=clock,
+        expires_at=clock() + resolved_limits.max_seconds,
+    )
     root = _migration_dir(vault)
     lock_path = root / "migration.lock"
     flags = os.O_RDWR | os.O_CREAT
@@ -1427,8 +1756,9 @@ def migrate_notes(
             }
         return _migrate_notes_locked(
             vault,
-            limits=limits,
+            limits=resolved_limits,
             boundary=boundary,
+            deadline=deadline,
             clock=clock,
         )
     finally:
@@ -1443,7 +1773,6 @@ def migrate_notes(
 def reset_migration_scratch(vault_dir: Path, *, run_id: str) -> dict[str, Any]:
     vault = Path(vault_dir)
     root = _migration_dir(vault)
-    root.mkdir(parents=True, exist_ok=True)
     lock_path = root / "migration.lock"
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):

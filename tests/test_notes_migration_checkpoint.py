@@ -337,6 +337,7 @@ def test_publication_journal_rejects_paths_outside_vault(tmp_path):
 
     assert result["status"] == "error"
     assert result["error_code"] == "migration_publication_failed"
+    assert result["production_changed"] is False
     assert outside.read_text(encoding="utf-8") == "do not replace\n"
 
 
@@ -626,6 +627,7 @@ def test_crash_before_first_replace_revalidates_snapshot_on_recovery(
     resumed = module.migrate_notes(vault)
 
     assert failed["status"] == "error"
+    assert failed["production_changed"] is False
     assert resumed["status"] == "error"
     assert resumed["error_code"] == "migration_publication_failed"
     assert rows(vault / "index.jsonl") == [original, original, late]
@@ -1010,3 +1012,229 @@ def test_publication_capacity_gate_fails_before_replace(tmp_path, monkeypatch):
     assert result["error_stage"] == "publication"
     assert result["production_changed"] is False
     assert (vault / "index.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("source_kind", ["index_symlink", "daily_symlink"])
+def test_source_discovery_rejects_root_escape_symlinks(tmp_path, source_kind):
+    module = migration()
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_index = outside / "index.jsonl"
+    write_rows(outside_index, [note("outside", "outside")])
+    vault.mkdir()
+    if source_kind == "index_symlink":
+        (vault / "index.jsonl").symlink_to(outside_index)
+    else:
+        (outside / "daily").mkdir()
+        write_rows(outside / "daily" / "2026-07-19.jsonl", [note("outside", "outside")])
+        (vault / "daily").symlink_to(outside / "daily", target_is_directory=True)
+    before = outside_index.read_bytes()
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_source_invalid"
+    assert result["production_changed"] is False
+    assert outside_index.read_bytes() == before
+
+
+def test_migration_rejects_symlinked_vault_root_before_creating_lock(tmp_path):
+    module = migration()
+    outside_vault = tmp_path / "outside-vault"
+    write_rows(outside_vault / "index.jsonl", [note("outside", "outside")])
+    vault = tmp_path / "vault"
+    vault.symlink_to(outside_vault, target_is_directory=True)
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_source_invalid"
+    assert not (outside_vault / "notes").exists()
+
+
+def test_checkpoint_symlink_is_not_followed(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "one")])
+    root = vault / "notes" / "migration"
+    root.mkdir(parents=True)
+    outside = tmp_path / "outside-checkpoint.json"
+    outside.write_text(
+        json.dumps({"migration_version": module.MIGRATION_VERSION}),
+        encoding="utf-8",
+    )
+    (root / "checkpoint.json").symlink_to(outside)
+    before = outside.read_bytes()
+
+    result = module.migrate_notes(vault)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_scratch_invalid"
+    assert outside.read_bytes() == before
+
+
+def test_resume_rejects_catalog_symlink_without_following_sqlite(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "content larger than limit")])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=10, max_bytes=10, max_seconds=30),
+    )
+    catalog = vault / "notes" / "migration" / "catalog.sqlite3"
+    catalog.unlink()
+    outside = tmp_path / "outside.sqlite3"
+    outside.write_bytes(b"do not open as sqlite")
+    catalog.symlink_to(outside)
+    before = outside.read_bytes()
+
+    result = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_scratch_invalid"
+    assert outside.read_bytes() == before
+
+
+def test_catalog_replacement_between_open_and_sqlite_connect_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    module = migration()
+    catalog = tmp_path / "catalog.sqlite3"
+    connection = module._connect_catalog(catalog, reset=True)
+    connection.close()
+    outside = tmp_path / "outside.sqlite3"
+    outside_connection = sqlite3.connect(outside)
+    outside_connection.execute("CREATE TABLE sentinel(value TEXT)")
+    outside_connection.commit()
+    outside_connection.close()
+    before = outside.read_bytes()
+    real_connect = module.sqlite3.connect
+    swapped = {"done": False}
+
+    def swap_before_connect(path, *args, **kwargs):
+        if Path(path) == catalog and not swapped["done"]:
+            swapped["done"] = True
+            catalog.unlink()
+            catalog.symlink_to(outside)
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.sqlite3, "connect", swap_before_connect)
+
+    with pytest.raises(OSError, match="migration_catalog_replaced"):
+        module._connect_catalog(catalog, reset=False)
+    assert outside.read_bytes() == before
+
+
+def test_reset_does_not_mkdir_through_migration_root_symlink(tmp_path, monkeypatch):
+    module = migration()
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside-migration"
+    outside.mkdir()
+    (vault / "notes").mkdir(parents=True)
+    root = vault / "notes" / "migration"
+    root.symlink_to(outside, target_is_directory=True)
+    real_mkdir = Path.mkdir
+
+    def reject_root_mkdir(path, *args, **kwargs):
+        if path == root:
+            raise AssertionError("must not mkdir through migration root symlink")
+        return real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", reject_root_mkdir)
+    result = module.reset_migration_scratch(vault, run_id="run")
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "notes_migration_busy"
+
+
+def test_unified_deadline_stops_after_staging_hash_before_replace(
+    tmp_path,
+    monkeypatch,
+):
+    module = migration()
+    vault = tmp_path / "vault"
+    duplicate = note("one", "one")
+    write_rows(vault / "index.jsonl", [duplicate, duplicate])
+    before = (vault / "index.jsonl").read_bytes()
+    now = {"value": 0.0}
+    real_hash = module._hash_file
+
+    def expire_after_staging_hash(path, *args, **kwargs):
+        result = real_hash(path, *args, **kwargs)
+        if Path(path).parent.name == "staging":
+            now["value"] = 2.0
+        return result
+
+    monkeypatch.setattr(module, "_hash_file", expire_after_staging_hash)
+    result = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_seconds=1),
+        clock=lambda: now["value"],
+    )
+
+    assert result["status"] == "partial"
+    assert result["error_code"] == "migration_limit_reached"
+    assert result["limit_kind"] == "time"
+    assert result["production_changed"] is False
+    assert (vault / "index.jsonl").read_bytes() == before
+
+
+def test_unified_deadline_covers_publication_source_sha_before_replace(
+    tmp_path,
+    monkeypatch,
+):
+    module = migration()
+    vault = tmp_path / "vault"
+    duplicate = note("one", "one")
+    write_rows(vault / "index.jsonl", [duplicate, duplicate])
+    before = (vault / "index.jsonl").read_bytes()
+    now = {"value": 0.0}
+    calls = {"count": 0}
+    real_fingerprint = module._source_fingerprint
+
+    def expire_on_publication_fingerprint(path, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            now["value"] = 2.0
+        return real_fingerprint(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        module,
+        "_source_fingerprint",
+        expire_on_publication_fingerprint,
+    )
+    result = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_seconds=1),
+        clock=lambda: now["value"],
+    )
+
+    assert result["status"] == "partial"
+    assert result["error_code"] == "migration_limit_reached"
+    assert result["error_stage"] == "publication"
+    assert result["production_changed"] is False
+    assert (vault / "index.jsonl").read_bytes() == before
+
+
+def test_deadline_does_not_interrupt_roll_forward_after_first_replace(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    duplicate = note("one", "one")
+    write_rows(vault / "index.jsonl", [duplicate, duplicate])
+
+    def interrupt(stage):
+        if stage.startswith("publication_replaced:"):
+            raise RuntimeError("injected")
+
+    failed = module.migrate_notes(vault, boundary=interrupt)
+    resumed = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_seconds=0),
+        clock=lambda: 100.0,
+    )
+
+    assert failed["production_changed"] is True
+    assert resumed["status"] == "ok"
