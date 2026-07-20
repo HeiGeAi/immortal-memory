@@ -5,6 +5,7 @@ import json
 import sys
 import tarfile
 import zipfile
+import stat
 from pathlib import Path
 
 import pytest
@@ -258,3 +259,96 @@ def test_unreadable_file_fails_closed(tmp_path, monkeypatch):
     assert result["errors"] == [
         {"path": str(target), "member": None, "rule": "file_unreadable"}
     ]
+
+
+def test_sensitive_regular_filename_is_scanned_without_leaking_name(tmp_path):
+    secret_name = "AKIA" + "IOSFODNN7EXAMPLE" + ".txt"
+    (tmp_path / secret_name).write_text("clean", encoding="utf-8")
+
+    result = private_scan.scan_paths([tmp_path])
+    dumped = json.dumps(result)
+
+    assert secret_name not in dumped
+    hit = next(hit for hit in result["hits"] if hit["rule"] == "aws_access_key")
+    assert hit["path"].startswith("path[")
+    assert len(hit["path_sha256_16"]) == 16
+
+
+def test_worktree_symlink_name_and_target_are_scanned_without_leaking(tmp_path):
+    secret_name = "AKIA" + "IOSFODNN7EXAMPLE"
+    link = tmp_path / (secret_name + ".link")
+    link.symlink_to("../" + secret_name)
+
+    result = private_scan.scan_paths([tmp_path])
+    dumped = json.dumps(result)
+
+    assert secret_name not in dumped
+    assert any(hit["rule"] == "aws_access_key" for hit in result["hits"])
+
+
+def test_zip_directories_consume_budget_and_sensitive_name_is_redacted(tmp_path, monkeypatch):
+    artifact = tmp_path / "directories.zip"
+    secret_dir = "AKIA" + "IOSFODNN7EXAMPLE" + "/"
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(secret_dir, b"")
+        archive.writestr("second/", b"")
+    monkeypatch.setattr(private_scan, "MAX_ARCHIVE_MEMBERS", 1)
+
+    result = private_scan.scan_paths([artifact])
+    dumped = json.dumps(result)
+
+    assert secret_dir not in dumped
+    assert any(hit["rule"] == "aws_access_key" for hit in result["hits"])
+    assert any(error["rule"] == "archive_member_limit_exceeded" for error in result["errors"])
+
+
+@pytest.mark.parametrize(
+    "member_type",
+    [
+        tarfile.DIRTYPE,
+        tarfile.SYMTYPE,
+        tarfile.LNKTYPE,
+        tarfile.FIFOTYPE,
+        tarfile.CHRTYPE,
+        tarfile.BLKTYPE,
+    ],
+)
+def test_tar_non_regular_members_are_budgeted_and_fail_closed_when_unsafe(
+    tmp_path, member_type
+):
+    artifact = tmp_path / "metadata.tar"
+    secret_name = "AKIA" + "IOSFODNN7EXAMPLE"
+    with tarfile.open(artifact, "w") as archive:
+        info = tarfile.TarInfo(secret_name)
+        info.type = member_type
+        if member_type in {tarfile.SYMTYPE, tarfile.LNKTYPE}:
+            info.linkname = "../" + secret_name
+        archive.addfile(info)
+
+    result = private_scan.scan_paths([artifact])
+    dumped = json.dumps(result)
+
+    assert secret_name not in dumped
+    assert any(hit["rule"] == "aws_access_key" for hit in result["hits"])
+    if member_type != tarfile.DIRTYPE:
+        assert any(
+            error["rule"] == "archive_non_regular_member"
+            for error in result["errors"]
+        )
+
+
+def test_zip_symlink_member_is_rejected_and_target_scanned(tmp_path):
+    artifact = tmp_path / "symlink.zip"
+    secret_target = "../" + "AKIA" + "IOSFODNN7EXAMPLE"
+    info = zipfile.ZipInfo("link")
+    info.create_system = 3
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(artifact, "w") as archive:
+        archive.writestr(info, secret_target)
+
+    result = private_scan.scan_paths([artifact])
+    dumped = json.dumps(result)
+
+    assert secret_target not in dumped
+    assert any(hit["rule"] == "aws_access_key" for hit in result["hits"])
+    assert any(error["rule"] == "archive_non_regular_member" for error in result["errors"])

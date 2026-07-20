@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import sys
 import tarfile
 import time
@@ -79,13 +80,14 @@ class ScanBudget:
 
 
 def iter_files(root: Path):
-    if root.is_file() and not root.is_symlink():
+    if root.is_file() or root.is_symlink():
         yield root
         return
     for path in root.rglob("*"):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
         if path.is_symlink():
+            yield path
             continue
         if path.is_file():
             yield path
@@ -147,6 +149,35 @@ def _scan_text(
     return hits
 
 
+def _safe_member_identity(
+    name: str,
+    *,
+    member_index: int,
+    member_prefix: str,
+    display_path: str,
+    extra_patterns: Iterable[str],
+) -> tuple[str, str | None, list[dict[str, str | None]]]:
+    rules = _matching_rules(
+        name,
+        include_private_literals=True,
+        extra_patterns=extra_patterns,
+    )
+    name_hash = hashlib.sha256(name.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    safe_name = f"member[{member_index}]" if rules else name
+    member_ref = f"{member_prefix}!{safe_name}".lstrip("!")
+    hits: list[dict[str, str | None]] = []
+    for rule in rules:
+        hits.append(
+            {
+                "path": display_path,
+                "member": member_ref,
+                "member_sha256_16": name_hash,
+                "rule": rule,
+            }
+        )
+    return member_ref, name_hash if rules else None, hits
+
+
 def _read_bounded(handle: BinaryIO, declared_size: int | None = None) -> bytes:
     if declared_size is not None and declared_size > MAX_MEMBER_BYTES:
         raise ScanLimitError("archive_member_too_large")
@@ -176,28 +207,46 @@ def _scan_archive_bytes(
         if archive_kind == "zip":
             with zipfile.ZipFile(BytesIO(payload)) as archive:
                 for info in archive.infolist():
-                    if info.is_dir():
-                        continue
                     member_index = budget.consume_member(info.file_size)
-                    name_rules = _matching_rules(
+                    member_ref, name_hash, name_hits = _safe_member_identity(
                         info.filename,
-                        include_private_literals=True,
+                        member_index=member_index,
+                        member_prefix=member_prefix,
+                        display_path=display_path,
                         extra_patterns=extra_patterns,
                     )
-                    name_hash = hashlib.sha256(info.filename.encode("utf-8", errors="ignore")).hexdigest()[:16]
-                    safe_name = f"member[{member_index}]" if name_rules else info.filename
-                    member_ref = f"{member_prefix}!{safe_name}".lstrip("!")
-                    for rule in name_rules:
-                        hits.append(
+                    hits.extend(name_hits)
+                    if info.is_dir():
+                        continue
+                    unix_mode = (info.external_attr >> 16) & 0xFFFF
+                    file_type = stat.S_IFMT(unix_mode)
+                    unsafe_type = bool(
+                        file_type
+                        and file_type not in {stat.S_IFREG, stat.S_IFDIR}
+                    )
+                    with archive.open(info, "r") as handle:
+                        member_payload = _read_bounded(handle, info.file_size)
+                    if unsafe_type:
+                        metadata_text = member_payload.decode("utf-8", errors="ignore")
+                        metadata_hash = hashlib.sha256(member_payload).hexdigest()[:16]
+                        hits.extend(
+                            _scan_text(
+                                metadata_text,
+                                path=display_path,
+                                member=member_ref,
+                                member_sha256_16=metadata_hash,
+                                include_private_literals=True,
+                                extra_patterns=extra_patterns,
+                            )
+                        )
+                        errors.append(
                             {
                                 "path": display_path,
                                 "member": member_ref,
-                                "member_sha256_16": name_hash,
-                                "rule": rule,
+                                "rule": "archive_non_regular_member",
                             }
                         )
-                    with archive.open(info, "r") as handle:
-                        member_payload = _read_bounded(handle, info.file_size)
+                        continue
                     nested_kind = _archive_kind(member_payload, info.filename)
                     if nested_kind:
                         nested_hits, nested_errors = _scan_archive_bytes(
@@ -218,34 +267,49 @@ def _scan_archive_bytes(
                                 text,
                                 path=display_path,
                                 member=member_ref,
-                                member_sha256_16=name_hash if name_rules else None,
+                                member_sha256_16=name_hash,
                                 include_private_literals=True,
                                 extra_patterns=extra_patterns,
                             )
                         )
         else:
-            with tarfile.open(fileobj=BytesIO(payload), mode="r:*") as archive:
-                for info in archive.getmembers():
-                    if not info.isfile():
-                        continue
+            with tarfile.open(fileobj=BytesIO(payload), mode="r|*") as archive:
+                for info in archive:
                     member_index = budget.consume_member(info.size)
-                    name_rules = _matching_rules(
+                    member_ref, name_hash, name_hits = _safe_member_identity(
                         info.name,
-                        include_private_literals=True,
+                        member_index=member_index,
+                        member_prefix=member_prefix,
+                        display_path=display_path,
                         extra_patterns=extra_patterns,
                     )
-                    name_hash = hashlib.sha256(info.name.encode("utf-8", errors="ignore")).hexdigest()[:16]
-                    safe_name = f"member[{member_index}]" if name_rules else info.name
-                    member_ref = f"{member_prefix}!{safe_name}".lstrip("!")
-                    for rule in name_rules:
-                        hits.append(
+                    hits.extend(name_hits)
+                    if info.isdir():
+                        continue
+                    if not info.isfile():
+                        link_target = str(info.linkname or "")
+                        if link_target:
+                            target_hash = hashlib.sha256(
+                                link_target.encode("utf-8", errors="ignore")
+                            ).hexdigest()[:16]
+                            hits.extend(
+                                _scan_text(
+                                    link_target,
+                                    path=display_path,
+                                    member=member_ref,
+                                    member_sha256_16=target_hash,
+                                    include_private_literals=True,
+                                    extra_patterns=extra_patterns,
+                                )
+                            )
+                        errors.append(
                             {
                                 "path": display_path,
                                 "member": member_ref,
-                                "member_sha256_16": name_hash,
-                                "rule": rule,
+                                "rule": "archive_non_regular_member",
                             }
                         )
+                        continue
                     extracted = archive.extractfile(info)
                     if extracted is None:
                         continue
@@ -271,7 +335,7 @@ def _scan_archive_bytes(
                                 text,
                                 path=display_path,
                                 member=member_ref,
-                                member_sha256_16=name_hash if name_rules else None,
+                                member_sha256_16=name_hash,
                                 include_private_literals=True,
                                 extra_patterns=extra_patterns,
                             )
@@ -318,19 +382,57 @@ def scan_paths(
         errors.append({"path": "", "member": None, "rule": "no_scan_targets"})
     for requested in requested_paths:
         root = Path(requested).expanduser()
-        if not root.exists():
+        if not root.exists() and not root.is_symlink():
             errors.append({"path": str(root), "member": None, "rule": "scan_target_missing"})
             continue
         for path in iter_files(root):
             scanned_files += 1
-            display = str(path)
+            raw_display = str(path)
             if root.is_dir():
                 try:
-                    display = path.relative_to(root).as_posix()
+                    raw_display = path.relative_to(root).as_posix()
                 except ValueError:
                     pass
+            path_rules = _matching_rules(
+                raw_display,
+                include_private_literals=True,
+                extra_patterns=patterns,
+            )
+            path_hash = hashlib.sha256(
+                raw_display.encode("utf-8", errors="ignore")
+            ).hexdigest()[:16]
+            display = f"path[{scanned_files}]" if path_rules else raw_display
+            for rule in path_rules:
+                hits.append(
+                    {
+                        "path": display,
+                        "path_sha256_16": path_hash,
+                        "member": None,
+                        "rule": rule,
+                    }
+                )
             try:
                 budget.check_deadline()
+                if path.is_symlink():
+                    link_target = os.readlink(path)
+                    target_hash = hashlib.sha256(
+                        link_target.encode("utf-8", errors="ignore")
+                    ).hexdigest()[:16]
+                    for rule in _matching_rules(
+                        link_target,
+                        include_private_literals=True,
+                        extra_patterns=patterns,
+                    ):
+                        hits.append(
+                            {
+                                "path": display,
+                                "path_sha256_16": path_hash,
+                                "metadata_sha256_16": target_hash,
+                                "member": None,
+                                "rule": rule,
+                            }
+                        )
+                    continue
                 size = path.stat().st_size
                 if size > MAX_ARCHIVE_FILE_BYTES:
                     raise ScanLimitError("file_too_large")

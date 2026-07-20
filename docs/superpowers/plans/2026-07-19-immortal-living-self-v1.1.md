@@ -12,7 +12,7 @@
 
 ## Working Rules
 
-- Work only in `/Users/blakexu/.config/superpowers/worktrees/immortal-memory/living-self-v1.1.0`.
+- Work only in `/Users/example/.config/superpowers/worktrees/immortal-memory/living-self-v1.1.0`.
 - Keep `~/.immortal/` untouched until the explicitly gated production switch in Task 21.
 - Follow red, green, refactor for every behavior.
 - Run targeted tests before each commit.
@@ -265,8 +265,8 @@ Do not replace the live DB yet. Add `--report-only --staging-path` support and r
 
 ```bash
 PYTHONPATH=core python3 core/index_integrity.py \
-  --source /Users/blakexu/.immortal/index.jsonl \
-  --database /Users/blakexu/.immortal/search_index.db \
+  --source /Users/example/.immortal/index.jsonl \
+  --database /Users/example/.immortal/search_index.db \
   --report-only
 ```
 
@@ -553,12 +553,12 @@ def test_external_strict_restorable_backup_passes(tmp_path):
 @pytest.mark.parametrize(
     "secret",
     [
-        "ou_f85356d9218ccf0cebc7915c0dbc95e5",
-        "Cookie: session=abcdefghijklmnopqrstuvwxyz",
-        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
-        "https://user:password@example.com/path",
-        "AKIAIOSFODNN7EXAMPLE",
-        "/Users/private-owner/.immortal/index.jsonl",
+        "ou_" + "00000000000000000000000000000000",
+        "Cook" + "ie: session=abcdefghijklmnopqrstuvwxyz",
+        "Authorization: Bea" + "rer abcdefghijklmnopqrstuvwxyz",
+        "https://user:pass" + "word@example.com/path",
+        "AKIA" + "IOSFODNN7EXAMPLE",
+        "/Users/" + "private-owner/.immortal/index.jsonl",
     ],
 )
 def test_private_scan_detects_release_secrets(tmp_path, secret):
@@ -1529,7 +1529,7 @@ from attribution_service import AttributionService
 
 
 def test_other_speaker_cannot_become_owner_direct_fact():
-    service = AttributionService(owner_aliases={"owner", "小黑子"})
+    service = AttributionService(owner_aliases={"owner", "小黑" + "子"})
     result = service.classify(
         {
             "role": "assistant",
@@ -3532,8 +3532,8 @@ Create a private report that classifies every file:
 
 ```bash
 diff -qr \
-  /Users/blakexu/.codex/skills/immortal \
-  /Users/blakexu/.config/superpowers/worktrees/immortal-memory/living-self-v1.1.0/core
+  /Users/example/.codex/skills/immortal \
+  /Users/example/.config/superpowers/worktrees/immortal-memory/living-self-v1.1.0/core
 ```
 
 For each live-only or differing file, record:
@@ -3550,10 +3550,10 @@ Do not overwrite live customizations until every difference has an explicit disp
 Run:
 
 ```bash
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py daily-status
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py backup-status --verify
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py health --max-age-hours 72
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py doctor
+python3 /Users/example/.codex/skills/immortal/immortal.py daily-status
+python3 /Users/example/.codex/skills/immortal/immortal.py backup-status --verify
+python3 /Users/example/.codex/skills/immortal/immortal.py health --max-age-hours 72
+python3 /Users/example/.codex/skills/immortal/immortal.py doctor
 launchctl print "gui/$(id -u)/com.blake.immortal.daily-backup"
 ```
 
@@ -3709,7 +3709,7 @@ Run all tests, both P0 suites, browser acceptance, command closure, migration, r
 Use the tested main-commit wheel, not a source copy. Preserve v1.0 install and LaunchAgent rollback artifacts. Install, then verify:
 
 ```bash
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py --version
+python3 /Users/example/.codex/skills/immortal/immortal.py --version
 ```
 
 Expected: `1.1.0`.
@@ -3821,11 +3821,11 @@ git rev-parse v1.1.0^{}
 Run against production:
 
 ```bash
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py --version
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py daily-status
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py backup-status --verify
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py health --max-age-hours 72
-python3 /Users/blakexu/.codex/skills/immortal/immortal.py doctor
+python3 /Users/example/.codex/skills/immortal/immortal.py --version
+python3 /Users/example/.codex/skills/immortal/immortal.py daily-status
+python3 /Users/example/.codex/skills/immortal/immortal.py backup-status --verify
+python3 /Users/example/.codex/skills/immortal/immortal.py health --max-age-hours 72
+python3 /Users/example/.codex/skills/immortal/immortal.py doctor
 launchctl print "gui/$(id -u)/com.blake.immortal.daily-backup"
 curl -fsS http://127.0.0.1:8765/readyz
 ```

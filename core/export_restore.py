@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -436,15 +437,11 @@ def migration_backup_gate(
     secret_count = 0
     secret_scan_valid = isinstance(secret_scan, dict) and "unique_candidates" in secret_scan
     if secret_scan_valid:
-        try:
-            raw_secret_count = secret_scan.get("unique_candidates")
-            if isinstance(raw_secret_count, bool):
-                raise ValueError("boolean is not a candidate count")
-            secret_count = int(raw_secret_count)
-            if secret_count < 0:
-                raise ValueError("negative candidate count")
-        except (TypeError, ValueError):
+        raw_secret_count = secret_scan.get("unique_candidates")
+        if type(raw_secret_count) is not int or raw_secret_count < 0:
             secret_scan_valid = False
+        else:
+            secret_count = raw_secret_count
     if not secret_scan_valid:
         blockers.append("secret_scan_invalid")
     elif secret_count > 0 or any("secret_shapes_present" in item for item in warning_codes):
@@ -493,6 +490,126 @@ def read_manifest(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _open_absolute_nofollow(path: Path, *, directory: bool = False) -> int:
+    absolute = path.expanduser().absolute()
+    for alias_text in ("/var", "/tmp", "/etc"):
+        alias = Path(alias_text)
+        try:
+            if alias.is_symlink() and (absolute == alias or alias in absolute.parents):
+                absolute = alias.resolve(strict=True) / absolute.relative_to(alias)
+                break
+        except (OSError, ValueError):
+            continue
+    parts = absolute.parts
+    current_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[1:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if directory:
+            flags |= os.O_DIRECTORY
+        return os.open(parts[-1], flags, dir_fd=current_fd)
+    finally:
+        os.close(current_fd)
+
+
+def _read_json_nofollow(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
+    fd = -1
+    try:
+        fd = _open_absolute_nofollow(path)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            return {}
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if remaining <= 0 or identity_before != identity_after:
+            return {}
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _secure_directory(path: Path) -> bool:
+    fd = -1
+    try:
+        fd = _open_absolute_nofollow(path, directory=True)
+        return stat.S_ISDIR(os.fstat(fd).st_mode)
+    except OSError:
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _secure_file_size_and_sha256(path: Path) -> tuple[int, str] | None:
+    fd = -1
+    try:
+        fd = _open_absolute_nofollow(path)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(fd)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity:
+            return None
+        return before.st_size, digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def resolve_export_path(export_path: str | Path) -> Path:
     path = Path(export_path).expanduser()
     if path.is_file() and path.name == MANIFEST_NAME:
@@ -509,7 +626,17 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
     mismatched: list[dict[str, Any]] = []
     checked_files = 0
 
-    manifest = read_manifest(manifest_path)
+    if not _secure_directory(export_dir):
+        return {
+            "ok": False,
+            "export_dir": str(export_dir),
+            "manifest_path": str(manifest_path),
+            "checked_files": 0,
+            "missing": [],
+            "mismatched": [],
+            "warnings": ["export_path_unsafe"],
+        }
+    manifest = _read_json_nofollow(manifest_path)
     if not manifest:
         return {
             "ok": False,
@@ -559,14 +686,17 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
             missing.append({"relpath": relative, "reason": "missing"})
             continue
 
+        verified = _secure_file_size_and_sha256(path)
+        if verified is None:
+            mismatched.append({"relpath": relative, "reason": "unsafe_or_changed"})
+            continue
         checked_files += 1
-        stat = path.stat()
+        actual_size, actual_hash = verified
         expected_size = item.get("size")
         expected_hash = item.get("sha256")
         problems: dict[str, Any] = {"relpath": relative}
-        if expected_size != stat.st_size:
-            problems["size"] = {"expected": expected_size, "actual": stat.st_size}
-        actual_hash = sha256_file(path)
+        if expected_size != actual_size:
+            problems["size"] = {"expected": expected_size, "actual": actual_size}
         if expected_hash != actual_hash:
             problems["sha256"] = {"expected": expected_hash, "actual": actual_hash}
         if len(problems) > 1:
@@ -604,7 +734,10 @@ def get_migration_backup_status(
 ) -> dict[str, Any]:
     """Strictly verify the exact export recorded by runtime state."""
     vault = vault_path(vault_dir)
-    state = read_manifest(vault / "orchestrator_state.json")
+    if not _secure_directory(vault):
+        state = {}
+    else:
+        state = _read_json_nofollow(vault / "orchestrator_state.json")
     raw_export_dir = state.get("last_portable_export_dir") if state else None
 
     def failed(reason: str) -> dict[str, Any]:
@@ -627,20 +760,13 @@ def get_migration_backup_status(
     if not isinstance(raw_export_dir, str) or not raw_export_dir.strip():
         return failed("state_export_missing")
     requested = Path(raw_export_dir).expanduser()
-    if (
-        not requested.is_absolute()
-        or requested.is_symlink()
-        or not requested.name.startswith(EXPORT_PREFIX)
-    ):
+    if not requested.is_absolute() or not requested.name.startswith(EXPORT_PREFIX):
         return failed("state_export_path_invalid")
-    try:
-        export_dir = requested.resolve(strict=True)
-    except OSError:
+    if not _secure_directory(requested):
         return failed("state_export_path_missing")
-    if not export_dir.is_dir():
-        return failed("state_export_path_invalid")
+    export_dir = requested.absolute()
 
-    manifest = read_manifest(export_dir / MANIFEST_NAME)
+    manifest = _read_json_nofollow(export_dir / MANIFEST_NAME)
     if not manifest:
         return failed("state_export_manifest_missing_or_invalid")
     manifest_export = manifest.get("export_dir")

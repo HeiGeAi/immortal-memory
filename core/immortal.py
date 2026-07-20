@@ -1752,11 +1752,14 @@ def command_migration_preflight(args) -> int:
     status["health"] = {"ok": health_ok}
     status["index_parity"] = {"ok": parity_ok}
     secret_scan = status.get("secret_scan")
-    try:
-        if not isinstance(secret_scan, dict):
-            raise TypeError("secret scan evidence is not a mapping")
-        secret_candidates = int(secret_scan.get("unique_candidates"))
-    except (TypeError, ValueError):
+    raw_secret_candidates = (
+        secret_scan.get("unique_candidates")
+        if isinstance(secret_scan, dict)
+        else None
+    )
+    if type(raw_secret_candidates) is int and raw_secret_candidates >= 0:
+        secret_candidates = raw_secret_candidates
+    else:
         secret_candidates = 1
 
     result = migration_backup_gate(

@@ -106,7 +106,18 @@ def test_missing_timestamp_health_and_index_evidence_fail_closed():
 
 @pytest.mark.parametrize(
     "secret_scan",
-    [None, "invalid", [], {}, {"unique_candidates": -1}],
+    [
+        None,
+        "invalid",
+        [],
+        {},
+        {"unique_candidates": -1},
+        {"unique_candidates": 0.9},
+        {"unique_candidates": -0.1},
+        {"unique_candidates": "0"},
+        {"unique_candidates": float("nan")},
+        {"unique_candidates": float("inf")},
+    ],
 )
 def test_missing_invalid_or_negative_secret_scan_fails_closed(secret_scan):
     evidence = valid_evidence()
@@ -353,6 +364,76 @@ def test_migration_status_fails_closed_for_missing_or_invalid_state_export(tmp_p
 
     assert status["ok"] is False
     assert status["check"]["ok"] is False
+
+
+def _write_external_migration_evidence(vault, export_dir):
+    vault.mkdir(parents=True, exist_ok=True)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    generated_at = "2026-07-20T03:30:00Z"
+    payload = b"strict proof"
+    (export_dir / "proof.txt").write_bytes(payload)
+    manifest = {
+        "generated_at": generated_at,
+        "vault_dir": str(vault),
+        "export_dir": str(export_dir),
+        "storage_location": "external_disk",
+        "secret_scan": {"unique_candidates": 0},
+        "warnings": [],
+        "items": [
+            {
+                "relpath": "proof.txt",
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        ],
+        "totals": {"files": 1, "bytes": len(payload)},
+    }
+    (export_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    state = {
+        "last_portable_export_dir": str(export_dir),
+        "last_portable_export": generated_at,
+    }
+    (vault / "orchestrator_state.json").write_text(json.dumps(state), encoding="utf-8")
+    return manifest, state
+
+
+def test_migration_status_rejects_symlinked_state_file(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    export_dir = tmp_path / "external" / "immortal-export-state-link"
+    _, state = _write_external_migration_evidence(vault, export_dir)
+    outside_state = tmp_path / "outside-state.json"
+    outside_state.write_text(json.dumps(state), encoding="utf-8")
+    (vault / "orchestrator_state.json").unlink()
+    (vault / "orchestrator_state.json").symlink_to(outside_state)
+    monkeypatch.setattr(export_restore, "classify_storage_location", lambda *args: "external_disk")
+
+    assert export_restore.get_migration_backup_status(vault)["ok"] is False
+
+
+def test_migration_status_rejects_symlinked_manifest_file(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    export_dir = tmp_path / "external" / "immortal-export-manifest-link"
+    manifest, _ = _write_external_migration_evidence(vault, export_dir)
+    outside_manifest = tmp_path / "outside-manifest.json"
+    outside_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    (export_dir / "manifest.json").unlink()
+    (export_dir / "manifest.json").symlink_to(outside_manifest)
+    monkeypatch.setattr(export_restore, "classify_storage_location", lambda *args: "external_disk")
+
+    assert export_restore.get_migration_backup_status(vault)["ok"] is False
+
+
+def test_migration_status_rejects_symlink_in_export_parent_chain(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    real_parent = tmp_path / "real-external"
+    linked_parent = tmp_path / "linked-external"
+    real_parent.mkdir()
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    export_dir = linked_parent / "immortal-export-parent-link"
+    _write_external_migration_evidence(vault, export_dir)
+    monkeypatch.setattr(export_restore, "classify_storage_location", lambda *args: "external_disk")
+
+    assert export_restore.get_migration_backup_status(vault)["ok"] is False
 
 
 def test_migration_preflight_cli_uses_real_temporary_vault_evidence(tmp_path):
