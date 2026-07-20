@@ -118,6 +118,46 @@ CONTEXT_ITEM_FIELDS = frozenset(
         "summary",
         "privacy",
         "evidence_ids",
+        "claim_ids",
+    }
+)
+CONTEXT_PACK_FIELDS = frozenset(
+    {
+        "context_id",
+        "task",
+        "mode",
+        "lifecycle_status",
+        "availability_status",
+        "budget",
+        "sections",
+        "provenance",
+        "privacy_policy",
+        "source_revision",
+        "preview_hash",
+        "content_hash",
+        "generated_at",
+        "expires_at",
+    }
+)
+CONTEXT_BUDGET_FIELDS = frozenset(
+    {"max_chars", "used_chars", "max_bytes", "used_bytes"}
+)
+CONTEXT_PROVENANCE_FIELDS = frozenset(
+    {
+        "evidence_ids",
+        "claim_ids",
+        "self_model_item_ids",
+        "judgment_card_ids",
+    }
+)
+CONTEXT_PRIVACY_POLICY_FIELDS = frozenset({"excluded_count", "reasons"})
+CONTEXT_SOURCE_REVISION_FIELDS = frozenset(
+    {
+        "claims_event_seq",
+        "living_self_version",
+        "judgments_event_seq",
+        "compiler_version",
+        "policy_version",
     }
 )
 CONTEXT_SECTION_CONTRACTS = {
@@ -184,6 +224,18 @@ def _require_fields(value: Mapping[str, Any], fields: Iterable[str]) -> None:
     for field in fields:
         if field not in value:
             raise ModelValidationError("missing_field", "missing required field: " + field)
+
+
+def _require_exact_fields(
+    value: Mapping[str, Any],
+    fields: Iterable[str],
+    *,
+    code: str,
+) -> None:
+    expected = frozenset(fields)
+    _require_fields(value, expected)
+    if set(value) != expected:
+        raise ModelValidationError(code, "model contains unsupported fields")
 
 
 def _require_text(value: Any, code: str, field: str) -> None:
@@ -489,7 +541,7 @@ def new_claim(
     privacy: str = "restricted",
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
-    generated = now or _now()
+    generated = _now() if now is None else now
     if (
         confidence_basis is None
         and isinstance(confidence, (int, float))
@@ -672,7 +724,7 @@ def new_event(
         "request_id": request_id,
         "idempotency_key": idempotency_key,
         "actor": _copy_mapping(actor, "invalid_actor", "actor"),
-        "occurred_at": now or _now(),
+        "occurred_at": _now() if now is None else now,
         "expected_version": expected_version,
         "payload": _copy_mapping(payload, "invalid_payload", "payload"),
         "previous_status": previous_status,
@@ -771,7 +823,7 @@ def new_evidence_ref(
         "raw_id": raw_id,
         "content_hash": content_hash,
         "status": status,
-        "observed_at": observed_at or _now(),
+        "observed_at": _now() if observed_at is None else observed_at,
         "privacy": privacy,
     }
     if resolved_detail is not None:
@@ -904,18 +956,14 @@ def validate_self_model_item(value: Mapping[str, Any]) -> None:
         "invalid_owner_confirmation_ref",
         "owner_confirmation_ref",
     )
-    if (
-        item["owner_confirmation_ref"] is not None
-        and not item["owner_confirmation_ref"].startswith("evt_")
-    ):
+    if item["owner_confirmation_ref"] is not None:
         raise ModelValidationError(
-            "invalid_owner_confirmation_ref",
-            "owner confirmation must reference a stable event ID",
+            "unverified_owner_confirmation",
+            "owner confirmation must be verified by the Living Self service",
         )
     if (
         item["kind"] == "mental_model"
         and item["status"] == "confirmed"
-        and item["owner_confirmation_ref"] is None
         and (
             validation["cross_domain_recurrence"] < 2
             or validation["generative_power"] != "tested"
@@ -964,7 +1012,7 @@ def new_self_model_item(
     owner_confirmation_ref: Optional[str] = None,
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
-    generated = now or _now()
+    generated = _now() if now is None else now
     value = {
         "schema_version": 1,
         "revision": 1,
@@ -1009,10 +1057,12 @@ def new_self_model_item(
             if domain_scope is not None
             else ["general"]
         ),
-        "valid_from": valid_from or generated,
+        "valid_from": generated if valid_from is None else valid_from,
         "valid_to": valid_to,
         "status": status,
-        "last_reviewed_at": last_reviewed_at or generated,
+        "last_reviewed_at": (
+            generated if last_reviewed_at is None else last_reviewed_at
+        ),
         "based_on_claim_seq": based_on_claim_seq,
         "owner_confirmation_ref": owner_confirmation_ref,
     }
@@ -1090,6 +1140,23 @@ def validate_living_self_version(value: Mapping[str, Any]) -> None:
         expected_kind = SELF_MODEL_SECTION_KINDS[section]
         for item in items:
             validate_self_model_item(item)
+            item_valid_from = _parse_timestamp(
+                item["valid_from"],
+                field="valid_from",
+                nullable=True,
+            )
+            item_last_reviewed_at = _parse_timestamp(
+                item["last_reviewed_at"],
+                field="last_reviewed_at",
+            )
+            if (
+                item_valid_from is not None
+                and item_valid_from > generated_at
+            ) or item_last_reviewed_at > generated_at:
+                raise ModelValidationError(
+                    "living_self_item_from_future",
+                    "Living Self version cannot predate an included item",
+                )
             maximum_item_claim_seq = max(
                 maximum_item_claim_seq,
                 int(item["based_on_claim_seq"]),
@@ -1129,7 +1196,7 @@ def new_living_self_version(
     status: str = "candidate",
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
-    generated = now or _now()
+    generated = _now() if now is None else now
     copied_sections = _copy_context_sections(sections)
     calculated_hash = _content_hash(copied_sections)
     value = {
@@ -1250,7 +1317,7 @@ def new_judgment_card(
     status: str = "candidate",
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
-    generated = now or _now()
+    generated = _now() if now is None else now
     value = {
         "card_id": _identifier("jdg_"),
         "title": title.strip() if isinstance(title, str) else title,
@@ -1329,6 +1396,11 @@ def _validate_context_item(section: str, value: Any) -> None:
         "invalid_context_item_contract",
         "evidence_ids",
     )
+    _require_text_list(
+        item["claim_ids"],
+        "invalid_context_item_contract",
+        "claim_ids",
+    )
     contract = CONTEXT_SECTION_CONTRACTS[section]
     for field in ("kind", "status", "source_kind"):
         _require_enum(
@@ -1337,7 +1409,23 @@ def _validate_context_item(section: str, value: Any) -> None:
             "invalid_context_item_contract",
             field,
         )
-    if section != "unknowns" and not item["evidence_ids"]:
+    if (
+        section == "confirmed_self_models"
+        and not item["evidence_ids"]
+        and not item["claim_ids"]
+    ):
+        raise ModelValidationError(
+            "invalid_context_item_contract",
+            "self model context item requires evidence or a claim",
+        )
+    if (
+        section not in {"unknowns", "confirmed_self_models"}
+        and not item["evidence_ids"]
+        and not (
+            section == "verified_facts"
+            and item["source_kind"] == "user_declared"
+        )
+    ):
         raise ModelValidationError(
             "invalid_context_item_contract",
             "context item requires evidence",
@@ -1381,24 +1469,10 @@ def _copy_context_sections(
 
 def validate_context_pack(value: Mapping[str, Any]) -> None:
     pack = _require_mapping(value)
-    _require_fields(
+    _require_exact_fields(
         pack,
-        (
-            "context_id",
-            "task",
-            "mode",
-            "lifecycle_status",
-            "availability_status",
-            "budget",
-            "sections",
-            "provenance",
-            "privacy_policy",
-            "source_revision",
-            "preview_hash",
-            "content_hash",
-            "generated_at",
-            "expires_at",
-        ),
+        CONTEXT_PACK_FIELDS,
+        code="invalid_context_fields",
     )
     _require_text(pack["context_id"], "context_id_required", "context_id")
     _require_text(pack["task"], "task_required", "task")
@@ -1421,9 +1495,10 @@ def validate_context_pack(value: Mapping[str, Any]) -> None:
         "availability_status",
     )
     budget = _require_mapping(pack["budget"])
-    _require_fields(
+    _require_exact_fields(
         budget,
-        ("max_chars", "used_chars", "max_bytes", "used_bytes"),
+        CONTEXT_BUDGET_FIELDS,
+        code="invalid_context_fields",
     )
     _require_positive_int(budget["max_chars"], "invalid_context_budget", "max_chars")
     _require_positive_int(budget["max_bytes"], "invalid_context_budget", "max_bytes")
@@ -1455,31 +1530,28 @@ def validate_context_pack(value: Mapping[str, Any]) -> None:
             "used_bytes does not match the structured Context Pack content",
         )
     provenance = _require_mapping(pack["provenance"])
-    provenance_fields = (
-        "evidence_ids",
-        "claim_ids",
-        "self_model_item_ids",
-        "judgment_card_ids",
+    _require_exact_fields(
+        provenance,
+        CONTEXT_PROVENANCE_FIELDS,
+        code="invalid_context_fields",
     )
-    _require_fields(provenance, provenance_fields)
-    for field in provenance_fields:
+    for field in CONTEXT_PROVENANCE_FIELDS:
         _require_text_list(provenance[field], "invalid_provenance", field)
     policy = _require_mapping(pack["privacy_policy"])
-    _require_fields(policy, ("excluded_count", "reasons"))
+    _require_exact_fields(
+        policy,
+        CONTEXT_PRIVACY_POLICY_FIELDS,
+        code="invalid_context_fields",
+    )
     _require_nonnegative_int(
         policy["excluded_count"], "invalid_privacy_policy", "excluded_count"
     )
     _require_text_list(policy["reasons"], "invalid_privacy_policy", "reasons")
     revision = _require_mapping(pack["source_revision"])
-    _require_fields(
+    _require_exact_fields(
         revision,
-        (
-            "claims_event_seq",
-            "living_self_version",
-            "judgments_event_seq",
-            "compiler_version",
-            "policy_version",
-        ),
+        CONTEXT_SOURCE_REVISION_FIELDS,
+        code="invalid_context_fields",
     )
     _require_nonnegative_int(
         revision["claims_event_seq"], "invalid_source_revision", "claims_event_seq"
@@ -1548,7 +1620,7 @@ def new_context_pack(
     now: Optional[str] = None,
     expires_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    generated = now or _now()
+    generated = _now() if now is None else now
     if expires_at is None:
         generated_time = _parse_timestamp(generated, field="generated_at")
         if generated_time is None:
@@ -1705,7 +1777,7 @@ def new_outcome_event(
             "invalid_typed_refs",
             "challenged_refs",
         ),
-        "created_at": now or _now(),
+        "created_at": _now() if now is None else now,
     }
     validate_outcome_event(value)
     return value

@@ -4,6 +4,7 @@ import json
 import pytest
 
 import model_types
+from evidence_catalog import EvidenceCatalog
 from model_types import (
     ModelValidationError,
     new_claim,
@@ -115,6 +116,7 @@ def context_item(
     summary="已验证事实",
     privacy="context_safe",
     evidence_ids=None,
+    claim_ids=None,
 ):
     return {
         "kind": kind,
@@ -127,6 +129,7 @@ def context_item(
         "evidence_ids": (
             ["ev_raw_1"] if evidence_ids is None else evidence_ids
         ),
+        "claim_ids": [] if claim_ids is None else claim_ids,
     }
 
 
@@ -670,26 +673,28 @@ def test_confirmed_mental_model_requires_threshold_or_owner_confirmation():
         ),
     )
 
-    owner_confirmed = new_self_model_item(
-        kind="mental_model",
-        title="用户手工确认",
-        summary="用户确认后允许跨过自动阈值。",
-        evidence_ids=["ev_raw_1"],
-        claim_ids=[],
-        confidence=0.8,
-        validation={
-            "cross_domain_recurrence": 0,
-            "generative_power": "untested",
-            "distinctiveness": "low",
-        },
-        owner_confirmation_ref="evt_owner_confirm_1",
-        status="confirmed",
-        now="2026-07-20T00:00:00+00:00",
+    assert_error(
+        "unverified_owner_confirmation",
+        lambda: new_self_model_item(
+            kind="mental_model",
+            title="未验证的用户手工确认",
+            summary="纯模型契约不能只凭事件 ID 前缀绕过阈值。",
+            evidence_ids=["ev_raw_1"],
+            claim_ids=[],
+            confidence=0.8,
+            validation={
+                "cross_domain_recurrence": 0,
+                "generative_power": "untested",
+                "distinctiveness": "low",
+            },
+            owner_confirmation_ref="evt_owner_confirm_1",
+            status="confirmed",
+            now="2026-07-20T00:00:00+00:00",
+        ),
     )
-    validate_self_model_item(owner_confirmed)
 
     assert_error(
-        "invalid_owner_confirmation_ref",
+        "unverified_owner_confirmation",
         lambda: new_self_model_item(
             kind="mental_model",
             title="伪造确认引用",
@@ -702,7 +707,7 @@ def test_confirmed_mental_model_requires_threshold_or_owner_confirmation():
                 "generative_power": "untested",
                 "distinctiveness": "low",
             },
-            owner_confirmation_ref="not-an-event",
+            owner_confirmation_ref="evt_forged",
             status="confirmed",
             now="2026-07-20T00:00:00+00:00",
         ),
@@ -795,6 +800,37 @@ def test_confirmed_living_self_rejects_inactive_items_and_future_watermarks():
             based_on_claim_seq=1,
             status="candidate",
             now="2026-07-20T00:00:00+00:00",
+        ),
+    )
+
+
+def test_living_self_version_cannot_predate_included_item():
+    future_item = new_self_model_item(
+        kind="value",
+        title="未来条目",
+        summary="版本不能包含未来才生成或复核的模型项。",
+        evidence_ids=["ev_raw_1"],
+        claim_ids=[],
+        now="2099-01-01T00:00:00+00:00",
+    )
+    sections = {
+        "identity_commitments": [],
+        "values": [future_item],
+        "expression_dna": [],
+        "mental_models": [],
+        "decision_heuristics": [],
+        "anti_patterns": [],
+        "tensions": [],
+        "honest_boundaries": [],
+    }
+
+    assert_error(
+        "living_self_item_from_future",
+        lambda: new_living_self_version(
+            sections=sections,
+            generation_reason="claim_change",
+            based_on_claim_seq=0,
+            now="2026-01-01T00:00:00+00:00",
         ),
     )
 
@@ -1045,6 +1081,36 @@ def test_context_sections_use_closed_safe_projection_contracts():
     )
 
 
+@pytest.mark.parametrize(
+    "container",
+    [
+        "pack",
+        "budget",
+        "provenance",
+        "privacy_policy",
+        "source_revision",
+    ],
+)
+def test_context_all_containers_reject_unknown_nested_private_fields(container):
+    pack = context_pack()
+    private_extra = {
+        "privacy": "private",
+        "raw_body": "TOP-SECRET",
+    }
+    if container == "pack":
+        pack["metadata"] = private_extra
+    else:
+        pack[container]["metadata"] = private_extra
+    pack["content_hash"] = model_types._content_hash(
+        {key: value for key, value in pack.items() if key != "content_hash"}
+    )
+
+    assert_error(
+        "invalid_context_fields",
+        lambda: validate_context_pack(pack),
+    )
+
+
 def test_context_section_kind_status_and_source_kind_must_match():
     inferred_candidate = context_item(
         status="candidate",
@@ -1107,6 +1173,101 @@ def test_context_section_kind_status_and_source_kind_must_match():
                 "inferences": [],
                 "unknowns": [],
             },
+            now="2099-07-20T00:00:00+00:00",
+            expires_at="2099-07-20T01:00:00+00:00",
+        ),
+    )
+
+
+def test_context_projection_accepts_user_declared_claim_without_evidence():
+    declared = new_claim(
+        statement="用户明确声明",
+        source_kind="user_declared",
+        evidence_ids=[],
+        status="confirmed",
+        now="2026-07-20T00:00:00+00:00",
+    )
+    sections = {
+        "verified_facts": [
+            context_item(
+                item_id=declared["claim_id"],
+                source_kind="user_declared",
+                evidence_ids=[],
+            )
+        ],
+        "confirmed_self_models": [],
+        "judgment_cards": [],
+        "counter_evidence": [],
+        "inferences": [],
+        "unknowns": [],
+    }
+
+    pack = new_context_pack(
+        task="Task 9 用户声明投影",
+        mode="reviewer",
+        living_self_version="lsv_1",
+        sections=sections,
+        now="2099-07-20T00:00:00+00:00",
+        expires_at="2099-07-20T01:00:00+00:00",
+    )
+
+    assert pack["sections"]["verified_facts"][0]["evidence_ids"] == []
+
+
+def test_context_self_model_projection_accepts_evidence_or_claim_source():
+    evidence_backed = context_item(
+        kind="self_model",
+        item_id="self_evidence",
+        status="confirmed",
+        source_kind="self_model",
+        evidence_ids=["ev_raw_1"],
+        claim_ids=[],
+    )
+    claim_backed = context_item(
+        kind="self_model",
+        item_id="self_claim",
+        status="confirmed",
+        source_kind="self_model",
+        evidence_ids=[],
+        claim_ids=["clm_1"],
+    )
+    sections = {
+        "verified_facts": [],
+        "confirmed_self_models": [evidence_backed, claim_backed],
+        "judgment_cards": [],
+        "counter_evidence": [],
+        "inferences": [],
+        "unknowns": [],
+    }
+
+    pack = new_context_pack(
+        task="Task 9 模型投影",
+        mode="reviewer",
+        living_self_version="lsv_1",
+        sections=sections,
+        now="2099-07-20T00:00:00+00:00",
+        expires_at="2099-07-20T01:00:00+00:00",
+    )
+    assert len(pack["sections"]["confirmed_self_models"]) == 2
+
+    empty = copy.deepcopy(sections)
+    empty["confirmed_self_models"] = [
+        context_item(
+            kind="self_model",
+            item_id="self_empty",
+            status="confirmed",
+            source_kind="self_model",
+            evidence_ids=[],
+            claim_ids=[],
+        )
+    ]
+    assert_error(
+        "invalid_context_item_contract",
+        lambda: new_context_pack(
+            task="拒绝无来源模型",
+            mode="reviewer",
+            living_self_version="lsv_1",
+            sections=empty,
             now="2099-07-20T00:00:00+00:00",
             expires_at="2099-07-20T01:00:00+00:00",
         ),
@@ -1426,3 +1587,118 @@ def test_falsey_non_list_inputs_are_not_silently_coerced(operation):
     with pytest.raises(ModelValidationError) as exc_info:
         operation()
     assert exc_info.value.code
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda: new_claim(
+            statement="falsey now",
+            source_kind="user_declared",
+            evidence_ids=[],
+            now=0,
+        ),
+        lambda: new_event(
+            event_type="claim.created",
+            stream_id="clm_1",
+            stream_version=1,
+            expected_version=0,
+            request_id="req-1",
+            idempotency_key="idem-1",
+            actor={"kind": "owner", "id": "owner"},
+            payload={},
+            now=False,
+        ),
+        lambda: new_evidence_ref(
+            evidence_id="ev_1",
+            source="codex",
+            raw_id="raw-1",
+            content_hash="sha256:" + "a" * 64,
+            status="available",
+            privacy="restricted",
+            observed_at=False,
+        ),
+        lambda: new_self_model_item(
+            kind="value",
+            title="falsey now",
+            summary="不得静默使用当前时间。",
+            evidence_ids=["ev_1"],
+            claim_ids=[],
+            now=0,
+        ),
+        lambda: new_living_self_version(
+            sections={
+                "identity_commitments": [],
+                "values": [],
+                "expression_dna": [],
+                "mental_models": [],
+                "decision_heuristics": [],
+                "anti_patterns": [],
+                "tensions": [],
+                "honest_boundaries": [],
+            },
+            generation_reason="claim_change",
+            based_on_claim_seq=0,
+            now=False,
+        ),
+        lambda: new_judgment_card(
+            title="falsey now",
+            situation="输入验证",
+            decision="拒绝错误时间",
+            evidence_ids=["ev_1"],
+            now=0,
+        ),
+        lambda: new_context_pack(
+            task="falsey now",
+            mode="reviewer",
+            living_self_version="lsv_1",
+            now=False,
+        ),
+        lambda: new_outcome_event(
+            context_id="ctx_1",
+            now=0,
+        ),
+    ],
+)
+def test_falsey_time_inputs_are_not_silently_replaced(operation):
+    with pytest.raises(ModelValidationError) as exc_info:
+        operation()
+    assert exc_info.value.code
+
+
+def test_evidence_catalog_uses_public_canonical_source_mapping(tmp_path):
+    sources = [
+        "codex-conversation",
+        "claude-code-paste-cache",
+        "lark-im",
+        "web-history",
+        "obsidian-note",
+        "desktop-output",
+        "immortal-smoke",
+        "hermes-conversation",
+    ]
+    index = tmp_path / "index.jsonl"
+    records = [
+        {
+            "id": f"raw-{number}",
+            "source": source,
+            "timestamp": "2026-07-20T00:00:00+00:00",
+            "content": f"事实 {number}",
+        }
+        for number, source in enumerate(sources)
+    ]
+    index.write_text(
+        "".join(
+            json.dumps(record, ensure_ascii=False) + "\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+    catalog = EvidenceCatalog(index)
+    for number, source in enumerate(sources):
+        ref = catalog.resolve(f"raw-{number}")
+        validate_evidence_ref(ref)
+        assert (ref["source"], ref.get("source_detail")) == (
+            model_types.canonical_evidence_source(source)
+        )
