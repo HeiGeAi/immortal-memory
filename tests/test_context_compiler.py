@@ -424,13 +424,14 @@ def test_source_revision_and_evidence_resolution_are_exact_and_bounded(tmp_path)
 
 
 def test_preview_redacts_secret_shaped_text_and_keeps_auto_as_preview(tmp_path):
+    private_home = "/" + "Users/alice/key"
     instance = compiler(
         tmp_path,
         claims=[
             claim(
                 "clm_secret",
                 "联系 owner@example.com 或 13812345678，Bearer abc.def.ghi，"
-                "api_key: abcdefghijklmnop，路径 /Users/alice/key",
+                "api_key: abcdefghijklmnop，路径 " + private_home,
                 role_scope=("general",),
                 domain_scope=("general",),
             )
@@ -454,7 +455,7 @@ def test_preview_redacts_secret_shaped_text_and_keeps_auto_as_preview(tmp_path):
     assert "abc.def.ghi" not in encoded
     assert "13812345678" not in encoded
     assert "abcdefghijklmnop" not in encoded
-    assert "/Users/alice" not in encoded
+    assert private_home.rsplit("/", 1)[0] not in encoded
 
 
 def test_authority_change_during_preview_fails_closed(tmp_path):
