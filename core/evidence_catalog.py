@@ -1,20 +1,48 @@
 #!/usr/bin/env python3
-"""Bounded safe-metadata catalog for stable JSONL evidence identifiers."""
+"""On-demand stable evidence resolution against an authoritative JSONL source."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import sqlite3
 import stat
+from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+
+from model_types import (
+    ModelValidationError,
+    canonical_evidence_source,
+    new_evidence_ref,
+)
 
 
-DEFAULT_MAX_RECORDS = 100_000
+DEFAULT_MAX_SCAN_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_RECORDS = 1_000_000
 DEFAULT_MAX_LINE_BYTES = 1024 * 1024
-DEFAULT_MAX_SOURCE_BYTES = 256 * 1024 * 1024
+DEFAULT_MAX_FALLBACK_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_FALLBACK_RECORDS = 100_000
+DEFAULT_MAX_CACHE_ENTRIES = 128
+DEFAULT_MAX_BATCH_IDS = 10_000
 MAX_METADATA_CHARS = 512
+
+REQUIRED_DATABASE_META = frozenset(
+    {
+        "last_size",
+        "source_size",
+        "source_dev",
+        "source_ino",
+        "source_mtime_ns",
+        "source_ctime_ns",
+        "prefix_sha256",
+        "indexed_id_count",
+        "last_line",
+        "parity_status",
+    }
+)
 
 
 class EvidenceCatalogError(RuntimeError):
@@ -46,6 +74,11 @@ def _sha256(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _readline(handle: Any, limit: int) -> bytes:
+    """Small seam for deterministic source-growth tests."""
+    return handle.readline(limit)
+
+
 def _required_text(
     value: Any,
     *,
@@ -67,22 +100,6 @@ def _required_text(
             line_number=line_number,
         )
     return normalized
-
-
-def _required_body(
-    value: Any,
-    *,
-    code: str,
-    field: str,
-    line_number: Optional[int] = None,
-) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise EvidenceCatalogError(
-            code,
-            field + " must be a non-empty string",
-            line_number=line_number,
-        )
-    return value
 
 
 def _required_identifier(
@@ -107,26 +124,20 @@ def _required_identifier(
     return value
 
 
-def _normalize_source(raw_source: Any) -> Tuple[str, Optional[str]]:
-    source = _required_text(
-        raw_source,
-        code="invalid_evidence_source",
-        field="source",
-    )
-    lowered = source.casefold()
-    if lowered == "codex" or lowered.startswith("codex-"):
-        return "codex", None
-    if lowered == "claude" or lowered.startswith("claude-"):
-        return "claude", None
-    if lowered in {"feishu", "lark"} or lowered.startswith(("feishu-", "lark-")):
-        return "feishu", None
-    if lowered == "web" or lowered.startswith("web-"):
-        return "web", None
-    if lowered == "local" or lowered.startswith("local-"):
-        return "local", None
-    if lowered == "custom":
-        return "custom", "custom"
-    return "custom", source
+def _required_body(
+    value: Any,
+    *,
+    code: str,
+    field: str,
+    line_number: Optional[int] = None,
+) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise EvidenceCatalogError(
+            code,
+            field + " must be a non-empty string",
+            line_number=line_number,
+        )
+    return value
 
 
 def _decode_record(raw: bytes, line_number: int) -> Mapping[str, Any]:
@@ -147,32 +158,234 @@ def _decode_record(raw: bytes, line_number: int) -> Mapping[str, Any]:
     return value
 
 
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(str(path))
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(str(path)))
+
+
+def _assert_no_symlink_chain(path: Path) -> Path:
+    candidate = _absolute(path)
+    current = candidate
+    while True:
+        try:
+            metadata = os.lstat(str(current))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "path chain cannot be inspected safely",
+            ) from exc
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                raise EvidenceCatalogError(
+                    "unsafe_path",
+                    "symlink paths are not allowed",
+                )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return candidate
+
+
+def _safe_regular_stat(path: Path, *, missing_ok: bool = False) -> Optional[os.stat_result]:
+    candidate = _assert_no_symlink_chain(path)
+    try:
+        metadata = os.lstat(str(candidate))
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise EvidenceCatalogError(
+            "source_unreadable",
+            "required catalog path does not exist",
+        )
+    except OSError as exc:
+        raise EvidenceCatalogError(
+            "source_unreadable",
+            "catalog path cannot be inspected",
+        ) from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise EvidenceCatalogError(
+            "unsafe_path",
+            "catalog paths must be regular files",
+        )
+    return metadata
+
+
+@contextmanager
+def _open_regular_nofollow(path: Path) -> Iterator[Any]:
+    candidate = _assert_no_symlink_chain(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise EvidenceCatalogError(
+            "source_unreadable",
+            "catalog source cannot be opened safely",
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(str(candidate))
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or _signature(opened) != _signature(current)
+        ):
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "catalog source identity changed during open",
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            yield handle
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _readonly_database(path: Path) -> Iterator[sqlite3.Connection]:
+    candidate = _assert_no_symlink_chain(path)
+    metadata = _safe_regular_stat(candidate)
+    assert metadata is not None
+    wal_path = Path(str(candidate) + "-wal")
+    if _lexists(wal_path):
+        wal = _safe_regular_stat(wal_path)
+        if wal is not None and wal.st_size:
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite index has a non-empty WAL",
+            )
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise EvidenceCatalogError(
+            "database_untrusted",
+            "SQLite index cannot be opened safely",
+        ) from exc
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        if _signature(os.fstat(descriptor)) != _signature(metadata):
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "SQLite index identity changed during open",
+            )
+        uri = candidate.as_uri() + "?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=30)
+        connection.execute("PRAGMA query_only=ON")
+        current = os.lstat(str(candidate))
+        if _signature(current) != _signature(metadata):
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "SQLite index identity changed during connect",
+            )
+        yield connection
+        try:
+            after_path = os.lstat(str(candidate))
+        except OSError as exc:
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "SQLite index disappeared during read",
+            ) from exc
+        if (
+            _signature(os.fstat(descriptor)) != _signature(metadata)
+            or _signature(after_path) != _signature(metadata)
+        ):
+            raise EvidenceCatalogError(
+                "unsafe_path",
+                "SQLite index identity changed during read",
+            )
+    except sqlite3.DatabaseError as exc:
+        raise EvidenceCatalogError(
+            "database_untrusted",
+            "SQLite index cannot be queried safely",
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
+        os.close(descriptor)
+
+
 class EvidenceCatalog:
-    """Resolve exact JSONL fact IDs without retaining raw evidence bodies."""
+    """Resolve one stable ID at a time without materializing the full source."""
 
     def __init__(
         self,
         index_path: Path,
         *,
+        database_path: Optional[Path] = None,
+        max_scan_bytes: int = DEFAULT_MAX_SCAN_BYTES,
         max_records: int = DEFAULT_MAX_RECORDS,
         max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
-        max_source_bytes: int = DEFAULT_MAX_SOURCE_BYTES,
+        max_fallback_bytes: int = DEFAULT_MAX_FALLBACK_BYTES,
+        max_fallback_records: int = DEFAULT_MAX_FALLBACK_RECORDS,
+        max_cache_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
+        max_batch_ids: int = DEFAULT_MAX_BATCH_IDS,
     ) -> None:
-        self.index_path = Path(index_path)
+        self.index_path = _absolute(Path(index_path))
+        self.max_scan_bytes = self._positive_limit(
+            max_scan_bytes,
+            "max_scan_bytes",
+        )
         self.max_records = self._positive_limit(max_records, "max_records")
         self.max_line_bytes = self._positive_limit(
             max_line_bytes,
             "max_line_bytes",
         )
-        self.max_source_bytes = self._positive_limit(
-            max_source_bytes,
-            "max_source_bytes",
+        self.max_fallback_bytes = self._positive_limit(
+            max_fallback_bytes,
+            "max_fallback_bytes",
         )
-        self._entries: Dict[str, Dict[str, Any]] = {}
-        self._source_signature: Optional[Tuple[int, int, int, int, int]] = None
-        self._source_digest: Optional[str] = None
-        if self.index_path.exists():
-            self._load()
+        self.max_fallback_records = self._positive_limit(
+            max_fallback_records,
+            "max_fallback_records",
+        )
+        self.max_cache_entries = self._positive_limit(
+            max_cache_entries,
+            "max_cache_entries",
+        )
+        self.max_batch_ids = self._positive_limit(
+            max_batch_ids,
+            "max_batch_ids",
+        )
+        self._resolved_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        source_stat = _safe_regular_stat(self.index_path, missing_ok=True)
+        self._source_signature = (
+            _signature(source_stat) if source_stat is not None else None
+        )
+        self._source_size = int(source_stat.st_size) if source_stat is not None else 0
+
+        explicit_database = database_path is not None
+        candidate_database = (
+            _absolute(Path(database_path))
+            if explicit_database
+            else self.index_path.with_name("search_index.db")
+        )
+        if explicit_database or _lexists(candidate_database):
+            self.database_path: Optional[Path] = candidate_database
+        else:
+            self.database_path = None
+        self._database_signature: Optional[Tuple[int, int, int, int, int]] = None
+        self._database_meta: Dict[str, str] = {}
+        if self.database_path is not None:
+            if source_stat is None:
+                raise EvidenceCatalogError(
+                    "database_stale",
+                    "SQLite index cannot be trusted without its JSONL source",
+                )
+            self._verify_database_revision(source_stat)
 
     @staticmethod
     def _positive_limit(value: Any, name: str) -> int:
@@ -187,142 +400,370 @@ class EvidenceCatalog:
             )
         return value
 
-    def _load(self) -> None:
+    def _verify_database_revision(self, source_stat: os.stat_result) -> None:
+        assert self.database_path is not None
+        database_stat = _safe_regular_stat(self.database_path)
+        assert database_stat is not None
         try:
-            before = self.index_path.stat()
-        except OSError as exc:
-            raise EvidenceCatalogError(
-                "source_unreadable",
-                "evidence source cannot be inspected",
-            ) from exc
-        if not stat.S_ISREG(before.st_mode):
-            raise EvidenceCatalogError(
-                "source_unreadable",
-                "evidence source must be a regular file",
-            )
-        if before.st_size > self.max_source_bytes:
-            raise EvidenceCatalogError(
-                "catalog_limit_exceeded",
-                "evidence source exceeds the bounded scan size",
-            )
-
-        entries: Dict[str, Dict[str, Any]] = {}
-        digest = hashlib.sha256()
-        bytes_read = 0
-        try:
-            with self.index_path.open("rb") as handle:
-                if _signature(os.fstat(handle.fileno())) != _signature(before):
+            with _readonly_database(self.database_path) as connection:
+                tables = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type='table' AND name IN ('docs','meta')"
+                    )
+                }
+                if tables != {"docs", "meta"}:
                     raise EvidenceCatalogError(
-                        "source_changed",
-                        "evidence source changed before catalog scan",
+                        "database_untrusted",
+                        "SQLite index is missing required tables",
                     )
-                line_number = 0
-                while True:
-                    raw = handle.readline(self.max_line_bytes + 1)
-                    if not raw:
-                        break
-                    line_number += 1
-                    bytes_read += len(raw)
-                    digest.update(raw)
-                    if len(raw) > self.max_line_bytes:
-                        raise EvidenceCatalogError(
-                            "catalog_line_too_large",
-                            "evidence record exceeds the bounded line size",
-                            line_number=line_number,
-                        )
-                    if not raw.endswith(b"\n") or not raw.strip():
-                        raise EvidenceCatalogError(
-                            "malformed_jsonl",
-                            "blank or unterminated JSONL at line "
-                            + str(line_number),
-                            line_number=line_number,
-                        )
-                    if line_number > self.max_records:
-                        raise EvidenceCatalogError(
-                            "catalog_limit_exceeded",
-                            "evidence source exceeds the bounded record count",
-                            line_number=line_number,
-                        )
-                    row = _decode_record(raw[:-1], line_number)
-                    raw_id = _required_identifier(
-                        row.get("id"),
-                        code="missing_evidence_id",
-                        field="id",
-                        line_number=line_number,
+                meta = {
+                    str(key): str(value)
+                    for key, value in connection.execute(
+                        "SELECT key,value FROM meta"
                     )
-                    if raw_id in entries:
-                        raise EvidenceCatalogError(
-                            "duplicate_evidence_id",
-                            "duplicate evidence id at line " + str(line_number),
-                            line_number=line_number,
-                        )
-                    content = _required_body(
-                        row.get("content"),
-                        code="invalid_evidence_record",
-                        field="content",
-                        line_number=line_number,
-                    )
-                    observed_at = _required_text(
-                        row.get("timestamp"),
-                        code="invalid_evidence_record",
-                        field="timestamp",
-                        line_number=line_number,
-                    )
-                    normalized_source, detail = _normalize_source(row.get("source"))
-                    ref: Dict[str, Any] = {
-                        "evidence_id": raw_id,
-                        "source": normalized_source,
-                        "raw_id": raw_id,
-                        "content_hash": _sha256(content),
-                        "status": "available",
-                        "observed_at": observed_at,
-                        "privacy": "restricted",
-                    }
-                    if detail is not None:
-                        ref["source_detail"] = detail
-                    entries[raw_id] = ref
-                after_fd = os.fstat(handle.fileno())
+                }
         except EvidenceCatalogError:
             raise
-        except OSError as exc:
+        if not REQUIRED_DATABASE_META.issubset(meta):
             raise EvidenceCatalogError(
-                "source_unreadable",
-                "evidence source cannot be read",
-            ) from exc
-
-        try:
-            after_path = self.index_path.stat()
-        except OSError as exc:
-            raise EvidenceCatalogError(
-                "source_changed",
-                "evidence source disappeared during catalog scan",
-            ) from exc
-        expected = _signature(before)
-        if (
-            _signature(after_fd) != expected
-            or _signature(after_path) != expected
-            or bytes_read != before.st_size
-        ):
-            raise EvidenceCatalogError(
-                "source_changed",
-                "evidence source changed during catalog scan",
+                "database_untrusted",
+                "SQLite index is missing trusted revision metadata",
             )
-        self._entries = entries
-        self._source_signature = expected
-        self._source_digest = digest.hexdigest()
+        if meta["parity_status"] != "trusted":
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite index parity is not trusted",
+            )
+        digest = meta["prefix_sha256"]
+        try:
+            valid_digest = len(digest) == 64 and int(digest, 16) >= 0
+        except ValueError:
+            valid_digest = False
+        if not valid_digest:
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite source digest metadata is invalid",
+            )
+        expected = {
+            "last_size": source_stat.st_size,
+            "source_size": source_stat.st_size,
+            "source_dev": source_stat.st_dev,
+            "source_ino": source_stat.st_ino,
+            "source_mtime_ns": source_stat.st_mtime_ns,
+            "source_ctime_ns": source_stat.st_ctime_ns,
+        }
+        try:
+            stale = any(int(meta[key]) != int(value) for key, value in expected.items())
+            indexed_count = int(meta["indexed_id_count"])
+            last_line = int(meta["last_line"])
+        except (TypeError, ValueError) as exc:
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite revision metadata is not numeric",
+            ) from exc
+        if stale:
+            raise EvidenceCatalogError(
+                "database_stale",
+                "SQLite revision does not match the JSONL source",
+            )
+        if indexed_count < 0 or last_line != indexed_count:
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite indexed count metadata is inconsistent",
+            )
+        self._database_signature = _signature(database_stat)
+        self._database_meta = meta
+
+    def preflight(self) -> Dict[str, Any]:
+        state = self._source_state()
+        return {
+            "mode": "verified_sqlite" if self.database_path is not None else "jsonl_stream",
+            "source_state": state,
+            "source_size": self._source_size,
+            "indexed_id_count": (
+                int(self._database_meta["indexed_id_count"])
+                if self._database_meta
+                else None
+            ),
+            "bounded_scan": True,
+        }
 
     def _source_state(self) -> str:
         if self._source_signature is None:
-            return "missing" if not self.index_path.exists() else "changed"
-        try:
-            current = self.index_path.stat()
-        except FileNotFoundError:
+            return "missing" if not _lexists(self.index_path) else "changed"
+        if not _lexists(self.index_path):
             return "deleted"
-        except OSError:
+        try:
+            current = _safe_regular_stat(self.index_path)
+        except EvidenceCatalogError:
             return "changed"
-        if _signature(current) != self._source_signature:
-            return "changed"
-        return "current"
+        assert current is not None
+        return (
+            "current"
+            if _signature(current) == self._source_signature
+            else "changed"
+        )
+
+    def _cache_get(self, raw_id: str) -> Optional[Dict[str, Any]]:
+        existing = self._resolved_cache.get(raw_id)
+        if existing is None:
+            return None
+        self._resolved_cache.move_to_end(raw_id)
+        return dict(existing)
+
+    def _cache_put(self, raw_id: str, ref: Mapping[str, Any]) -> None:
+        self._resolved_cache[raw_id] = dict(ref)
+        self._resolved_cache.move_to_end(raw_id)
+        while len(self._resolved_cache) > self.max_cache_entries:
+            self._resolved_cache.popitem(last=False)
+
+    def _database_candidate(self, raw_id: str) -> Optional[Dict[str, str]]:
+        assert self.database_path is not None
+        database_stat = _safe_regular_stat(self.database_path)
+        assert database_stat is not None
+        if _signature(database_stat) != self._database_signature:
+            raise EvidenceCatalogError(
+                "database_changed",
+                "SQLite index changed after revision verification",
+            )
+        with _readonly_database(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT rec_id,ts,source,content FROM docs "
+                "INDEXED BY idx_docs_rec_id WHERE rec_id=? LIMIT 2",
+                (raw_id,),
+            ).fetchall()
+        if len(rows) > 1:
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite index contains duplicate stable IDs",
+            )
+        if not rows:
+            return None
+        rec_id, timestamp, source, content = rows[0]
+        return {
+            "id": str(rec_id),
+            "timestamp": str(timestamp),
+            "source": str(source),
+            "content": str(content),
+        }
+
+    @staticmethod
+    def _candidate_matches(
+        row: Mapping[str, Any],
+        candidate: Mapping[str, str],
+    ) -> bool:
+        return all(
+            isinstance(row.get(field), str)
+            and row[field] == candidate[field]
+            for field in ("id", "timestamp", "source", "content")
+        )
+
+    @staticmethod
+    def _make_ref(
+        *,
+        evidence_id: str,
+        source: str,
+        raw_id: Optional[str],
+        content: str,
+        status: str,
+        observed_at: str,
+    ) -> Dict[str, Any]:
+        try:
+            canonical_source, source_detail = canonical_evidence_source(source)
+            return new_evidence_ref(
+                evidence_id=evidence_id,
+                source=canonical_source,
+                source_detail=source_detail,
+                raw_id=raw_id,
+                content_hash=_sha256(content),
+                status=status,
+                privacy="restricted",
+                observed_at=observed_at,
+            )
+        except ModelValidationError as exc:
+            raise EvidenceCatalogError(
+                "invalid_evidence_record",
+                str(exc),
+            ) from exc
+
+    def _scan_source(
+        self,
+        *,
+        requested_ids: Optional[set],
+        candidates: Optional[Mapping[str, Mapping[str, str]]],
+        collect: bool,
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        if self._source_state() != "current":
+            raise EvidenceCatalogError(
+                "source_changed",
+                "evidence source changed after catalog preflight",
+            )
+        if self._source_size > self.max_scan_bytes:
+            raise EvidenceCatalogError(
+                "catalog_limit_exceeded",
+                "evidence source exceeds the bounded scan budget",
+            )
+        fallback = self.database_path is None
+        if fallback and self._source_size > self.max_fallback_bytes:
+            raise EvidenceCatalogError(
+                "database_required",
+                "large evidence sources require a verified SQLite index",
+            )
+
+        expected_signature = self._source_signature
+        found: Dict[str, Dict[str, Any]] = {}
+        rows: List[Dict[str, Any]] = []
+        seen_ids = set() if fallback else None
+        bytes_read = 0
+        record_count = 0
+        with _open_regular_nofollow(self.index_path) as handle:
+            opened = os.fstat(handle.fileno())
+            if _signature(opened) != expected_signature:
+                raise EvidenceCatalogError(
+                    "source_changed",
+                    "evidence source changed before scan",
+                )
+            while True:
+                raw = _readline(handle, self.max_line_bytes + 1)
+                if not raw:
+                    break
+                bytes_read += len(raw)
+                if bytes_read > self.max_scan_bytes:
+                    raise EvidenceCatalogError(
+                        "catalog_limit_exceeded",
+                        "evidence scan exceeded its byte budget",
+                    )
+                record_count += 1
+                bounded_collection = fallback or collect
+                record_limit = (
+                    min(self.max_records, self.max_fallback_records)
+                    if bounded_collection
+                    else self.max_records
+                )
+                if record_count > record_limit:
+                    raise EvidenceCatalogError(
+                        "catalog_limit_exceeded",
+                        "evidence scan exceeded its record budget",
+                        line_number=record_count,
+                    )
+                if len(raw) > self.max_line_bytes:
+                    raise EvidenceCatalogError(
+                        "catalog_line_too_large",
+                        "evidence record exceeds the bounded line size",
+                        line_number=record_count,
+                    )
+                if not raw.endswith(b"\n") or not raw.strip():
+                    raise EvidenceCatalogError(
+                        "malformed_jsonl",
+                        "blank or unterminated JSONL at line "
+                        + str(record_count),
+                        line_number=record_count,
+                    )
+                row = _decode_record(raw[:-1], record_count)
+                raw_id = _required_identifier(
+                    row.get("id"),
+                    code="missing_evidence_id",
+                    field="id",
+                    line_number=record_count,
+                )
+                if seen_ids is not None:
+                    if raw_id in seen_ids:
+                        raise EvidenceCatalogError(
+                            "duplicate_evidence_id",
+                            "duplicate evidence id at line " + str(record_count),
+                            line_number=record_count,
+                        )
+                    seen_ids.add(raw_id)
+                target = requested_ids is not None and raw_id in requested_ids
+                if not (bounded_collection or target):
+                    continue
+                content = _required_body(
+                    row.get("content"),
+                    code="invalid_evidence_record",
+                    field="content",
+                    line_number=record_count,
+                )
+                observed_at = _required_text(
+                    row.get("timestamp"),
+                    code="invalid_evidence_record",
+                    field="timestamp",
+                    line_number=record_count,
+                )
+                source = _required_text(
+                    row.get("source"),
+                    code="invalid_evidence_source",
+                    field="source",
+                    line_number=record_count,
+                )
+                ref = self._make_ref(
+                    evidence_id=raw_id,
+                    source=source,
+                    raw_id=raw_id,
+                    content=content,
+                    status="available",
+                    observed_at=observed_at,
+                )
+                if collect:
+                    rows.append(ref)
+                if target:
+                    if raw_id in found:
+                        raise EvidenceCatalogError(
+                            "duplicate_evidence_id",
+                            "requested evidence ID appears more than once",
+                            line_number=record_count,
+                        )
+                    candidate = (
+                        candidates.get(raw_id)
+                        if candidates is not None
+                        else None
+                    )
+                    if candidate is not None and not self._candidate_matches(row, candidate):
+                        raise EvidenceCatalogError(
+                            "database_source_mismatch",
+                            "SQLite candidate does not match authoritative JSONL",
+                            line_number=record_count,
+                        )
+                    found[raw_id] = ref
+                    if (
+                        candidates is not None
+                        and requested_ids is not None
+                        and len(found) == len(requested_ids)
+                        and not collect
+                    ):
+                        break
+            opened_after = os.fstat(handle.fileno())
+
+        current = _safe_regular_stat(self.index_path)
+        if (
+            current is None
+            or _signature(opened_after) != expected_signature
+            or _signature(current) != expected_signature
+        ):
+            raise EvidenceCatalogError(
+                "source_changed",
+                "evidence source changed during scan",
+            )
+        return found, rows
+
+    def _scan_for_id(
+        self,
+        raw_id: str,
+        candidate: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        candidates = {raw_id: candidate} if candidate is not None else None
+        found, _rows = self._scan_source(
+            requested_ids={raw_id},
+            candidates=candidates,
+            collect=False,
+        )
+        if raw_id not in found:
+            raise EvidenceCatalogError(
+                "evidence_not_found",
+                "requested evidence ID was not confirmed in JSONL",
+            )
+        return found[raw_id]
 
     def resolve(self, requested_id: str) -> Dict[str, Any]:
         raw_id = _required_identifier(
@@ -331,36 +772,114 @@ class EvidenceCatalog:
             field="requested_id",
         )
         state = self._source_state()
-        if state == "changed":
+        cached = self._cache_get(raw_id)
+        if state == "missing":
+            raise EvidenceCatalogError(
+                "evidence_not_found",
+                "missing source cannot confirm an evidence ID",
+            )
+        if state == "deleted":
+            if cached is None:
+                raise EvidenceCatalogError(
+                    "evidence_not_found",
+                    "deleted source cannot confirm an uncached evidence ID",
+                )
+            cached["status"] = "source_deleted"
+            return cached
+        if state != "current":
             raise EvidenceCatalogError(
                 "source_changed",
-                "evidence source changed after catalog verification",
+                "evidence source changed after catalog preflight",
             )
-        existing = self._entries.get(raw_id)
-        if existing is None:
+        if cached is not None:
+            return cached
+        if self.database_path is not None:
+            candidate = self._database_candidate(raw_id)
+            if candidate is None:
+                raise EvidenceCatalogError(
+                    "evidence_not_found",
+                    "requested evidence ID was not present in verified SQLite",
+                )
+            ref = self._make_ref(
+                evidence_id=raw_id,
+                source=candidate["source"],
+                raw_id=raw_id,
+                content=candidate["content"],
+                status="available",
+                observed_at=candidate["timestamp"],
+            )
+        else:
+            ref = self._scan_for_id(raw_id)
+        self._cache_put(raw_id, ref)
+        return dict(ref)
+
+    def resolve_many(self, requested_ids: List[str]) -> List[Dict[str, Any]]:
+        if not isinstance(requested_ids, list):
+            raise EvidenceCatalogError(
+                "invalid_evidence_ids",
+                "requested evidence IDs must be a list",
+            )
+        if len(requested_ids) > self.max_batch_ids:
+            raise EvidenceCatalogError(
+                "catalog_limit_exceeded",
+                "evidence batch exceeds the bounded request count",
+            )
+        normalized = [
+            _required_identifier(
+                raw_id,
+                code="evidence_id_required",
+                field="requested_id",
+            )
+            for raw_id in requested_ids
+        ]
+        if not normalized:
+            return []
+        if self._source_state() != "current":
+            raise EvidenceCatalogError(
+                "source_changed",
+                "evidence source changed after catalog preflight",
+            )
+        unique_ids = set(normalized)
+        candidates: Optional[Dict[str, Dict[str, str]]] = None
+        if self.database_path is not None:
+            candidates = {}
+            for raw_id in unique_ids:
+                candidate = self._database_candidate(raw_id)
+                if candidate is None:
+                    raise EvidenceCatalogError(
+                        "evidence_not_found",
+                        "requested evidence ID was not present in verified SQLite",
+                    )
+                candidates[raw_id] = candidate
+        found, _rows = self._scan_source(
+            requested_ids=unique_ids,
+            candidates=candidates,
+            collect=False,
+        )
+        missing = unique_ids - set(found)
+        if missing:
             raise EvidenceCatalogError(
                 "evidence_not_found",
                 "requested evidence ID was not confirmed in JSONL",
             )
-        result = dict(existing)
-        if state == "deleted":
-            result["status"] = "source_deleted"
-        return result
+        for raw_id, ref in found.items():
+            self._cache_put(raw_id, ref)
+        return [dict(found[raw_id]) for raw_id in normalized]
 
     def list(self) -> List[Dict[str, Any]]:
-        state = self._source_state()
-        if state == "changed":
+        if self._source_state() == "missing":
+            return []
+        if self._source_size > self.max_fallback_bytes:
             raise EvidenceCatalogError(
-                "source_changed",
-                "evidence source changed after catalog verification",
+                "catalog_limit_exceeded",
+                "full evidence listing exceeds the bounded fallback size",
             )
-        rows = []
-        for raw_id in sorted(self._entries):
-            row = dict(self._entries[raw_id])
-            if state == "deleted":
-                row["status"] = "source_deleted"
-            rows.append(row)
-        return rows
+        _found, rows = self._scan_source(
+            requested_ids=None,
+            candidates=None,
+            collect=True,
+        )
+        return sorted(rows, key=lambda row: str(row["evidence_id"]))
 
     def from_legacy(
         self,
@@ -371,7 +890,11 @@ class EvidenceCatalog:
         statement: str,
         source_deleted: bool = False,
     ) -> Dict[str, Any]:
-        normalized_source, detail = _normalize_source(source)
+        source_value = _required_text(
+            source,
+            code="invalid_evidence_source",
+            field="source",
+        )
         observed_at = _required_text(
             timestamp,
             code="invalid_evidence_record",
@@ -397,12 +920,12 @@ class EvidenceCatalog:
             try:
                 return self.resolve(normalized_raw_id)
             except EvidenceCatalogError as exc:
-                if exc.code not in {"evidence_not_found"}:
+                if exc.code != "evidence_not_found":
                     raise
 
         legacy_seed = {
             "raw_id": normalized_raw_id,
-            "source": source.strip(),
+            "source": source_value,
             "statement_sha256": _sha256(body),
             "timestamp": observed_at,
         }
@@ -416,15 +939,11 @@ class EvidenceCatalog:
             encoded_seed.encode("utf-8")
         ).hexdigest()
         deleted = source_deleted or self._source_state() == "deleted"
-        result: Dict[str, Any] = {
-            "evidence_id": evidence_id,
-            "source": normalized_source,
-            "raw_id": normalized_raw_id,
-            "content_hash": _sha256(body),
-            "status": "source_deleted" if deleted else "source_broken",
-            "observed_at": observed_at,
-            "privacy": "restricted",
-        }
-        if detail is not None:
-            result["source_detail"] = detail
-        return result
+        return self._make_ref(
+            evidence_id=evidence_id,
+            source=source_value,
+            raw_id=normalized_raw_id,
+            content=body,
+            status="source_deleted" if deleted else "source_broken",
+            observed_at=observed_at,
+        )
