@@ -581,3 +581,29 @@ def test_concurrent_same_idempotency_create_converges(
     assert isinstance(outcomes[0], dict)
     assert outcomes[0] == outcomes[1]
     assert JudgmentStore(tmp_path).events.watermark() == 2
+
+
+def test_outcome_idempotency_survives_later_card_state_changes(tmp_path):
+    store, clock = advancing_store(tmp_path)
+    card = create_card(store)
+    clock["now"] = TEST_NOW
+    store.transition(card["card_id"], "confirmed", **metadata("confirm", 1))
+    outcome_args = {
+        "status": "positive",
+        "summary": "结果有效",
+        "observed_at": "2026-07-20T08:00:00+00:00",
+        **metadata("outcome", 2),
+    }
+    first = store.record_outcome(card["card_id"], **outcome_args)
+    retired = store.transition(
+        card["card_id"],
+        "retired",
+        **metadata("retire", 3),
+    )
+
+    retried = store.record_outcome(card["card_id"], **outcome_args)
+
+    assert retried == first
+    assert retired["status"] == "retired"
+    assert store.get(card["card_id"])["status"] == "retired"
+    assert store.events.watermark() == 4

@@ -728,7 +728,6 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
-        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -749,6 +748,7 @@ class JudgmentStore:
         prior = self._find_idempotent(idem, operation)
         if prior is not None:
             return self._return_projected(prior)
+        operation_time = self._operation_time(current)
         if current["revision"] != expected:
             raise InvalidJudgmentOperation(
                 "version_conflict",
@@ -792,7 +792,6 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
-        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -822,6 +821,7 @@ class JudgmentStore:
         prior = self._find_idempotent(idem, operation)
         if prior is not None:
             return self._return_projected(prior)
+        operation_time = self._operation_time(current)
         if current["revision"] != expected:
             raise InvalidJudgmentOperation(
                 "version_conflict",
@@ -869,7 +869,6 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
-        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -879,17 +878,7 @@ class JudgmentStore:
             reason=reason,
             default_reason="judgment outcome recorded",
         )
-        if current["status"] != "confirmed":
-            raise InvalidJudgmentOperation(
-                "invalid_transition",
-                "only confirmed judgments can record outcomes",
-            )
         observed = _parse_timestamp(observed_at)
-        if observed > operation_time:
-            raise InvalidJudgmentOperation(
-                "future_timestamp",
-                "judgment outcome is later than the trusted clock",
-            )
         outcome = {
             "status": status,
             "summary": summary,
@@ -906,10 +895,21 @@ class JudgmentStore:
         prior = self._find_idempotent(idem, operation)
         if prior is not None:
             return self._return_projected(prior)
+        operation_time = self._operation_time(current)
+        if current["status"] != "confirmed":
+            raise InvalidJudgmentOperation(
+                "invalid_transition",
+                "only confirmed judgments can record outcomes",
+            )
         if current["revision"] != expected:
             raise InvalidJudgmentOperation(
                 "version_conflict",
                 "judgment revision changed",
+            )
+        if observed > operation_time:
+            raise InvalidJudgmentOperation(
+                "future_timestamp",
+                "judgment outcome is later than the trusted clock",
             )
         updated = _card_body(current)
         updated["outcome"] = outcome
