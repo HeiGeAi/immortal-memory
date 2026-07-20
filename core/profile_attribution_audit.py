@@ -21,9 +21,11 @@ def should_circuit_break(records_coverage: float, quarantine_rate: float) -> boo
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from attribution_service import AttributionService
+from config import owner_aliases as configured_owner_aliases
 from feishu_distill import infer_attribution, is_profile_review_memory
 from profile_merge import render_reviewed_md, write_jsonl_atomic
 
@@ -35,6 +37,9 @@ DEFAULT_REVIEWED_MD = IMMORTAL_DIR / "reviewed" / "profile_memories.md"
 DEFAULT_DISTILLED = IMMORTAL_DIR / "feishu" / "distilled" / "profile_memories.jsonl"
 DEFAULT_RECORDS = IMMORTAL_DIR / "feishu" / "clean" / "records.jsonl"
 DEFAULT_REPORT_DIR = IMMORTAL_DIR / "quality"
+DEFAULT_TRUST_REPORT = (
+    IMMORTAL_DIR / "model" / "attribution" / "latest-report.json"
+)
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 OWNER_MARKERS = ("用户本人", "用户本人", "Owner", "用户本人")
 FIRST_PERSON_RE = re.compile(r"(^|[。！？\n])\s*(我|我们|咱们)")
@@ -189,7 +194,61 @@ def render_quarantine_md(rows: list[dict[str, Any]], generated_at: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_summary(name: str, rows: list[dict[str, Any]], records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def trust_record(row: dict[str, Any]) -> dict[str, Any]:
+    source = row.get("source") if isinstance(row.get("source"), dict) else {}
+    attribution = (
+        row.get("attribution")
+        if isinstance(row.get("attribution"), dict)
+        else {}
+    )
+    category = str(attribution.get("category") or "")
+    author = str(
+        attribution.get("actor")
+        or attribution.get("sender")
+        or ""
+    ).strip()
+    if category == "self_direct" and not author:
+        author = "owner"
+    elif category in {
+        "other_speaker",
+        "other_first_person",
+        "about_owner_from_other",
+    } and not author:
+        author = "third_party"
+    sensitivity = str(row.get("sensitivity") or "").strip().casefold()
+    privacy = {
+        "secret": "private",
+        "confidential": "restricted",
+        "internal": "context_safe",
+        "public": "public",
+    }.get(sensitivity)
+    result = {
+        "role": (
+            "user"
+            if category == "self_direct"
+            else "assistant"
+            if category.startswith("other") or category == "about_owner_from_other"
+            else "unknown"
+        ),
+        "author": author,
+        "content": str(row.get("statement") or ""),
+        "source": str(source.get("source") or ""),
+        "recurrence_count": row.get("recurrence_count", 0),
+        "role_scope": row.get("role_scope"),
+        "domain_scope": row.get("domain_scope"),
+    }
+    if privacy is not None:
+        result["privacy"] = privacy
+    return result
+
+
+def build_summary(
+    name: str,
+    rows: list[dict[str, Any]],
+    records: dict[str, dict[str, Any]],
+    service: Optional[AttributionService] = None,
+) -> dict[str, Any]:
+    trust_service = service or AttributionService(owner_aliases={"owner"})
     enriched = [enrich_attribution(row, records) for row in rows]
     actions = Counter()
     reasons = Counter()
@@ -203,15 +262,17 @@ def build_summary(name: str, rows: list[dict[str, Any]], records: dict[str, dict
         attribution[(row.get("attribution") or {}).get("category", "unknown")] += 1
         focus[str(row.get("focus") or "unknown")] += 1
         if action == "quarantine" and len(examples) < 20:
-            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            classification = trust_service.classify(trust_record(row))
             examples.append(
                 {
                     "memory_id": row.get("memory_id", ""),
                     "reason": reason,
-                    "attribution": row.get("attribution", {}),
+                    "speaker_kind": classification["speaker"]["kind"],
+                    "subject_kind": classification["subject"]["kind"],
                     "focus": row.get("focus", ""),
-                    "statement": row.get("statement", ""),
-                    "source": source.get("title", ""),
+                    "safe_summary": trust_service.safe_summary(
+                        classification
+                    ),
                 }
             )
     return {
@@ -232,6 +293,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--distilled", type=Path, default=DEFAULT_DISTILLED)
     parser.add_argument("--records", type=Path, default=DEFAULT_RECORDS)
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
+    parser.add_argument(
+        "--trust-report",
+        type=Path,
+        default=DEFAULT_TRUST_REPORT,
+    )
     parser.add_argument("--apply", action="store_true", help="Quarantine failing reviewed rows and rewrite reviewed profile layer")
     return parser
 
@@ -249,8 +315,18 @@ def main(argv: list[str] | None = None) -> int:
     }
     clean_ids.discard("")
     records = load_records_by_clean_id(args.records, clean_ids)
+    trust_service = AttributionService(
+        owner_aliases={
+            "owner",
+            "用户本人",
+            *configured_owner_aliases(),
+        }
+    )
 
     enriched_reviewed = [enrich_attribution(row, records) for row in reviewed_rows]
+    enriched_distilled = [
+        enrich_attribution(row, records) for row in distilled_rows
+    ]
     kept: list[dict[str, Any]] = []
     quarantined: list[dict[str, Any]] = []
     for row in enriched_reviewed:
@@ -266,12 +342,30 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "generated_at": generated_at,
         "records_loaded": len(records),
-        "reviewed": build_summary("reviewed", reviewed_rows, records),
-        "distilled": build_summary("distilled", distilled_rows, records),
+        "reviewed": build_summary(
+            "reviewed",
+            reviewed_rows,
+            records,
+            trust_service,
+        ),
+        "distilled": build_summary(
+            "distilled",
+            distilled_rows,
+            records,
+            trust_service,
+        ),
         "apply": bool(args.apply),
         "kept_reviewed": len(kept),
         "quarantined_reviewed": len(quarantined),
     }
+    trust_service.write_latest_report(
+        args.trust_report,
+        [
+            trust_record(row)
+            for row in [*enriched_reviewed, *enriched_distilled]
+        ],
+        generated_at=generated_at,
+    )
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
     report_json = args.report_dir / "profile_attribution_audit.json"
@@ -293,7 +387,10 @@ def main(argv: list[str] | None = None) -> int:
         md_lines.append(f"- {key}: {value}")
     md_lines.extend(["", "## Quarantine Examples", ""])
     for item in report["reviewed"]["examples"]:
-        md_lines.append(f"- `{item['memory_id']}` {item['reason']} :: {item['statement']}")
+        md_lines.append(
+            f"- `{item['memory_id']}` {item['reason']} :: "
+            f"{item['safe_summary']}"
+        )
     report_md.write_text("\n".join(md_lines).rstrip() + "\n", encoding="utf-8")
 
     records_coverage = (len(records) / len(clean_ids)) if clean_ids else 1.0
@@ -329,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"records_loaded={len(records)}")
     print(f"report_json={report_json}")
     print(f"report_md={report_md}")
+    print(f"trust_report={args.trust_report}")
     return 2 if quarantined and not args.apply else 0
 
 
