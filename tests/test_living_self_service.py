@@ -640,33 +640,32 @@ def test_confirm_rejects_tampering_stale_watermark_parent_and_empty_reason(
     with pytest.raises(ValueError, match="candidate"):
         service.confirm(forged_parent, reason="reviewed")
 
-    forged_time = copy.deepcopy(candidate)
-    forged_time["generated_at"] = "2027-07-20T12:00:00+00:00"
-    with pytest.raises(ValueError, match="candidate"):
-        service.confirm(forged_time, reason="reviewed")
-
-    forged_old_time = copy.deepcopy(candidate)
-    forged_old_time["generated_at"] = "2000-01-01T00:00:00+00:00"
-    with pytest.raises(ValueError, match="candidate"):
-        service.confirm(forged_old_time, reason="reviewed")
-
-    forged_generation = copy.deepcopy(candidate)
-    forged_generation["generation_reason"] = "scheduled_rebuild"
-    with pytest.raises(ValueError, match="candidate"):
-        service.confirm(forged_generation, reason="reviewed")
-
-
-def test_confirm_requires_exact_fresh_generated_at_with_fixed_clock(tmp_path):
+def test_confirm_normalizes_untrusted_generation_metadata_from_fresh_candidate(
+    tmp_path,
+):
     service = service_for(tmp_path)
     candidate = service.build_candidate()
     forged = copy.deepcopy(candidate)
     forged["generated_at"] = "2000-01-01T00:00:00+00:00"
+    forged["generation_reason"] = "scheduled_rebuild"
 
-    with pytest.raises(ValueError, match="candidate"):
-        service.confirm(forged, reason="reviewed")
+    confirmed = service.confirm(forged, reason="reviewed")
+
+    assert confirmed["generated_at"] == candidate["generated_at"]
+    assert confirmed["generation_reason"] == "claim_change"
+
+
+def test_default_clock_empty_candidate_can_be_confirmed(tmp_path):
+    from living_self_service import LivingSelfService
+
+    service = LivingSelfService(tmp_path)
+    candidate = service.build_candidate()
 
     confirmed = service.confirm(candidate, reason="reviewed")
-    assert confirmed["generated_at"] == candidate["generated_at"]
+
+    assert confirmed["status"] == "confirmed"
+    assert confirmed["sections"] == candidate["sections"]
+    assert confirmed["based_on_claim_seq"] == candidate["based_on_claim_seq"]
 
 
 def test_confirm_never_overwrites_existing_version(tmp_path):

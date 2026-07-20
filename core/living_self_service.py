@@ -873,11 +873,6 @@ class LivingSelfService:
         for field in ("sections", "content_hash", "based_on_claim_seq"):
             if value[field] != fresh[field]:
                 raise ValueError("candidate does not match current Claim authority")
-        if (
-            value["generation_reason"] != fresh["generation_reason"]
-            or value["generated_at"] != fresh["generated_at"]
-        ):
-            raise ValueError("candidate generation metadata is invalid")
         parent = value["parent_version_id"]
         if current is None:
             if parent is not None:
@@ -887,7 +882,7 @@ class LivingSelfService:
                 "stale_candidate",
                 "candidate parent is not the current Living Self version",
             )
-        return value
+        return fresh
 
     def _confirmed_from_candidate(
         self,
