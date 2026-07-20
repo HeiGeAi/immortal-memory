@@ -238,27 +238,9 @@ def _exclusive_lock(
         try:
             yield parent_fd
         finally:
-            try:
-                owned = os.fstat(fd)
-                current = os.stat(
-                    name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    not stat.S_ISREG(current.st_mode)
-                    or (owned.st_dev, owned.st_ino)
-                    != (current.st_dev, current.st_ino)
-                ):
-                    raise _unsafe_path(
-                        "event lock ownership changed while held",
-                    )
-            except FileNotFoundError:
-                raise _unsafe_path("event lock disappeared while held")
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def _acquire_event_lock(
@@ -330,6 +312,31 @@ def _acquire_event_lock(
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
             raise
+
+
+@contextmanager
+def _descriptor_lock(
+    descriptor: int,
+    *,
+    timeout: float,
+    exclusive: bool,
+) -> Iterator[None]:
+    if fcntl is None:
+        raise RuntimeError("kernel file locking is unavailable")
+    deadline = time.monotonic() + timeout
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    while True:
+        try:
+            fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for event file lock")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 def _positive_int(value: Any) -> bool:
@@ -456,8 +463,26 @@ class JsonlEventStore:
             if owns_descriptor:
                 os.close(descriptor)
             raise _unsafe_path("event log must be a regular file")
-        os.lseek(descriptor, 0, os.SEEK_SET)
+        descriptor_lock = None
+        if owns_descriptor:
+            descriptor_lock = _descriptor_lock(
+                descriptor,
+                timeout=self.lock_timeout,
+                exclusive=recover_tail,
+            )
+            lock_entered = False
+            try:
+                descriptor_lock.__enter__()
+                lock_entered = True
+                _verify_public_file(parent_fd, self.path.name, descriptor)
+                _verify_public_parent(self.path, parent_fd)
+            except Exception:
+                if lock_entered:
+                    descriptor_lock.__exit__(None, None, None)
+                os.close(descriptor)
+                raise
         try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
             handle_context = os.fdopen(
                 descriptor,
                 mode,
@@ -562,6 +587,8 @@ class JsonlEventStore:
                         os.fsync(handle.fileno())
                     yield row
         finally:
+            if descriptor_lock is not None:
+                descriptor_lock.__exit__(None, None, None)
             if owns_descriptor:
                 os.close(descriptor)
 
@@ -628,103 +655,108 @@ class JsonlEventStore:
         ) as parent_fd:
             _verify_public_parent(self.path, parent_fd)
             event_fd: Optional[int] = None
-            flags = os.O_RDWR | os.O_APPEND
+            flags = os.O_RDWR | os.O_APPEND | os.O_CREAT
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             try:
+                existed = _regular_stat_at(parent_fd, self.path.name) is not None
                 try:
                     event_fd = os.open(
                         self.path.name,
                         flags,
+                        0o600,
                         dir_fd=parent_fd,
                     )
-                except FileNotFoundError:
-                    event_fd = None
                 except OSError as exc:
                     raise _unsafe_path(
                         "event log cannot be opened safely",
                         exc,
                     )
-                if event_fd is not None:
-                    _verify_public_file(parent_fd, self.path.name, event_fd)
-                by_event_id: Dict[str, Dict[str, Any]] = {}
-                by_idempotency_key: Dict[str, Dict[str, Any]] = {}
-                stream_versions: Dict[str, int] = {}
-                watermark = 0
-                for existing in self._validated_events(
-                    recover_tail=True,
-                    parent_fd=parent_fd,
-                    descriptor=event_fd,
+                if not existed:
+                    os.fsync(parent_fd)
+                with _descriptor_lock(
+                    event_fd,
+                    timeout=self.lock_timeout,
+                    exclusive=True,
                 ):
-                    by_event_id[str(existing["event_id"])] = existing
-                    key = str(existing.get("idempotency_key") or "")
-                    if key:
-                        by_idempotency_key[key] = existing
-                    stream_versions[str(existing["stream_id"])] = int(
-                        existing["stream_version"]
-                    )
-                    watermark = int(existing["seq"])
-
-                same_event = by_event_id.get(event_id)
-                if same_event is not None:
-                    if _canonical_event(same_event) == _canonical_event(candidate):
-                        assert event_fd is not None
-                        _verify_public_file(
-                            parent_fd,
-                            self.path.name,
-                            event_fd,
+                    _verify_public_file(parent_fd, self.path.name, event_fd)
+                    _verify_public_parent(self.path, parent_fd)
+                    by_event_id: Dict[str, Dict[str, Any]] = {}
+                    by_idempotency_key: Dict[str, Dict[str, Any]] = {}
+                    stream_versions: Dict[str, int] = {}
+                    watermark = 0
+                    for existing in self._validated_events(
+                        recover_tail=True,
+                        parent_fd=parent_fd,
+                        descriptor=event_fd,
+                    ):
+                        by_event_id[str(existing["event_id"])] = existing
+                        key = str(existing.get("idempotency_key") or "")
+                        if key:
+                            by_idempotency_key[key] = existing
+                        stream_versions[str(existing["stream_id"])] = int(
+                            existing["stream_version"]
                         )
-                        _verify_public_parent(self.path, parent_fd)
-                        return same_event
-                    raise EventConflict(
-                        "event_id_conflict",
-                        "event_id was already used for a different event",
-                    )
+                        watermark = int(existing["seq"])
 
-                idempotency_key = str(candidate.get("idempotency_key") or "")
-                same_key = by_idempotency_key.get(idempotency_key)
-                if same_key is not None:
-                    if _idempotency_intent(same_key) == _idempotency_intent(candidate):
-                        assert event_fd is not None
-                        _verify_public_file(
-                            parent_fd,
-                            self.path.name,
-                            event_fd,
+                    same_event = by_event_id.get(event_id)
+                    if same_event is not None:
+                        if _canonical_event(same_event) == _canonical_event(candidate):
+                            _verify_public_file(
+                                parent_fd,
+                                self.path.name,
+                                event_fd,
+                            )
+                            _verify_public_parent(self.path, parent_fd)
+                            return same_event
+                        raise EventConflict(
+                            "event_id_conflict",
+                            "event_id was already used for a different event",
                         )
-                        _verify_public_parent(self.path, parent_fd)
-                        return same_key
-                    raise EventConflict(
-                        "idempotency_conflict",
-                        "idempotency key was reused for a different intent",
-                    )
 
-                stream_id = str(candidate["stream_id"])
-                current_version = stream_versions.get(stream_id, 0)
-                if int(candidate["expected_version"]) != current_version:
-                    raise EventConflict(
-                        "version_conflict",
-                        "stream version changed",
+                    idempotency_key = str(candidate.get("idempotency_key") or "")
+                    same_key = by_idempotency_key.get(idempotency_key)
+                    if same_key is not None:
+                        if _idempotency_intent(same_key) == _idempotency_intent(candidate):
+                            _verify_public_file(
+                                parent_fd,
+                                self.path.name,
+                                event_fd,
+                            )
+                            _verify_public_parent(self.path, parent_fd)
+                            return same_key
+                        raise EventConflict(
+                            "idempotency_conflict",
+                            "idempotency key was reused for a different intent",
+                        )
+
+                    stream_id = str(candidate["stream_id"])
+                    current_version = stream_versions.get(stream_id, 0)
+                    if int(candidate["expected_version"]) != current_version:
+                        raise EventConflict(
+                            "version_conflict",
+                            "stream version changed",
+                        )
+                    stored = {**candidate, "seq": watermark + 1}
+                    encoded = (
+                        json.dumps(
+                            stored,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    if len(encoded) > self.max_event_bytes:
+                        raise ValueError("event exceeds maximum encoded size")
+                    self._append_bytes(
+                        encoded,
+                        parent_fd=parent_fd,
+                        event_fd=event_fd,
                     )
-                stored = {**candidate, "seq": watermark + 1}
-                encoded = (
-                    json.dumps(
-                        stored,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
-                ).encode("utf-8")
-                if len(encoded) > self.max_event_bytes:
-                    raise ValueError("event exceeds maximum encoded size")
-                self._append_bytes(
-                    encoded,
-                    parent_fd=parent_fd,
-                    event_fd=event_fd,
-                )
-                return stored
+                    return stored
             finally:
                 if event_fd is not None:
                     os.close(event_fd)

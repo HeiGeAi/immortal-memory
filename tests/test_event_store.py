@@ -395,17 +395,112 @@ def test_lock_replacement_is_not_unlinked_by_previous_owner(tmp_path):
     lock_path = tmp_path / "events.jsonl.lock"
     moved = tmp_path / "owned.lock"
 
-    with pytest.raises(Exception) as captured:
-        with module._exclusive_lock(
-            lock_path,
-            timeout=0.1,
-            stale_after=60.0,
-        ):
-            lock_path.rename(moved)
-            lock_path.write_text("replacement", encoding="utf-8")
+    with module._exclusive_lock(
+        lock_path,
+        timeout=0.1,
+        stale_after=60.0,
+    ):
+        lock_path.rename(moved)
+        lock_path.write_text("replacement", encoding="utf-8")
 
-    assert getattr(captured.value, "code", None) == "unsafe_path"
     assert lock_path.read_text(encoding="utf-8") == "replacement"
+
+
+def test_event_file_lock_serializes_writers_if_diagnostic_lock_is_replaced(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "events.jsonl"
+    first_store = JsonlEventStore(path)
+    first_store.append(event("evt-1"))
+    reached_append = threading.Event()
+    release_append = threading.Event()
+    outcomes = []
+    real_append = first_store._append_bytes
+
+    def paused_append(payload, **kwargs):
+        reached_append.set()
+        assert release_append.wait(timeout=5)
+        return real_append(payload, **kwargs)
+
+    monkeypatch.setattr(first_store, "_append_bytes", paused_append)
+
+    def append_first():
+        try:
+            first_store.append(event("evt-2", expected_version=1))
+            outcomes.append("first-ok")
+        except Exception as exc:
+            outcomes.append("first-" + getattr(exc, "code", type(exc).__name__))
+
+    def append_second():
+        try:
+            JsonlEventStore(path).append(
+                event("evt-3", stream_id="stream-2", expected_version=0)
+            )
+            outcomes.append("second-ok")
+        except Exception as exc:
+            outcomes.append("second-" + getattr(exc, "code", type(exc).__name__))
+
+    first = threading.Thread(target=append_first)
+    first.start()
+    assert reached_append.wait(timeout=5)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.rename(tmp_path / "old.lock")
+    lock_path.write_text("replacement", encoding="utf-8")
+    second = threading.Thread(target=append_second)
+    second.start()
+    time.sleep(0.1)
+    assert second.is_alive()
+
+    release_append.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert sorted(outcomes) == ["first-ok", "second-ok"]
+    rows = JsonlEventStore(path).read_all()
+    assert [row["seq"] for row in rows] == [1, 2, 3]
+    assert {row["event_id"] for row in rows} == {"evt-1", "evt-2", "evt-3"}
+
+
+def test_event_file_lock_keeps_reader_from_observing_inflight_append(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "events.jsonl"
+    writer_store = JsonlEventStore(path)
+    writer_store.append(event("evt-1"))
+    reached_append = threading.Event()
+    release_append = threading.Event()
+    reader_rows = []
+    real_append = writer_store._append_bytes
+
+    def paused_append(payload, **kwargs):
+        reached_append.set()
+        assert release_append.wait(timeout=5)
+        return real_append(payload, **kwargs)
+
+    monkeypatch.setattr(writer_store, "_append_bytes", paused_append)
+    writer = threading.Thread(
+        target=lambda: writer_store.append(event("evt-2", expected_version=1))
+    )
+    writer.start()
+    assert reached_append.wait(timeout=5)
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.rename(tmp_path / "reader-old.lock")
+    lock_path.write_text("replacement", encoding="utf-8")
+
+    reader = threading.Thread(
+        target=lambda: reader_rows.extend(JsonlEventStore(path).read_all())
+    )
+    reader.start()
+    time.sleep(0.1)
+    assert reader.is_alive()
+
+    release_append.set()
+    writer.join(timeout=5)
+    reader.join(timeout=5)
+
+    assert [row["event_id"] for row in reader_rows] == ["evt-1", "evt-2"]
 
 
 def test_append_rejects_event_file_replaced_after_validation_and_can_retry(
