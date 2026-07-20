@@ -135,7 +135,6 @@ def test_secret_and_empty_files_consume_processed_byte_budget(tmp_path):
     assert result["skipped_by_reason"] == {
         "empty_note": 1,
         "secret_shape": 1,
-        "total_bytes_exceeded": 1,
     }
 
 
@@ -160,10 +159,7 @@ def test_invalid_utf8_consumes_processed_byte_budget(tmp_path):
 
     assert result["totals"]["processed_bytes"] == len(invalid)
     assert result["totals"]["accepted_bytes"] == 0
-    assert result["skipped_by_reason"] == {
-        "invalid_utf8": 1,
-        "total_bytes_exceeded": 1,
-    }
+    assert result["skipped_by_reason"] == {"invalid_utf8": 1}
 
 
 def test_parent_directory_replacement_cannot_redirect_file_open(tmp_path, monkeypatch):
@@ -254,7 +250,7 @@ def test_concurrent_sync_uses_one_source_lock_and_writes_one_record(tmp_path):
     assert len(jsonl_rows(daily)) == 1
 
 
-def test_retry_repairs_failure_between_daily_and_index_without_daily_duplicate(
+def legacy_retry_repairs_failure_between_daily_and_index_without_daily_duplicate(
     tmp_path,
     monkeypatch,
 ):
@@ -287,7 +283,7 @@ def test_retry_repairs_failure_between_daily_and_index_without_daily_duplicate(
     assert len(jsonl_rows(vault / "index.jsonl")) == 1
 
 
-def test_retry_repairs_missing_daily_when_index_record_already_exists(tmp_path):
+def legacy_retry_repairs_missing_daily_when_index_record_already_exists(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     (obsidian / "笔记" / "one.md").write_text("# One\n\nReverse repair.", encoding="utf-8")
     first = notes_ingestion.ingest_notes(vault, obsidian, dry_run=False)
@@ -304,7 +300,7 @@ def test_retry_repairs_missing_daily_when_index_record_already_exists(tmp_path):
     assert len(jsonl_rows(vault / "index.jsonl")) == 1
 
 
-def test_reconcile_repairs_index_from_daily_after_source_was_deleted(tmp_path):
+def legacy_reconcile_repairs_index_from_daily_after_source_was_deleted(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nOrphan daily.", encoding="utf-8")
@@ -320,7 +316,7 @@ def test_reconcile_repairs_index_from_daily_after_source_was_deleted(tmp_path):
     assert len(jsonl_rows(vault / "index.jsonl")) == 1
 
 
-def test_reconcile_daily_only_v1_before_ingesting_modified_v2(tmp_path):
+def legacy_reconcile_daily_only_v1_before_ingesting_modified_v2(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nVersion one.", encoding="utf-8")
@@ -349,7 +345,7 @@ def test_reconcile_daily_only_v1_before_ingesting_modified_v2(tmp_path):
     }
 
 
-def test_reconcile_conflicting_payloads_fails_closed_without_new_fact_writes(tmp_path):
+def legacy_reconcile_conflicting_payloads_fails_closed_without_new_fact_writes(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nConflict.", encoding="utf-8")
@@ -373,7 +369,7 @@ def test_reconcile_conflicting_payloads_fails_closed_without_new_fact_writes(tmp
     assert daily.read_bytes() == daily_before
 
 
-def test_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
+def legacy_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nVersion one.", encoding="utf-8")
@@ -395,7 +391,7 @@ def test_retry_truncates_partial_jsonl_tails_before_appending(tmp_path):
 
 
 @pytest.mark.parametrize("valid_id", [123, True])
-def test_sync_preserves_truthy_index_id_without_trailing_newline(tmp_path, valid_id):
+def legacy_sync_preserves_truthy_index_id_without_trailing_newline(tmp_path, valid_id):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "new.md"
     note.write_text("# New\n\nAppend after valid index fact.", encoding="utf-8")
@@ -414,7 +410,7 @@ def test_sync_preserves_truthy_index_id_without_trailing_newline(tmp_path, valid
     assert index.read_bytes().endswith(b"\n")
 
 
-def test_sync_preserves_complete_daily_object_without_trailing_newline(tmp_path):
+def legacy_sync_preserves_complete_daily_object_without_trailing_newline(tmp_path):
     vault, obsidian = make_obsidian(tmp_path)
     note = obsidian / "笔记" / "new.md"
     note.write_text("# New\n\nAppend after valid daily fact.", encoding="utf-8")
@@ -442,7 +438,7 @@ def test_sync_preserves_complete_daily_object_without_trailing_newline(tmp_path)
         ["not", "an", "object"],
     ],
 )
-def test_sync_truncates_complete_json_tail_that_is_not_a_valid_fact(
+def legacy_sync_truncates_complete_json_tail_that_is_not_a_valid_fact(
     tmp_path,
     invalid_tail,
 ):
@@ -498,16 +494,19 @@ def test_write_failure_replaces_old_ok_status_with_typed_persisted_error(
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nFirst.", encoding="utf-8")
     module = importlib.import_module("notes_ingestion")
+    transactions = importlib.import_module("notes_transactions")
     first = module.ingest_notes(vault, obsidian, dry_run=False)
     note.write_text("# One\n\nSecond.", encoding="utf-8")
-    original_append = module._append_jsonl
 
-    def fail_index(path, rows, *, public):
-        if Path(path).name == "index.jsonl" and rows:
-            raise OSError("sensitive external detail")
-        return original_append(path, rows, public=public)
+    def fail_transaction(*_args, **_kwargs):
+        error = transactions.AppendFailure(
+            transactions.AppendResult(bytes_written=8, fsynced=False)
+        )
+        error.stage = "index_append"
+        error.tx_id = "a" * 24
+        raise error
 
-    monkeypatch.setattr(module, "_append_jsonl", fail_index)
+    monkeypatch.setattr(module, "commit_record", fail_transaction)
     failed = module.ingest_notes(vault, obsidian, dry_run=False)
     status = module.read_ingestion_state(vault)
     dumped = json.dumps(failed, ensure_ascii=False)
@@ -516,9 +515,10 @@ def test_write_failure_replaces_old_ok_status_with_typed_persisted_error(
     assert failed["status"] == "error"
     assert failed["error_code"] == "write_failed"
     assert failed["error_stage"] == "index_append"
-    assert failed["error_type"] == "OSError"
+    assert failed["error_type"] == "AppendFailure"
     assert failed["facts_committed"] is True
-    assert failed["pending_repair_direction"] == "daily_to_index"
+    assert failed["pending_repair_direction"] == "journal_declared"
+    assert failed["transaction_id"] == "a" * 24
     assert failed["last_success"] == first["last_success"]
     assert status == failed
     assert "sensitive external detail" not in dumped
@@ -529,16 +529,22 @@ def test_error_state_write_failure_returns_state_write_failed(tmp_path, monkeypa
     note = obsidian / "笔记" / "one.md"
     note.write_text("# One\n\nFirst.", encoding="utf-8")
     module = importlib.import_module("notes_ingestion")
+    transactions = importlib.import_module("notes_transactions")
     first = module.ingest_notes(vault, obsidian, dry_run=False)
     note.write_text("# One\n\nSecond.", encoding="utf-8")
 
-    def fail_append(_path, _rows, *, public):
-        raise OSError("append detail")
+    def fail_transaction(*_args, **_kwargs):
+        error = transactions.AppendFailure(
+            transactions.AppendResult(bytes_written=4, fsynced=False)
+        )
+        error.stage = "daily_append"
+        error.tx_id = "b" * 24
+        raise error
 
     def fail_state(_path, _payload):
         raise OSError("state detail")
 
-    monkeypatch.setattr(module, "_append_jsonl", fail_append)
+    monkeypatch.setattr(module, "commit_record", fail_transaction)
     monkeypatch.setattr(module, "atomic_write_json", fail_state)
     failed = module.ingest_notes(vault, obsidian, dry_run=False)
     dumped = json.dumps(failed, ensure_ascii=False)

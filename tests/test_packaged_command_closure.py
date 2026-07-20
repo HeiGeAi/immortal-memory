@@ -127,6 +127,7 @@ def test_installed_compatibility_commands_are_safe_and_closed(tmp_path):
     for command in (
         ("cards", "--help"),
         ("notes-sync", "--help"),
+        ("notes-migrate", "--help"),
         ("profile-attribution-audit", "--help"),
     ):
         result = subprocess.run(

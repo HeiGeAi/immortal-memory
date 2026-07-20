@@ -113,3 +113,65 @@ def test_escaped_user_query_remains_a_normal_successful_query(
     assert ready is True
     assert labels
     assert rankings
+
+
+def test_notes_migration_rebuild_marker_forces_index_unavailable(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    build_index(source, database)
+    manifest = tmp_path / "notes" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "migration_status": "complete",
+                "index_rebuild_required": True,
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(index_db, "INDEX_FILE", source)
+    monkeypatch.setattr(index_db, "DB_FILE", database)
+
+    assert index_db.is_ready() is False
+    assert index_db.ready_channels("needle", limit=5) == (False, [], [])
+
+
+def test_successful_index_sync_clears_notes_migration_rebuild_marker(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text(
+        json.dumps(record("a", "needle"), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "notes" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "migration_status": "complete",
+                "index_rebuild_required": True,
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(index_db, "INDEX_FILE", source)
+    monkeypatch.setattr(index_db, "DB_FILE", database)
+
+    index_db.sync(force_rebuild=True)
+
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert payload["index_rebuild_required"] is False
+    assert payload["index_rebuilt_at"]
+    assert index_db.is_ready() is True

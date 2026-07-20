@@ -17,9 +17,11 @@ CLI:
 """
 
 import sys
+import json
 import math
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +34,38 @@ DB_FILE = IMMORTAL_DIR / "search_index.db"
 
 class IndexQueryError(RuntimeError):
     """The trusted SQLite generation could not execute a search query."""
+
+
+def _notes_migration_requires_rebuild() -> bool:
+    manifest = INDEX_FILE.parent / "notes" / "manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(payload, dict) or bool(
+        payload.get("index_rebuild_required")
+    )
+
+
+def _clear_notes_migration_rebuild_marker() -> None:
+    manifest = INDEX_FILE.parent / "notes" / "manifest.json"
+    if not manifest.is_file():
+        return
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("notes migration manifest is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("notes migration manifest is invalid")
+    if not payload.get("index_rebuild_required"):
+        return
+    payload["index_rebuild_required"] = False
+    payload["index_rebuilt_at"] = datetime.now(timezone.utc).isoformat()
+    from notes_transactions import durable_atomic_json
+
+    durable_atomic_json(manifest, payload)
 
 
 # 时间衰减收敛到 ranking_common（单一真源），与 search.py 共用，避免两通道打分口径漂移。
@@ -95,7 +129,13 @@ def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
         return 0
     from index_integrity import reconcile_index
 
-    result = reconcile_index(INDEX_FILE, DB_FILE, force_rebuild=force_rebuild)
+    notes_rebuild_required = _notes_migration_requires_rebuild()
+    result = reconcile_index(
+        INDEX_FILE,
+        DB_FILE,
+        force_rebuild=force_rebuild or notes_rebuild_required,
+    )
+    _clear_notes_migration_rebuild_marker()
     if verbose:
         print(
             f"索引同步模式: {result['mode']}，原因: {result['reason']}，"
@@ -105,7 +145,11 @@ def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
 
 
 def is_ready() -> bool:
-    if not INDEX_FILE.exists() or not DB_FILE.exists():
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or _notes_migration_requires_rebuild()
+    ):
         return False
     try:
         with index_lock_pair(
@@ -121,7 +165,11 @@ def is_ready() -> bool:
 
 def _is_ready_unlocked() -> bool:
     """Return trusted index readiness using only source stat and fixed metadata."""
-    if not INDEX_FILE.exists() or not DB_FILE.exists():
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or _notes_migration_requires_rebuild()
+    ):
         return False
     con = None
     try:
@@ -193,7 +241,11 @@ def ready_channels(
     pool: Optional[int] = None,
 ):
     """Check readiness and query one immutable source/DB generation snapshot."""
-    if not INDEX_FILE.exists() or not DB_FILE.exists():
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or _notes_migration_requires_rebuild()
+    ):
         return (False, [], [])
     try:
         with index_lock_pair(

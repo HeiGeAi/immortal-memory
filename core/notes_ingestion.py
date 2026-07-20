@@ -14,6 +14,15 @@ from typing import Any, Optional
 
 from file_utils import atomic_write_json
 from index_locks import source_lock
+from notes_transactions import (
+    AppendFailure,
+    MigrationRequired,
+    TransactionConflict,
+    commit_record,
+    ensure_manifest,
+    manifest_readiness,
+    recover_pending,
+)
 from secret_scan import scan_text_shapes
 
 
@@ -54,6 +63,10 @@ def after_daily_append() -> None:
 
 def before_file_open(_relative_path: str) -> None:
     """Deterministic test boundary; production leaves the anchored fd unchanged."""
+
+
+def after_file_fstat(_relative_path: str, _fd: int) -> None:
+    """Deterministic test boundary for concurrent source growth."""
 
 
 def _skip(
@@ -170,21 +183,25 @@ def _open_regular_file(
         return None, None, "file_unreadable"
 
 
-def _read_open_file(fd: int, max_bytes: int) -> tuple[Optional[bytes], str]:
+def _read_open_file(
+    fd: int,
+    max_bytes: int,
+) -> tuple[Optional[bytes], str, int]:
+    total = 0
     try:
         chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+        while total < max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes - total))
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > max_bytes:
-                return None, "file_too_large"
-        return b"".join(chunks), ""
+        current_size = os.fstat(fd).st_size
+        if current_size > total:
+            return None, "file_too_large", total
+        return b"".join(chunks), "", total
     except OSError:
-        return None, "file_unreadable"
+        return None, "file_unreadable", total
     finally:
         os.close(fd)
 
@@ -240,6 +257,7 @@ def discover_notes(
                 _skip(skipped, skipped_counts, relative, open_error)
                 continue
             assert fd is not None and metadata is not None
+            after_file_fstat(relative, fd)
             if metadata.st_size > limits.max_file_bytes:
                 os.close(fd)
                 _skip(skipped, skipped_counts, relative, "file_too_large")
@@ -254,9 +272,9 @@ def discover_notes(
                 _skip(skipped, skipped_counts, relative, "total_bytes_exceeded")
                 continue
             remaining_budget = limits.max_total_bytes - processed_bytes
-            processed_bytes += metadata.st_size
             read_limit = min(limits.max_file_bytes, remaining_budget)
-            payload, read_error = _read_open_file(fd, read_limit)
+            payload, read_error, bytes_read = _read_open_file(fd, read_limit)
+            processed_bytes += bytes_read
             if read_error:
                 reason = (
                     "total_bytes_exceeded"
@@ -265,12 +283,16 @@ def discover_notes(
                     else read_error
                 )
                 _skip(skipped, skipped_counts, relative, reason)
+                if processed_bytes >= limits.max_total_bytes:
+                    break
                 continue
             assert payload is not None
             try:
                 text = payload.decode("utf-8")
             except UnicodeDecodeError:
                 _skip(skipped, skipped_counts, relative, "invalid_utf8")
+                if processed_bytes >= limits.max_total_bytes:
+                    break
                 continue
             rules = scan_text_shapes(text)
             if rules:
@@ -281,9 +303,13 @@ def discover_notes(
                     relative,
                     list(rules),
                 )
+                if processed_bytes >= limits.max_total_bytes:
+                    break
                 continue
             if not text.strip():
                 _skip(skipped, skipped_counts, relative, "empty_note")
+                if processed_bytes >= limits.max_total_bytes:
+                    break
                 continue
             candidates.append(
                 NoteCandidate(
@@ -295,6 +321,8 @@ def discover_notes(
                 )
             )
             accepted_bytes += len(payload)
+            if processed_bytes >= limits.max_total_bytes:
+                break
     finally:
         os.close(root_fd)
     return (
@@ -527,6 +555,7 @@ def _persist_failure(
     last_success: Optional[str],
     facts_committed: bool,
     pending_repair_direction: Optional[str],
+    transaction_id: Optional[str] = None,
 ) -> dict[str, Any]:
     failed = dict(result)
     failed["status"] = "error"
@@ -542,6 +571,8 @@ def _persist_failure(
         failed["last_success"] = last_success
     if pending_repair_direction:
         failed["pending_repair_direction"] = pending_repair_direction
+    if transaction_id:
+        failed["transaction_id"] = transaction_id
     persisted = _persist_state(vault, failed)
     if persisted.get("error_code") == "state_write_failed":
         persisted["original_error_stage"] = stage
@@ -557,6 +588,22 @@ def ingest_notes(
     limits: Optional[NoteIngestionLimits] = None,
 ) -> dict[str, Any]:
     limits = limits or NoteIngestionLimits()
+    vault = Path(vault_dir)
+    readiness = manifest_readiness(vault)
+    if not readiness["ok"]:
+        return {
+            "status": "error",
+            "error_code": "notes_migration_required",
+            "dry_run": dry_run,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "totals": {
+                "scanned": 0,
+                "planned_this_run": 0,
+                "ingested_this_run": 0,
+                "processed_bytes": 0,
+                "accepted_bytes": 0,
+            },
+        }
     (
         candidates,
         skipped,
@@ -577,109 +624,57 @@ def ingest_notes(
         processed_bytes=processed_bytes,
         accepted_bytes=accepted_bytes,
     )
-    vault = Path(vault_dir)
-    index = vault / "index.jsonl"
+    manifest = readiness.get("manifest")
     if dry_run:
-        existing = _read_ids(index)
+        sources = manifest.get("sources", {}) if isinstance(manifest, dict) else {}
         result["totals"]["planned_this_run"] = sum(
-            1 for record in records if record["id"] not in existing
+            1
+            for candidate, record in zip(candidates, records)
+            if not isinstance(sources.get(candidate.relative_path), dict)
+            or sources[candidate.relative_path].get("record_id") != record["id"]
         )
         return result
 
     last_success = _previous_last_success(vault)
-    index.parent.mkdir(parents=True, exist_ok=True)
-    stage = "reconcile"
+    stage = "manifest"
     facts_committed = False
     pending_repair_direction: Optional[str] = None
     try:
-        with source_lock(index, exclusive=True):
-            stage = "repair_tail"
-            repaired_tails = 1 if _repair_partial_tail(index) else 0
-            daily_paths = sorted((vault / "daily").glob("*.jsonl"))
-            for daily in daily_paths:
-                if _repair_partial_tail(daily):
-                    repaired_tails += 1
-
-            stage = "reconcile"
-            index_rows = _read_note_rows(index)
-            daily_rows: dict[str, dict[str, Any]] = {}
-            for daily in daily_paths:
-                for record_id, row in _read_note_rows(daily).items():
-                    existing = daily_rows.get(record_id)
-                    if (
-                        existing is not None
-                        and _public_fact(existing) != _public_fact(row)
-                    ):
-                        raise ReconciliationConflict("daily_note_payload_conflict")
-                    daily_rows[record_id] = row
-            for record_id in index_rows.keys() & daily_rows.keys():
-                if _public_fact(index_rows[record_id]) != _public_fact(
-                    daily_rows[record_id]
-                ):
-                    raise ReconciliationConflict("cross_store_note_payload_conflict")
-
-            index_ids = set(index_rows)
-            daily_ids = set(daily_rows)
-            daily_appends: dict[Path, list[dict[str, Any]]] = {}
-            index_appends: list[dict[str, Any]] = []
-            missing_from_index = daily_ids - index_ids
-            missing_from_daily = index_ids - daily_ids
-            repaired_index = len(missing_from_index)
-            repaired_daily = len(missing_from_daily)
-            ingested = 0
-
-            for record_id in sorted(missing_from_daily):
-                row = index_rows[record_id]
-                daily_appends.setdefault(_daily_path_for(vault, row), []).append(row)
-            for record_id in sorted(missing_from_index):
-                index_appends.append(daily_rows[record_id])
-            daily_ids.update(missing_from_daily)
-            index_ids.update(missing_from_index)
-
-            for record in records:
-                daily = vault / "daily" / f"{str(record['timestamp'])[:10]}.jsonl"
-                if daily not in daily_paths:
-                    stage = "repair_tail"
-                    if _repair_partial_tail(daily):
-                        repaired_tails += 1
-                    stage = "reconcile"
-                    daily_paths.append(daily)
-                in_daily = record["id"] in daily_ids
-                in_index = record["id"] in index_ids
-                if in_daily and in_index:
-                    continue
-                if not in_daily:
-                    daily_appends.setdefault(daily, []).append(record)
-                    daily_ids.add(record["id"])
-                if not in_index:
-                    index_appends.append(record)
-                    index_ids.add(record["id"])
-                    ingested += 1
-
-            stage = "daily_append"
-            for daily, rows in sorted(daily_appends.items(), key=lambda item: str(item[0])):
-                if rows:
-                    facts_committed = True
-                    pending_repair_direction = (
-                        "daily_to_index" if index_appends else "index_to_daily"
-                    )
-                _append_jsonl(daily, rows, public=True)
-            if daily_appends and index_appends:
-                after_daily_append()
-            elif daily_appends:
-                pending_repair_direction = None
-
-            stage = "index_append"
-            if index_appends:
-                facts_committed = True
-                pending_repair_direction = "daily_to_index"
-            _append_jsonl(index, index_appends, public=False)
+        ensure_manifest(vault)
+        stage = "recover_pending"
+        recovery = recover_pending(vault)
+        result["totals"]["recovered_transactions"] = recovery["recovered"]
+        current_manifest = ensure_manifest(vault)
+        sources = current_manifest.get("sources", {})
+        ingested = 0
+        for candidate, record in zip(candidates, records):
+            previous = sources.get(candidate.relative_path)
+            if isinstance(previous, dict) and previous.get("record_id") == record["id"]:
+                continue
+            source_value = {
+                "record_id": record["id"],
+                "content_sha256": hashlib.sha256(candidate.text.encode("utf-8")).hexdigest(),
+                "size": candidate.size,
+                "mtime": candidate.mtime,
+            }
+            stage = "transaction"
+            transaction = commit_record(
+                vault,
+                record,
+                source_entry=(candidate.relative_path, source_value),
+            )
+            facts_committed = facts_committed or transaction.facts_committed
             pending_repair_direction = None
-            result["totals"]["ingested_this_run"] = ingested
-            result["totals"]["repaired_index"] = repaired_index
-            result["totals"]["repaired_daily"] = repaired_daily
-            result["totals"]["repaired_tails"] = repaired_tails
+            sources[candidate.relative_path] = source_value
+            if transaction.facts_committed:
+                ingested += 1
+        result["totals"]["ingested_this_run"] = ingested
     except Exception as exc:
+        if isinstance(exc, AppendFailure):
+            facts_committed = facts_committed or exc.result.bytes_written > 0
+        if isinstance(exc, (AppendFailure, TransactionConflict)):
+            pending_repair_direction = "journal_declared"
+            stage = str(getattr(exc, "stage", None) or stage)
         return _persist_failure(
             vault,
             result,
@@ -688,6 +683,7 @@ def ingest_notes(
             last_success=last_success,
             facts_committed=facts_committed,
             pending_repair_direction=pending_repair_direction,
+            transaction_id=str(getattr(exc, "tx_id", None) or "") or None,
         )
 
     result["last_success"] = result["generated_at"]

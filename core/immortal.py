@@ -1351,6 +1351,14 @@ def command_notes_status(args) -> int:
     return run_script("obsidian_notes_sync.py", ["status", *args.notes_status_args])
 
 
+def command_notes_migrate(args) -> int:
+    vault = configured_vault_dir(load_config())
+    return run_script(
+        "notes_migration.py",
+        ["--vault-dir", str(vault), *args.notes_migrate_args],
+    )
+
+
 def command_obsidian_sync(args) -> int:
     code = run_script("obsidian_sync.py", ["sync", *args.obsidian_args])
     if code == 0 and "--dry-run" not in args.obsidian_args:
@@ -1897,6 +1905,13 @@ def build_parser() -> argparse.ArgumentParser:
     notes_status.add_argument("notes_status_args", nargs=argparse.REMAINDER)
     notes_status.set_defaults(func=command_notes_status)
 
+    notes_migrate = sub.add_parser(
+        "notes-migrate",
+        help="Explicitly migrate and reconcile legacy Obsidian note facts",
+    )
+    notes_migrate.add_argument("notes_migrate_args", nargs=argparse.REMAINDER)
+    notes_migrate.set_defaults(func=command_notes_migrate)
+
     obsidian_sync = sub.add_parser("obsidian-sync", help="Generate Obsidian reading-layer indexes and link health")
     obsidian_sync.add_argument("obsidian_args", nargs=argparse.REMAINDER)
     obsidian_sync.set_defaults(func=command_obsidian_sync)
@@ -2119,6 +2134,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("obsidian_notes_sync.py", ["sync", *argv[1:]])
     if argv and argv[0] == "notes-status":
         return run_script("obsidian_notes_sync.py", ["status", *argv[1:]])
+    if argv and argv[0] == "notes-migrate":
+        return command_notes_migrate(
+            argparse.Namespace(notes_migrate_args=argv[1:])
+        )
     if argv and argv[0] == "obsidian-sync":
         return command_obsidian_sync(argparse.Namespace(obsidian_args=argv[1:]))
     if argv and argv[0] == "obsidian-status":
