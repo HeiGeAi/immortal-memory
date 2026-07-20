@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from event_store import EventConflict, JsonlEventStore
 from file_utils import atomic_write_text
-from model_types import ModelValidationError, new_event, validate_claim
+from model_types import ACTOR_KINDS, ModelValidationError, new_event, validate_claim
 
 
 ALLOWED_TRANSITIONS = {
@@ -30,6 +31,9 @@ CLAIM_EVENT_TYPES = frozenset(
         "claim.corrected",
     }
 )
+
+PUBLIC_IDEMPOTENCY_PREFIX = "claim:public:v1:"
+INTERNAL_IDEMPOTENCY_PREFIX = "claim:internal:v1:"
 
 
 class InvalidTransition(ValueError):
@@ -56,6 +60,10 @@ def _canonical(value: Mapping[str, Any]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _key_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 class ClaimStore:
@@ -102,7 +110,24 @@ class ClaimStore:
                 "write_metadata_required",
                 "expected revision, request ID, idempotency key, actor, and reason are required",
             )
+        if actor["kind"] not in ACTOR_KINDS:
+            raise InvalidTransition(
+                "invalid_actor",
+                "actor kind is not allowed",
+            )
         return {"kind": actor["kind"], "id": actor["id"]}
+
+    @staticmethod
+    def _public_idempotency_key(value: str) -> str:
+        return PUBLIC_IDEMPOTENCY_PREFIX + _key_digest(value)
+
+    @staticmethod
+    def _internal_replacement_key(started: Mapping[str, Any]) -> str:
+        return (
+            INTERNAL_IDEMPOTENCY_PREFIX
+            + "correction:"
+            + _key_digest(str(started["event_id"]))
+        )
 
     @staticmethod
     def _event_claim(event: Mapping[str, Any]) -> Dict[str, Any]:
@@ -165,13 +190,6 @@ class ClaimStore:
             ("\n".join(rows) + "\n") if rows else "",
         )
 
-    @staticmethod
-    def _view_watermark(claims: Mapping[str, Mapping[str, Any]]) -> int:
-        return max(
-            (int(claim.get("based_on_event_seq", 0)) for claim in claims.values()),
-            default=0,
-        )
-
     def _refresh_current(self) -> Dict[str, Dict[str, Any]]:
         while True:
             current, replay_head = self._replay()
@@ -180,29 +198,24 @@ class ClaimStore:
                 return current
 
     def _ensure_current(self) -> Dict[str, Dict[str, Any]]:
-        current = self._read_current()
-        events = self.events.read_all()
-        head = int(events[-1]["seq"]) if events else 0
-        event_claim_ids = {
-            str(event["payload"]["claim"]["claim_id"])
-            for event in events
-            if event["event_type"] in CLAIM_EVENT_TYPES
-        }
-        if (
-            current is None
-            or self._view_watermark(current) != head
-            or set(current) != event_claim_ids
-        ):
-            return self._refresh_current()
-        return current
+        self._recover_pending_corrections()
+        while True:
+            projected, replay_head = self._replay()
+            current = self._read_current()
+            if current is None or _canonical(current) != _canonical(projected):
+                self._write_current(projected)
+                current = projected
+            if self.events.watermark() == replay_head:
+                return current
 
-    def _find_idempotent(
+    def _find_idempotent_by_keys(
         self,
-        idempotency_key: str,
+        idempotency_keys: List[str],
         operation: Mapping[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        requested_keys = set(idempotency_keys)
         for event in self.events.read_all():
-            if event["idempotency_key"] != idempotency_key:
+            if event["idempotency_key"] not in requested_keys:
                 continue
             existing = event["payload"].get("operation")
             if not isinstance(existing, Mapping) or _canonical(existing) != _canonical(operation):
@@ -212,6 +225,16 @@ class ClaimStore:
                 )
             return event
         return None
+
+    def _find_public_idempotent(
+        self,
+        idempotency_key: str,
+        operation: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return self._find_idempotent_by_keys(
+            [self._public_idempotency_key(idempotency_key), idempotency_key],
+            operation,
+        )
 
     def _append(
         self,
@@ -298,7 +321,7 @@ class ClaimStore:
             "method": "create",
             "reason": reason,
         }
-        previous = self._find_idempotent(idempotency_key, operation)
+        previous = self._find_public_idempotent(idempotency_key, operation)
         if previous is not None:
             return self._return_projected(previous)
         if self.events.stream_version(str(candidate["claim_id"])) != 0:
@@ -311,7 +334,7 @@ class ClaimStore:
             operation=operation,
             expected_version=0,
             request_id=request_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=self._public_idempotency_key(idempotency_key),
             actor=actor_value,
             reason=reason,
             previous_status=None,
@@ -355,7 +378,7 @@ class ClaimStore:
             "reason": reason,
             "status": status,
         }
-        previous = self._find_idempotent(idempotency_key, operation)
+        previous = self._find_public_idempotent(idempotency_key, operation)
         if previous is not None:
             return self._return_projected(previous)
         claim = self.get(claim_id)
@@ -389,7 +412,7 @@ class ClaimStore:
             operation=operation,
             expected_version=int(claim["stream_version"]),
             request_id=request_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=self._public_idempotency_key(idempotency_key),
             actor=actor_value,
             reason=reason,
             previous_status=str(claim["status"]),
@@ -414,6 +437,14 @@ class ClaimStore:
             actor=actor,
             reason=reason,
         )
+        if (
+            not isinstance(evidence_ids, list)
+            or any(not isinstance(item, str) or not item.strip() for item in evidence_ids)
+        ):
+            raise InvalidTransition(
+                "new_evidence_required",
+                "reconsideration requires valid new evidence",
+            )
         operation = {
             "actor": actor_value,
             "claim_id": claim_id,
@@ -422,7 +453,7 @@ class ClaimStore:
             "method": "reconsider",
             "reason": reason,
         }
-        previous = self._find_idempotent(idempotency_key, operation)
+        previous = self._find_public_idempotent(idempotency_key, operation)
         if previous is not None:
             return self._return_projected(previous)
         claim = self.get(claim_id)
@@ -432,14 +463,6 @@ class ClaimStore:
             raise InvalidTransition(
                 "invalid_transition",
                 "only rejected claims can be reconsidered",
-            )
-        if (
-            not isinstance(evidence_ids, list)
-            or any(not isinstance(item, str) or not item.strip() for item in evidence_ids)
-        ):
-            raise InvalidTransition(
-                "new_evidence_required",
-                "reconsideration requires valid new evidence",
             )
         new_evidence = [
             item for item in evidence_ids if item not in claim["evidence_ids"]
@@ -468,41 +491,61 @@ class ClaimStore:
             operation=operation,
             expected_version=int(claim["stream_version"]),
             request_id=request_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=self._public_idempotency_key(idempotency_key),
             actor=actor_value,
             reason=reason,
             previous_status="rejected",
         )
         return self._return_projected(event)
 
-    def _finish_correction(
+    def _append_replacement(
         self,
         started: Mapping[str, Any],
-        *,
-        request_id: str,
-        idempotency_key: str,
-        actor: Mapping[str, str],
-        reason: str,
     ) -> Dict[str, Any]:
         replacement = dict(started["payload"]["replacement"])
         operation = {
             "method": "correct.replacement",
-            "parent_idempotency_key": idempotency_key,
+            "parent_event_id": str(started["event_id"]),
         }
-        derived_key = idempotency_key + ":replacement"
-        existing = self._find_idempotent(derived_key, operation)
+        derived_key = self._internal_replacement_key(started)
+        existing = self._find_idempotent_by_keys([derived_key], operation)
         if existing is None:
             existing = self._append(
                 event_type="claim.corrected",
                 claim=replacement,
                 operation=operation,
                 expected_version=0,
-                request_id=request_id + ":replacement",
+                request_id=str(started["request_id"]) + ":replacement",
                 idempotency_key=derived_key,
-                actor=actor,
-                reason=reason,
+                actor=dict(started["actor"]),
+                reason=str(started["payload"]["reason"]),
                 previous_status=None,
             )
+        return existing
+
+    def _recover_pending_corrections(self) -> None:
+        events = self.events.read_all()
+        corrected_claim_ids = {
+            str(event["payload"]["claim"]["claim_id"])
+            for event in events
+            if event["event_type"] == "claim.corrected"
+        }
+        for event in events:
+            if event["event_type"] != "claim.correction_started":
+                continue
+            replacement_id = str(event["payload"]["replacement"]["claim_id"])
+            if replacement_id in corrected_claim_ids:
+                continue
+            completed = self._append_replacement(event)
+            corrected_claim_ids.add(
+                str(completed["payload"]["claim"]["claim_id"])
+            )
+
+    def _finish_correction(
+        self,
+        started: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        existing = self._append_replacement(started)
         return self._return_projected(existing)
 
     def correct(
@@ -536,15 +579,9 @@ class ClaimStore:
             "reason": reason,
             "statement": statement.strip(),
         }
-        previous = self._find_idempotent(idempotency_key, operation)
+        previous = self._find_public_idempotent(idempotency_key, operation)
         if previous is not None:
-            return self._finish_correction(
-                previous,
-                request_id=request_id,
-                idempotency_key=idempotency_key,
-                actor=actor_value,
-                reason=reason,
-            )
+            return self._finish_correction(previous)
         claim = self.get(claim_id)
         if int(claim["revision"]) != expected_revision:
             raise InvalidTransition("version_conflict", "claim revision changed")
@@ -589,16 +626,10 @@ class ClaimStore:
             operation=operation,
             expected_version=int(claim["stream_version"]),
             request_id=request_id,
-            idempotency_key=idempotency_key,
+            idempotency_key=self._public_idempotency_key(idempotency_key),
             actor=actor_value,
             reason=reason,
             previous_status="confirmed",
             extra_payload={"replacement": replacement},
         )
-        return self._finish_correction(
-            started,
-            request_id=request_id,
-            idempotency_key=idempotency_key,
-            actor=actor_value,
-            reason=reason,
-        )
+        return self._finish_correction(started)

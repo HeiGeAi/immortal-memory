@@ -101,6 +101,22 @@ def test_every_public_write_rejects_missing_or_blank_operation_metadata(tmp_path
     assert transition_error.value.code == "write_metadata_required"
 
 
+def test_unsupported_actor_kind_raises_stable_invalid_transition(tmp_path):
+    store = ClaimStore(tmp_path)
+
+    with pytest.raises(InvalidTransition) as captured:
+        store.create(
+            claim(),
+            expected_revision=0,
+            request_id="req-create",
+            idempotency_key="idem-create",
+            actor={"kind": "admin", "id": "owner"},
+            reason="reason",
+        )
+
+    assert captured.value.code == "invalid_actor"
+
+
 def test_explicit_state_machine_accepts_only_declared_transitions(tmp_path):
     store = ClaimStore(tmp_path)
     create(store, claim())
@@ -146,6 +162,35 @@ def test_correct_supersedes_original_and_preserves_four_event_history(tmp_path):
     validate_claim(corrected)
 
 
+def test_external_suffix_key_cannot_preempt_internal_correction_event(tmp_path):
+    store = ClaimStore(tmp_path)
+    store.create(
+        claim("clm-attacker", "正常外部写入"),
+        expected_revision=0,
+        request_id="req-attacker",
+        idempotency_key="correct-a:replacement",
+        actor=ACTOR,
+        reason="normal external key remains allowed",
+    )
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+
+    corrected = store.correct(
+        "clm-1",
+        "先给结果，再给必要依据",
+        reason="more precise",
+        expected_revision=2,
+        request_id="req-correct-a",
+        idempotency_key="correct-a",
+        actor=ACTOR,
+    )
+
+    assert corrected["status"] == "confirmed"
+    assert corrected["supersedes"] == "clm-1"
+    assert store.get("clm-1")["status"] == "superseded"
+    assert len(store.events.read_all()) == 5
+
+
 def test_rejected_claim_requires_evidence_not_already_on_the_claim(tmp_path):
     store = ClaimStore(tmp_path)
     create(store, claim())
@@ -176,6 +221,25 @@ def test_rejected_claim_requires_evidence_not_already_on_the_claim(tmp_path):
     assert reconsidered["status"] == "candidate"
     assert reconsidered["revision"] == 3
     assert reconsidered["evidence_ids"] == ["ev-1", "ev-2"]
+
+
+def test_reconsider_none_evidence_raises_stable_invalid_transition(tmp_path):
+    store = ClaimStore(tmp_path)
+    create(store, claim())
+    transition(store, "clm-1", "rejected", 1, "reject")
+
+    with pytest.raises(InvalidTransition) as captured:
+        store.reconsider(
+            "clm-1",
+            evidence_ids=None,
+            reason="review again",
+            expected_revision=2,
+            request_id="req-reconsider-none",
+            idempotency_key="idem-reconsider-none",
+            actor=ACTOR,
+        )
+
+    assert captured.value.code == "new_evidence_required"
 
 
 def test_concurrent_same_revision_allows_only_one_correction(tmp_path):
@@ -263,6 +327,25 @@ def test_current_row_missing_stream_version_is_repaired(tmp_path):
     repaired = ClaimStore(tmp_path)
 
     assert repaired.get("clm-1")["stream_version"] == 1
+
+
+def test_forged_current_row_at_global_head_is_replayed_per_claim(tmp_path):
+    store = ClaimStore(tmp_path)
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+    old_candidate = dict(store.events.read_all()[0]["payload"]["claim"])
+    old_candidate["based_on_event_seq"] = 2
+    old_candidate["stream_version"] = 2
+    store.current_path.write_text(
+        json.dumps(old_candidate, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    repaired = ClaimStore(tmp_path)
+
+    assert repaired.get("clm-1")["status"] == "confirmed"
+    assert repaired.get("clm-1")["revision"] == 2
+    assert repaired.get("clm-1")["stream_version"] == 2
 
 
 def test_event_commit_before_current_write_is_repaired_on_restart(
@@ -375,3 +458,41 @@ def test_correction_retry_finishes_second_event_after_mid_operation_failure(
     assert corrected["supersedes"] == "clm-1"
     assert store.get("clm-1")["status"] == "superseded"
     assert len(store.events.read_all()) == 4
+
+
+def test_restart_recovers_pending_correction_without_caller_retry(
+    tmp_path,
+    monkeypatch,
+):
+    store = ClaimStore(tmp_path)
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+    real_append = store.events.append
+    attempts = {"count": 0}
+
+    def fail_second_append(event):
+        attempts["count"] += 1
+        if attempts["count"] == 2:
+            raise OSError("replacement append interrupted")
+        return real_append(event)
+
+    monkeypatch.setattr(store.events, "append", fail_second_append)
+    with pytest.raises(OSError, match="replacement append interrupted"):
+        store.correct(
+            "clm-1",
+            "先给结果，再给必要依据",
+            reason="more precise",
+            expected_revision=2,
+            request_id="req-correct",
+            idempotency_key="idem-correct",
+            actor=ACTOR,
+        )
+
+    repaired = ClaimStore(tmp_path)
+    active = [row for row in repaired.list() if row["status"] != "superseded"]
+
+    assert repaired.get("clm-1")["status"] == "superseded"
+    assert len(active) == 1
+    assert active[0]["statement"] == "先给结果，再给必要依据"
+    assert active[0]["supersedes"] == "clm-1"
+    assert len(repaired.events.read_all()) == 4
