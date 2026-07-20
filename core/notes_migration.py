@@ -21,6 +21,10 @@ from typing import Any, Callable, Optional
 from index_locks import source_lock
 from notes_transactions import (
     MANIFEST_SCHEMA_VERSION,
+    _open_directory_fd,
+    _secure_read_json,
+    _secure_regular_exists,
+    _secure_unlink,
     durable_atomic_json,
     manifest_path,
 )
@@ -646,11 +650,11 @@ def _recover_publication(
     boundary: Callable[[str], None],
 ) -> Optional[dict[str, Any]]:
     journal_path = _migration_dir(vault) / "publication.json"
-    if not journal_path.is_file():
-        return None
     try:
-        journal = json.loads(journal_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        journal = _secure_read_json(journal_path)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MigrationConflict("publication_journal_invalid") from exc
     entries = journal.get("entries")
     source_snapshot = journal.get("source_snapshot")
@@ -658,17 +662,47 @@ def _recover_publication(
         journal.get("schema_version") != 1
         or not isinstance(entries, list)
         or not isinstance(source_snapshot, dict)
-        or journal.get("stage") not in {"prepared", "publishing", "complete"}
+        or journal.get("stage")
+        not in {
+            "prepared",
+            "publishing",
+            "publishing_zero",
+            "publishing_started",
+            "complete",
+        }
     ):
         raise MigrationConflict("publication_journal_invalid")
+    if journal["stage"] == "publishing":
+        journal["stage"] = "publishing_zero"
+        durable_atomic_json(journal_path, journal)
     index = Path(vault) / "index.jsonl"
     index.parent.mkdir(parents=True, exist_ok=True)
     with source_lock(index, exclusive=True):
         if journal["stage"] == "prepared":
             _validate_source_snapshot(vault, source_snapshot)
-            journal["stage"] = "publishing"
+            journal["stage"] = "publishing_zero"
             durable_atomic_json(journal_path, journal)
-        for entry in entries:
+        if journal["stage"] == "publishing_zero" and entries:
+            first = entries[0]
+            if not isinstance(first, dict):
+                raise MigrationConflict("publication_journal_invalid")
+            first_target, _first_staging, _first_backup = (
+                _derived_publication_paths(vault, first)
+            )
+            first_expected = (
+                str(first.get("sha256") or ""),
+                int(first.get("length") or 0),
+            )
+            first_hash = (
+                _hash_file(first_target) if first_target.is_file() else None
+            )
+            if first.get("replace_started") and first_hash == first_expected:
+                first["published"] = True
+                journal["stage"] = "publishing_started"
+                durable_atomic_json(journal_path, journal)
+            else:
+                _validate_source_snapshot(vault, source_snapshot)
+        for position, entry in enumerate(entries):
             if not isinstance(entry, dict):
                 raise MigrationConflict("publication_journal_invalid")
             target, staging, backup = _derived_publication_paths(vault, entry)
@@ -679,6 +713,8 @@ def _recover_publication(
                 raise MigrationConflict("publication_journal_invalid") from exc
             if target_hash == expected:
                 entry["published"] = True
+                if position == 0 and journal["stage"] == "publishing_zero":
+                    journal["stage"] = "publishing_started"
                 durable_atomic_json(journal_path, journal)
                 continue
             if entry.get("published"):
@@ -690,12 +726,18 @@ def _recover_publication(
             if target.exists() and not backup.exists():
                 shutil.copy2(target, backup)
                 _fsync_parent(backup)
+            if position == 0 and journal["stage"] == "publishing_zero":
+                entry["replace_started"] = True
+                durable_atomic_json(journal_path, journal)
+                _validate_source_snapshot(vault, source_snapshot)
             os.replace(staging, target)
             _fsync_parent(target)
             boundary(f"publication_replaced:{entry['relative']}")
             if _hash_file(target) != expected:
                 raise MigrationConflict("published_hash_mismatch")
             entry["published"] = True
+            if position == 0 and journal["stage"] == "publishing_zero":
+                journal["stage"] = "publishing_started"
             durable_atomic_json(journal_path, journal)
     journal["stage"] = "complete"
     durable_atomic_json(journal_path, journal)
@@ -777,10 +819,7 @@ def _completed_manifest(
 def _cleanup_completed_publication(vault: Path) -> None:
     root = _migration_dir(vault)
     journal = root / "publication.json"
-    try:
-        journal.unlink()
-    except FileNotFoundError:
-        pass
+    _secure_unlink(journal, missing_ok=True)
     staging = root / "staging"
     if staging.exists():
         shutil.rmtree(staging)
@@ -798,7 +837,17 @@ def _migrate_notes_locked(
     limits = limits or MigrationLimits()
     callback = boundary or (lambda _stage: None)
     publication_path = _migration_dir(vault) / "publication.json"
-    if publication_path.is_file():
+    try:
+        publication_exists = _secure_regular_exists(publication_path)
+    except OSError:
+        return {
+            "status": "error",
+            "error_code": "migration_publication_failed",
+            "error_stage": "publication",
+            "error_type": "MigrationConflict",
+            "production_changed": False,
+        }
+    if publication_exists:
         try:
             recovered_publication = _recover_publication(
                 vault,
@@ -840,13 +889,11 @@ def _migrate_notes_locked(
                 "production_changed": True,
             }
     existing_manifest_path = manifest_path(vault)
-    if existing_manifest_path.is_file():
-        try:
-            existing_manifest = json.loads(
-                existing_manifest_path.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            existing_manifest = None
+    try:
+        existing_manifest = _secure_read_json(existing_manifest_path)
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+        existing_manifest = None
+    if existing_manifest is not None:
         if (
             isinstance(existing_manifest, dict)
             and existing_manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
@@ -1004,14 +1051,17 @@ def migrate_notes(
 ) -> dict[str, Any]:
     vault = Path(vault_dir)
     root = _migration_dir(vault)
-    root.mkdir(parents=True, exist_ok=True)
     lock_path = root / "migration.lock"
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    directory_fd: Optional[int] = None
     try:
-        fd = os.open(lock_path, flags, 0o600)
+        directory_fd = _open_directory_fd(root, create=True)
+        fd = os.open(lock_path.name, flags, 0o600, dir_fd=directory_fd)
     except OSError:
+        if directory_fd is not None:
+            os.close(directory_fd)
         return {
             "status": "error",
             "error_code": "notes_migration_busy",
@@ -1037,6 +1087,8 @@ def migrate_notes(
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
 
 def build_parser() -> argparse.ArgumentParser:

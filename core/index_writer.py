@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from index_locks import source_lock
+from maintenance_gate import writer_access
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -31,6 +32,8 @@ def _fsync_directory(path: Path) -> None:
 def append_jsonl_records(
     source: Path,
     records: Iterable[Mapping[str, Any]],
+    *,
+    maintenance_held: bool = False,
 ) -> int:
     """Append one serialized batch under the shared source lock contract."""
     source = Path(source)
@@ -43,9 +46,12 @@ def append_jsonl_records(
     ).encode("utf-8")
     source.parent.mkdir(parents=True, exist_ok=True)
 
-    with source_lock(source, exclusive=True):
+    def append_locked() -> None:
         source_existed = source.exists()
-        fd = os.open(source, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(source, flags, 0o600)
         try:
             _write_all(fd, payload)
             os.fsync(fd)
@@ -53,4 +59,12 @@ def append_jsonl_records(
             os.close(fd)
         if not source_existed:
             _fsync_directory(source.parent)
+
+    if maintenance_held:
+        with source_lock(source, exclusive=True):
+            append_locked()
+    else:
+        with writer_access(source.parent):
+            with source_lock(source, exclusive=True):
+                append_locked()
     return len(rows)

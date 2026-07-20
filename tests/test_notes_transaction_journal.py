@@ -358,3 +358,51 @@ def test_unscoped_transaction_replay_is_idempotent_after_journal_cleanup(tmp_pat
     assert [row["id"] for row in index_rows] == [record()["id"]]
     assert manifest["stats"]["committed_transactions"] == 1
     assert manifest["applied_transactions"] == [first.tx_id]
+
+
+def test_manifest_rejects_symlinked_notes_directory(tmp_path):
+    module = transactions()
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    vault.mkdir()
+    outside.mkdir()
+    (vault / "notes").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(module.JournalDurabilityError):
+        module.ensure_manifest(vault)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_commit_rejects_symlinked_transactions_directory(tmp_path):
+    module = transactions()
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    module.ensure_manifest(vault)
+    (vault / "notes" / "transactions").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(module.TransactionConflict):
+        module.commit_record(vault, record())
+
+    assert list(outside.iterdir()) == []
+
+
+def test_commit_rejects_symlinked_journal_file(tmp_path):
+    module = transactions()
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"private":true}\n', encoding="utf-8")
+    module.ensure_manifest(vault)
+    journal = module._prepared_journal(vault, record(), None)
+    directory = module.transactions_dir(vault)
+    directory.mkdir()
+    (directory / f"{journal['tx_id']}.json").symlink_to(outside)
+
+    with pytest.raises(module.TransactionConflict):
+        module.commit_record(vault, record())
+
+    assert outside.read_text(encoding="utf-8") == '{"private":true}\n'

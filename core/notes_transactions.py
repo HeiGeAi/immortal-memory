@@ -6,14 +6,15 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from index_locks import source_lock
+from maintenance_gate import MaintenanceInProgress, writer_access
 
 
 MANIFEST_SCHEMA_VERSION = 2
@@ -33,6 +34,10 @@ class InvalidDailyTarget(TransactionConflict, ValueError):
 
 
 class MigrationRequired(RuntimeError):
+    pass
+
+
+class MigrationInProgress(TransactionConflict):
     pass
 
 
@@ -73,47 +78,193 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _open_directory_fd(path: Path, *, create: bool) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if not absolute.is_absolute():
+        raise OSError("directory_path_not_absolute")
+    parts = list(absolute.parts)
+    note_positions = [
+        index for index, part in enumerate(parts) if part == "notes"
+    ]
+    if note_positions:
+        boundary = note_positions[-1]
+        vault_anchor = Path(*parts[:boundary])
+        if vault_anchor.exists():
+            anchor = vault_anchor.resolve(strict=True)
+            remaining = parts[boundary:]
+        else:
+            anchor = vault_anchor.parent.resolve(strict=True)
+            remaining = [vault_anchor.name, *parts[boundary:]]
+    else:
+        anchor = Path(absolute.anchor)
+        remaining = parts[1:]
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(anchor, flags)
+    try:
+        for part in remaining:
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                    os.fsync(fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _secure_read_bytes(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> bytes:
+    path = Path(path)
+    parent_fd = _open_directory_fd(path.parent, create=False)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            metadata = os.fstat(fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_bytes:
+                raise OSError("metadata_file_invalid")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > max_bytes:
+                raise OSError("metadata_file_too_large")
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _secure_read_json(path: Path) -> Any:
+    return json.loads(_secure_read_bytes(path).decode("utf-8"))
+
+
+def _secure_regular_exists(path: Path) -> bool:
+    path = Path(path)
+    try:
+        parent_fd = _open_directory_fd(path.parent, create=False)
+    except FileNotFoundError:
+        return False
+    try:
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode):
+            raise OSError("metadata_symlink_forbidden")
+        return stat.S_ISREG(metadata.st_mode)
+    finally:
+        os.close(parent_fd)
+
+
+def _secure_unlink(path: Path, *, missing_ok: bool) -> None:
+    path = Path(path)
+    parent_fd = _open_directory_fd(path.parent, create=False)
+    try:
+        try:
+            metadata = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise OSError("metadata_target_invalid")
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def durable_atomic_json(path: Path, payload: Any) -> None:
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Optional[Path] = None
+    parent_fd: Optional[int] = None
+    temporary_name: Optional[str] = None
     stage = "temp_write"
     try:
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(path.parent),
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as handle:
-                temporary = Path(handle.name)
-                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                stage = "file_fsync"
-                os.fsync(handle.fileno())
-            stage = "replace"
-            os.replace(temporary, path)
-            temporary = None
             stage = "parent_fsync"
-            parent_fd = os.open(
-                path.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
+            parent_fd = _open_directory_fd(path.parent, create=True)
+            stage = "temp_write"
             try:
-                os.fsync(parent_fd)
+                existing = os.stat(
+                    path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(
+                    existing.st_mode
+                ):
+                    raise OSError("metadata_target_invalid")
+            except FileNotFoundError:
+                pass
+            temporary_name = (
+                f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(temporary_name, flags, 0o600, dir_fd=parent_fd)
+            try:
+                encoded = (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                view = memoryview(encoded)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("metadata_write_no_progress")
+                    view = view[written:]
+                stage = "file_fsync"
+                os.fsync(fd)
             finally:
-                os.close(parent_fd)
+                os.close(fd)
+            stage = "replace"
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = None
+            stage = "parent_fsync"
+            os.fsync(parent_fd)
         except OSError as exc:
             raise JournalDurabilityError(stage) from exc
     finally:
-        if temporary is not None:
+        if temporary_name is not None and parent_fd is not None:
             try:
-                temporary.unlink()
+                os.unlink(temporary_name, dir_fd=parent_fd)
             except FileNotFoundError:
                 pass
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def manifest_path(vault: Path) -> Path:
@@ -160,11 +311,11 @@ def _fact_layer_nonempty(vault: Path) -> bool:
 
 def _load_manifest(vault: Path) -> Optional[dict[str, Any]]:
     path = manifest_path(vault)
-    if not path.is_file():
-        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = _secure_read_json(path)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -445,6 +596,16 @@ def _journal_path(vault: Path, tx_id: str) -> Path:
     return transactions_dir(vault) / f"{tx_id}.json"
 
 
+def _assert_no_publication_in_progress(vault: Path) -> None:
+    publication = Path(vault) / "notes" / "migration" / "publication.json"
+    try:
+        exists = _secure_regular_exists(publication)
+    except OSError as exc:
+        raise MigrationInProgress("notes_migration_in_progress") from exc
+    if exists:
+        raise MigrationInProgress("notes_migration_in_progress")
+
+
 def _path_size(path: Path) -> int:
     try:
         return path.stat().st_size
@@ -620,17 +781,9 @@ def _finalize_transaction(
     durable_atomic_json(manifest_path(vault), manifest)
     boundary("pending_cleared")
     try:
-        journal_path.unlink()
-    except FileNotFoundError:
-        return
-    parent_fd = os.open(
-        journal_path.parent,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-    )
-    try:
-        os.fsync(parent_fd)
-    finally:
-        os.close(parent_fd)
+        _secure_unlink(journal_path, missing_ok=True)
+    except OSError as exc:
+        raise TransactionConflict("transaction_journal_cleanup_failed") from exc
 
 
 def _resume_one(
@@ -712,7 +865,7 @@ def _resume_one(
         raise
 
 
-def commit_record(
+def _commit_record_guarded(
     vault: Path,
     row: dict[str, Any],
     *,
@@ -724,6 +877,7 @@ def commit_record(
     index = vault / "index.jsonl"
     index.parent.mkdir(parents=True, exist_ok=True)
     with source_lock(index, exclusive=True):
+        _assert_no_publication_in_progress(vault)
         ensure_manifest(vault)
         _recover_pending_locked(vault)
         manifest = ensure_manifest(vault)
@@ -756,13 +910,18 @@ def commit_record(
                 AppendResult(0, True),
             )
         path = _journal_path(vault, str(journal["tx_id"]))
-        if path.is_file():
-            existing = json.loads(path.read_text(encoding="utf-8"))
-            journal = existing
-        else:
+        try:
+            existing = _secure_read_json(path)
+        except FileNotFoundError:
             durable_atomic_json(path, journal)
             callback("journal_persisted")
             _register_pending(vault, str(journal["tx_id"]))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TransactionConflict("transaction_journal_invalid") from exc
+        else:
+            if not isinstance(existing, dict):
+                raise TransactionConflict("transaction_journal_invalid")
+            journal = existing
         callback("prepared")
         return _resume_one(
             vault,
@@ -772,8 +931,28 @@ def commit_record(
         )
 
 
+def commit_record(
+    vault: Path,
+    row: dict[str, Any],
+    *,
+    boundary: Optional[Callable[[str], None]] = None,
+    source_entry: Optional[tuple[str, dict[str, Any]]] = None,
+) -> TransactionResult:
+    try:
+        with writer_access(Path(vault)):
+            return _commit_record_guarded(
+                vault,
+                row,
+                boundary=boundary,
+                source_entry=source_entry,
+            )
+    except MaintenanceInProgress as exc:
+        raise MigrationInProgress("notes_migration_in_progress") from exc
+
+
 def _recover_pending_locked(vault: Path) -> dict[str, int]:
     vault = Path(vault)
+    _assert_no_publication_in_progress(vault)
     recovered = 0
     cleaned = 0
     ensure_manifest(vault)
@@ -781,20 +960,31 @@ def _recover_pending_locked(vault: Path) -> dict[str, int]:
     pending = list(manifest.get("pending_transactions") or [])
     if len(pending) > MAX_PENDING_TRANSACTIONS:
         raise TransactionConflict("pending_transaction_limit")
-    directory = transactions_dir(vault)
     discovered: set[str] = set()
     try:
-        with os.scandir(directory) as entries:
-            for entry in entries:
+        directory_fd = _open_directory_fd(transactions_dir(vault), create=False)
+        try:
+            names = os.listdir(directory_fd)
+            for name in names:
                 if len(discovered) >= MAX_PENDING_TRANSACTIONS:
                     raise TransactionConflict("transaction_directory_limit")
-                if (
-                    entry.name.endswith(".json")
-                    and entry.is_file(follow_symlinks=False)
-                ):
-                    discovered.add(entry.name[:-5])
+                if not name.endswith(".json"):
+                    continue
+                metadata = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise TransactionConflict("transaction_journal_symlink")
+                if stat.S_ISREG(metadata.st_mode):
+                    discovered.add(name[:-5])
+        finally:
+            os.close(directory_fd)
     except FileNotFoundError:
         pass
+    except OSError as exc:
+        raise TransactionConflict("transaction_directory_invalid") from exc
     tx_ids = set(pending) | discovered
     if len(tx_ids) > MAX_PENDING_TRANSACTIONS:
         raise TransactionConflict("transaction_directory_limit")
@@ -802,10 +992,10 @@ def _recover_pending_locked(vault: Path) -> dict[str, int]:
         if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{24}", tx_id):
             raise TransactionConflict("pending_transaction_id_invalid")
         path = _journal_path(vault, tx_id)
-        if not path.is_file():
-            raise TransactionConflict("pending_transaction_missing")
         try:
-            journal = json.loads(path.read_text(encoding="utf-8"))
+            journal = _secure_read_json(path)
+        except FileNotFoundError:
+            raise TransactionConflict("pending_transaction_missing")
         except (OSError, json.JSONDecodeError) as exc:
             raise TransactionConflict("transaction_journal_invalid") from exc
         if not isinstance(journal, dict) or journal.get("tx_id") != tx_id:
@@ -826,9 +1016,18 @@ def _recover_pending_locked(vault: Path) -> dict[str, int]:
     return {"recovered": recovered, "cleaned": cleaned}
 
 
-def recover_pending(vault: Path) -> dict[str, int]:
+def _recover_pending_guarded(vault: Path) -> dict[str, int]:
     vault = Path(vault)
     index = vault / "index.jsonl"
     index.parent.mkdir(parents=True, exist_ok=True)
     with source_lock(index, exclusive=True):
+        _assert_no_publication_in_progress(vault)
         return _recover_pending_locked(vault)
+
+
+def recover_pending(vault: Path) -> dict[str, int]:
+    try:
+        with writer_access(Path(vault)):
+            return _recover_pending_guarded(vault)
+    except MaintenanceInProgress as exc:
+        raise MigrationInProgress("notes_migration_in_progress") from exc

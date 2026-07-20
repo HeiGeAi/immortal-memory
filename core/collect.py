@@ -23,6 +23,7 @@ import uuid
 import hashlib
 import redact_common
 from index_writer import append_jsonl_records
+from maintenance_gate import writer_access
 from typing import Optional
 from datetime import datetime, timezone
 from pathlib import Path
@@ -194,7 +195,7 @@ def redact_record_content(record: dict) -> dict:
     return rec
 
 
-def write_records(records_by_date: dict):
+def _write_records_locked(records_by_date: dict):
     """将记录写入日文件和全量索引。"""
     for date_str, records in sorted(records_by_date.items()):
         daily_file = DAILY_DIR / f"{date_str}.jsonl"
@@ -218,7 +219,16 @@ def write_records(records_by_date: dict):
             if dedup_key is not None:
                 indexed["_dedup_key"] = dedup_key
             indexed_records.append(indexed)
-        append_jsonl_records(INDEX_FILE, indexed_records)
+        append_jsonl_records(
+            INDEX_FILE,
+            indexed_records,
+            maintenance_held=True,
+        )
+
+
+def write_records(records_by_date: dict):
+    with writer_access(IMMORTAL_DIR):
+        _write_records_locked(records_by_date)
 
 
 def copy_to_immortal(src: Path, category: str, date_str: str) -> Optional[str]:

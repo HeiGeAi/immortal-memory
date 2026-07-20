@@ -590,3 +590,122 @@ def test_completed_migration_is_idempotent_without_rescanning(tmp_path, monkeypa
     assert second["status"] == "ok"
     assert second["already_migrated"] is True
     assert second["production_changed"] is False
+
+
+def test_crash_before_first_replace_revalidates_snapshot_on_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    module = migration()
+    vault = tmp_path / "vault"
+    original = note("one", "one")
+    late = {"id": "late", "source": "web", "content": "must survive"}
+    write_rows(vault / "index.jsonl", [original, original])
+    real_replace = module.os.replace
+    interrupted = {"done": False}
+
+    def crash_before_fact_replace(source, target, *args, **kwargs):
+        if (
+            not interrupted["done"]
+            and not kwargs
+            and Path(source).parent.name == "staging"
+        ):
+            interrupted["done"] = True
+            raise RuntimeError("injected")
+        return real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "replace", crash_before_fact_replace)
+    failed = module.migrate_notes(vault)
+    monkeypatch.setattr(module.os, "replace", real_replace)
+    with (vault / "index.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(late, ensure_ascii=False) + "\n")
+
+    resumed = module.migrate_notes(vault)
+
+    assert failed["status"] == "error"
+    assert resumed["status"] == "error"
+    assert resumed["error_code"] == "migration_publication_failed"
+    assert rows(vault / "index.jsonl") == [original, original, late]
+
+
+def test_pending_publication_blocks_note_transaction_writer(tmp_path):
+    module = migration()
+    transactions = importlib.import_module("notes_transactions")
+    vault = tmp_path / "vault"
+    original = note("one", "one")
+    write_rows(vault / "index.jsonl", [original, original])
+
+    def interrupt(stage):
+        if stage.startswith("publication_replaced:"):
+            raise RuntimeError("injected")
+
+    failed = module.migrate_notes(vault, boundary=interrupt)
+
+    with pytest.raises(transactions.MigrationInProgress):
+        transactions.commit_record(vault, note("late", "late"))
+
+    assert failed["status"] == "error"
+    assert (vault / "notes" / "migration" / "publication.json").is_file()
+
+
+def test_pending_publication_blocks_non_notes_daily_writer(tmp_path):
+    module = migration()
+    web_capture = importlib.import_module("web_capture")
+    maintenance = importlib.import_module("maintenance_gate")
+    vault = tmp_path / "vault"
+    original = note("one", "one")
+    write_rows(vault / "index.jsonl", [original, original])
+
+    def interrupt(stage):
+        if stage.startswith("publication_replaced:"):
+            raise RuntimeError("injected")
+
+    failed = module.migrate_notes(vault, boundary=interrupt)
+    late = {
+        "id": "late-web",
+        "timestamp": "2026-07-19T15:00:00+00:00",
+        "source": "web",
+        "content": "must be blocked",
+    }
+
+    with pytest.raises(maintenance.MaintenanceInProgress):
+        web_capture.append_records(vault, [late])
+
+    assert failed["status"] == "error"
+    assert all(
+        row["id"] != "late-web"
+        for path in (vault / "daily").glob("*.jsonl")
+        for row in rows(path)
+    )
+    assert all(row["id"] != "late-web" for row in rows(vault / "index.jsonl"))
+
+
+def test_pending_publication_blocks_direct_index_writer(tmp_path):
+    module = migration()
+    index_writer = importlib.import_module("index_writer")
+    maintenance = importlib.import_module("maintenance_gate")
+    vault = tmp_path / "vault"
+    original = note("one", "one")
+    write_rows(vault / "index.jsonl", [original, original])
+
+    def interrupt(stage):
+        if stage.startswith("publication_replaced:"):
+            raise RuntimeError("injected")
+
+    failed = module.migrate_notes(vault, boundary=interrupt)
+    before = (vault / "index.jsonl").read_bytes()
+
+    with pytest.raises(maintenance.MaintenanceInProgress):
+        index_writer.append_jsonl_records(
+            vault / "index.jsonl",
+            [
+                {
+                    "id": "late-direct",
+                    "source": "web",
+                    "content": "must be blocked",
+                }
+            ],
+        )
+
+    assert failed["status"] == "error"
+    assert (vault / "index.jsonl").read_bytes() == before

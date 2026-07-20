@@ -40,6 +40,39 @@ def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
     )
 
 
+def _delegates_to_index_writer(
+    tree: ast.Module,
+    function_name: str,
+    *,
+    seen: set[str] | None = None,
+) -> bool:
+    visited = set(seen or ())
+    if function_name in visited:
+        return False
+    visited.add(function_name)
+    function = _function(tree, function_name)
+    local_functions = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id == "append_jsonl_records":
+            return True
+        if (
+            node.func.id in local_functions
+            and _delegates_to_index_writer(
+                tree,
+                node.func.id,
+                seen=visited,
+            )
+        ):
+            return True
+    return False
+
+
 def _is_authoritative_index_path(node: ast.AST) -> bool:
     return any(
         (
@@ -117,12 +150,7 @@ def test_public_index_writers_delegate_to_one_durable_helper() -> None:
             and any(alias.name == "append_jsonl_records" for alias in node.names)
             for node in tree.body
         )
-        calls_helper = any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "append_jsonl_records"
-            for node in ast.walk(_function(tree, function_name))
-        )
+        calls_helper = _delegates_to_index_writer(tree, function_name)
         assert imports_helper, filename
         assert calls_helper, f"{filename}:{function_name}"
 
