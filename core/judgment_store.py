@@ -97,6 +97,33 @@ def _card_body(value: Mapping[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _creation_intent_from_card(
+    card: Mapping[str, Any],
+    *,
+    include_card_id: bool,
+    include_requested_created_at: bool,
+) -> Dict[str, Any]:
+    intent = {
+        "alternatives": card["alternatives"],
+        "claim_ids": card["claim_ids"],
+        "constraints": card["constraints"],
+        "decision": card["decision"],
+        "evidence_ids": card["evidence_ids"],
+        "goal": card["goal"],
+        "lesson": card["lesson"],
+        "next_trigger": card["next_trigger"],
+        "privacy": card["privacy"],
+        "signals": card["signals"],
+        "situation": card["situation"],
+        "title": card["title"],
+    }
+    if include_card_id:
+        intent["card_id"] = card["card_id"]
+    if include_requested_created_at:
+        intent["requested_created_at"] = card["created_at"]
+    return intent
+
+
 def _parse_timestamp(value: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise InvalidJudgmentOperation(
@@ -309,6 +336,7 @@ class JudgmentStore:
 
         if event_type == "judgment.created":
             input_fields = operation.get("input")
+            intent = operation.get("intent")
             initial_outcome = {
                 "status": "unknown",
                 "summary": "",
@@ -326,6 +354,17 @@ class JudgmentStore:
                 and operation.get("expected_revision") == 0
                 and isinstance(input_fields, Mapping)
                 and _canonical(input_fields) == _canonical(raw_card)
+                and isinstance(intent, Mapping)
+                and _canonical(intent)
+                == _canonical(
+                    _creation_intent_from_card(
+                        raw_card,
+                        include_card_id="card_id" in intent,
+                        include_requested_created_at=(
+                            "requested_created_at" in intent
+                        ),
+                    )
+                )
                 and event.get("previous_status") is None
                 and int(event["expected_version"]) == 0
                 and int(event["stream_version"]) == 1
@@ -501,6 +540,7 @@ class JudgmentStore:
         idempotency_key: str,
         operation: Mapping[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        self._replay()
         requested = {idempotency_key, self._public_key(idempotency_key)}
         for event in self.events.iter_all():
             if event["idempotency_key"] not in requested:
@@ -654,22 +694,11 @@ class JudgmentStore:
                 "version_conflict",
                 "judgment creation requires expected revision 0",
             )
-        intent = {
-            "alternatives": card["alternatives"],
-            "claim_ids": card["claim_ids"],
-            "constraints": card["constraints"],
-            "decision": card["decision"],
-            "evidence_ids": card["evidence_ids"],
-            "goal": card["goal"],
-            "lesson": card["lesson"],
-            "next_trigger": card["next_trigger"],
-            "privacy": card["privacy"],
-            "signals": card["signals"],
-            "situation": card["situation"],
-            "title": card["title"],
-        }
-        if card_id is not None:
-            intent["card_id"] = card_id
+        intent = _creation_intent_from_card(
+            card,
+            include_card_id=card_id is not None,
+            include_requested_created_at=now is not None,
+        )
         operation = {
             "actor": actor_value,
             "expected_revision": 0,

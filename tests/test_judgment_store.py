@@ -469,6 +469,24 @@ def test_created_event_binds_initial_outcome_and_timestamps(tmp_path):
     assert captured.value.code == "judgment_event_corruption"
 
 
+def test_created_event_binds_idempotency_intent_to_the_actual_card(tmp_path):
+    store = JudgmentStore(tmp_path)
+    create_card(store)
+    rows = [
+        json.loads(line)
+        for line in store.events.path.read_text(encoding="utf-8").splitlines()
+    ]
+    rows[0]["payload"]["operation"]["intent"]["title"] = "另一业务意图"
+    store.events.path.write_text(
+        json.dumps(rows[0], ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidJudgmentOperation) as captured:
+        JudgmentStore(tmp_path)
+    assert captured.value.code == "judgment_event_corruption"
+
+
 def test_future_create_and_outcome_are_rejected_with_stable_errors(tmp_path):
     now = datetime(2026, 7, 20, 8, tzinfo=timezone.utc)
     store = JudgmentStore(tmp_path, clock=lambda: now)
