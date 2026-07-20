@@ -131,6 +131,55 @@ def test_new_vault_manifest_is_compatible_and_bounded(tmp_path):
     assert (vault / "notes" / "manifest.json").is_file()
 
 
+def test_manifest_creation_supports_completely_missing_home_ancestry(tmp_path):
+    module = transactions()
+    vault = tmp_path / "missing-home" / ".immortal"
+
+    manifest = module.ensure_manifest(vault)
+
+    assert manifest["migration_status"] == "not_required"
+    assert (vault / "notes" / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "damaged_manifest",
+    [
+        {"schema_version": 2, "sources": {}},
+        {
+            "schema_version": 2,
+            "migration_status": "complete",
+            "sources": {},
+            "pending_transactions": [],
+            "applied_transactions": [],
+            "last_successful_tx": None,
+            "stats": {"committed_transactions": 0},
+        },
+    ],
+)
+def test_semantically_damaged_manifest_cannot_bypass_migration(
+    tmp_path,
+    damaged_manifest,
+):
+    module = transactions()
+    vault = tmp_path / "vault"
+    index = vault / "index.jsonl"
+    index.parent.mkdir(parents=True)
+    index.write_bytes(module.serialize_record(record(), public=False))
+    manifest = module.manifest_path(vault)
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps(damaged_manifest), encoding="utf-8")
+    before = index.read_bytes()
+    candidate = record()
+    candidate["id"] = "must-not-append"
+
+    readiness = module.manifest_readiness(vault)
+    with pytest.raises(module.MigrationRequired):
+        module.commit_record(vault, candidate)
+
+    assert readiness == {"ok": False, "error_code": "notes_migration_required"}
+    assert index.read_bytes() == before
+
+
 def test_legacy_fact_layer_requires_explicit_migration_without_full_scan(tmp_path):
     module = transactions()
     vault = tmp_path / "vault"

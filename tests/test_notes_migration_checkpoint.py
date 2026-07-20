@@ -1128,6 +1128,60 @@ def test_catalog_replacement_between_open_and_sqlite_connect_fails_closed(
     assert outside.read_bytes() == before
 
 
+def test_resume_rejects_well_formed_catalog_from_another_run(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    index_only = {"id": "web-only", "source": "web", "content": "must survive"}
+    shared = note("shared", "shared")
+    write_rows(vault / "index.jsonl", [index_only, shared])
+    write_rows(vault / "daily" / "2026-07-19.jsonl", [shared])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=1, max_bytes=100_000, max_seconds=30),
+    )
+    before_index = (vault / "index.jsonl").read_bytes()
+    replacement = tmp_path / "replacement.sqlite3"
+    replacement_connection = module._connect_catalog(replacement, reset=True)
+    replacement_connection.close()
+    catalog = vault / "notes" / "migration" / "catalog.sqlite3"
+    os.replace(replacement, catalog)
+
+    resumed = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert resumed["status"] == "error"
+    assert resumed["error_code"] == "notes_migration_reset_required"
+    assert resumed["production_changed"] is False
+    assert (vault / "index.jsonl").read_bytes() == before_index
+
+
+def test_resume_rejects_catalog_progress_older_than_checkpoint(tmp_path):
+    module = migration()
+    vault = tmp_path / "vault"
+    write_rows(vault / "index.jsonl", [note("one", "one")])
+    write_rows(vault / "daily" / "2026-07-19.jsonl", [note("one", "one")])
+    partial = module.migrate_notes(
+        vault,
+        limits=module.MigrationLimits(max_files=1, max_bytes=100_000, max_seconds=30),
+    )
+    checkpoint = json.loads(
+        (vault / "notes" / "migration" / "checkpoint.json").read_text()
+    )
+    catalog = sqlite3.connect(vault / "notes" / "migration" / "catalog.sqlite3")
+    catalog.execute(
+        "UPDATE migration_progress SET file_index=0, offset=0, generation=0 WHERE id=1"
+    )
+    catalog.commit()
+    catalog.close()
+
+    resumed = module.migrate_notes(vault)
+
+    assert partial["status"] == "partial"
+    assert checkpoint["catalog_generation"] > 0
+    assert resumed["error_code"] == "notes_migration_reset_required"
+    assert resumed["production_changed"] is False
+
+
 def test_reset_does_not_mkdir_through_migration_root_symlink(tmp_path, monkeypatch):
     module = migration()
     vault = tmp_path / "vault"

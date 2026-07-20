@@ -174,6 +174,9 @@ def test_installed_compatibility_commands_are_safe_and_closed(tmp_path):
     assert dry_run.returncode == 0, dry_run.stdout + dry_run.stderr
     assert '"dry_run": true' in dry_run.stdout
     assert not (tmp_path / "home" / ".immortal" / "index.jsonl").exists()
+    if (tmp_path / "home").exists():
+        shutil.rmtree(tmp_path / "home")
+    assert not (tmp_path / "home").exists()
 
     ingest = subprocess.run(
         [

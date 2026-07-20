@@ -82,35 +82,27 @@ def _open_directory_fd(path: Path, *, create: bool) -> int:
     absolute = Path(os.path.abspath(os.fspath(path)))
     if not absolute.is_absolute():
         raise OSError("directory_path_not_absolute")
-    parts = list(absolute.parts)
-    note_positions = [
-        index for index, part in enumerate(parts) if part == "notes"
-    ]
-    if note_positions:
-        boundary = note_positions[-1]
-        vault_anchor = Path(*parts[:boundary])
-        if vault_anchor.exists():
-            anchor = vault_anchor.resolve(strict=True)
-            remaining = parts[boundary:]
-        else:
-            anchor = vault_anchor.parent.resolve(strict=True)
-            remaining = [vault_anchor.name, *parts[boundary:]]
-    else:
-        anchor = Path(absolute.anchor)
-        remaining = parts[1:]
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(anchor, flags)
+    fd = os.open(absolute.anchor, flags)
     try:
-        for part in remaining:
-            if create:
+        for part in absolute.parts[1:]:
+            try:
+                next_fd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
                 try:
                     os.mkdir(part, 0o700, dir_fd=fd)
                     os.fsync(fd)
                 except FileExistsError:
                     pass
-            next_fd = os.open(part, flags, dir_fd=fd)
+                next_fd = os.open(part, flags, dir_fd=fd)
+            metadata = os.fstat(next_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(next_fd)
+                raise OSError("directory_component_invalid")
             os.close(fd)
             fd = next_fd
         return fd
@@ -319,18 +311,85 @@ def _load_manifest(vault: Path) -> Optional[dict[str, Any]]:
         return None
     if not isinstance(payload, dict):
         return None
-    if payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-        return None
-    if not isinstance(payload.get("sources"), dict):
+    if not _manifest_semantically_valid(payload):
         return None
     return payload
 
 
+def _bounded_string_list(value: Any, *, limit: int) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= limit
+        and all(isinstance(item, str) and item for item in value)
+    )
+
+
+def _manifest_semantically_valid(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        return False
+    migration_status = payload.get("migration_status")
+    if migration_status not in {"not_required", "complete"}:
+        return False
+    sources = payload.get("sources")
+    if not isinstance(sources, dict) or len(sources) > MAX_MANIFEST_SOURCES:
+        return False
+    for relative, value in sources.items():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or not isinstance(value, dict)
+            or not isinstance(value.get("record_id"), str)
+            or not value.get("record_id")
+        ):
+            return False
+    if not _bounded_string_list(
+        payload.get("pending_transactions"),
+        limit=MAX_PENDING_TRANSACTIONS,
+    ):
+        return False
+    if not _bounded_string_list(
+        payload.get("applied_transactions"),
+        limit=MAX_UNSCOPED_APPLIED_TRANSACTIONS,
+    ):
+        return False
+    last_tx = payload.get("last_successful_tx")
+    if last_tx is not None and (not isinstance(last_tx, str) or not last_tx):
+        return False
+    stats = payload.get("stats")
+    if not isinstance(stats, dict):
+        return False
+    committed = stats.get("committed_transactions")
+    if (
+        not isinstance(committed, int)
+        or isinstance(committed, bool)
+        or committed < 0
+    ):
+        return False
+    if migration_status == "not_required":
+        return isinstance(payload.get("generated_at"), str) and bool(
+            payload.get("generated_at")
+        )
+    return (
+        isinstance(payload.get("migration_version"), int)
+        and not isinstance(payload.get("migration_version"), bool)
+        and payload.get("migration_version") >= 1
+        and isinstance(payload.get("migration_completed_at"), str)
+        and bool(payload.get("migration_completed_at"))
+        and isinstance(payload.get("index_rebuild_required"), bool)
+    )
+
+
 def manifest_readiness(vault: Path) -> dict[str, Any]:
     vault = Path(vault)
+    try:
+        manifest_exists = _secure_regular_exists(manifest_path(vault))
+    except OSError:
+        manifest_exists = False
     manifest = _load_manifest(vault)
     if manifest is not None:
         return {"ok": True, "manifest": manifest}
+    if manifest_exists:
+        return {"ok": False, "error_code": "notes_migration_required"}
     if (vault / "notes" / "state.json").exists() or _fact_layer_nonempty(vault):
         return {"ok": False, "error_code": "notes_migration_required"}
     return {"ok": True, "manifest": None}

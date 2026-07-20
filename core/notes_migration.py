@@ -23,6 +23,7 @@ from index_locks import source_lock
 from notes_transactions import (
     MANIFEST_SCHEMA_VERSION,
     _open_directory_fd,
+    _manifest_semantically_valid,
     _secure_read_json,
     _secure_regular_exists,
     _secure_unlink,
@@ -63,6 +64,10 @@ class MigrationExpansionLimit(RuntimeError):
 
 
 class MigrationDeadline(RuntimeError):
+    pass
+
+
+class CatalogBindingError(MigrationConflict):
     pass
 
 
@@ -233,7 +238,12 @@ def _source_files(
     return files
 
 
-def _connect_catalog(path: Path, *, reset: bool) -> sqlite3.Connection:
+def _connect_catalog(
+    path: Path,
+    *,
+    reset: bool,
+    catalog_id: Optional[str] = None,
+) -> sqlite3.Connection:
     path = Path(path)
     parent_fd = _open_directory_fd(path.parent, create=True)
     flags = os.O_RDWR | os.O_CREAT
@@ -319,10 +329,91 @@ def _connect_catalog(path: Path, *, reset: bool) -> sqlite3.Connection:
           raw_sha256 TEXT NOT NULL,
           PRIMARY KEY(file_rel, seq)
         );
+        CREATE TABLE IF NOT EXISTS migration_meta(
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS migration_progress(
+          id INTEGER PRIMARY KEY CHECK(id=1),
+          file_index INTEGER NOT NULL,
+          offset INTEGER NOT NULL,
+          generation INTEGER NOT NULL
+        );
         """
     )
+    if reset:
+        bound_id = catalog_id or uuid.uuid4().hex
+        con.execute(
+            "INSERT OR REPLACE INTO migration_meta(key,value) VALUES('catalog_id',?)",
+            (bound_id,),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO migration_progress(id,file_index,offset,generation) "
+            "VALUES(1,0,0,0)"
+        )
+    elif catalog_id is not None:
+        row = con.execute(
+            "SELECT value FROM migration_meta WHERE key='catalog_id'"
+        ).fetchone()
+        if row is None or row[0] != catalog_id:
+            con.close()
+            raise CatalogBindingError("migration_catalog_id_mismatch")
     con.commit()
     return con
+
+
+def _catalog_progress(con: sqlite3.Connection) -> tuple[int, int, int]:
+    row = con.execute(
+        "SELECT file_index,offset,generation FROM migration_progress WHERE id=1"
+    ).fetchone()
+    if row is None:
+        raise CatalogBindingError("migration_catalog_progress_missing")
+    try:
+        file_index, offset, generation = map(int, row)
+    except (TypeError, ValueError) as exc:
+        raise CatalogBindingError("migration_catalog_progress_invalid") from exc
+    if file_index < 0 or offset < 0 or generation < 0:
+        raise CatalogBindingError("migration_catalog_progress_invalid")
+    return file_index, offset, generation
+
+
+def _validate_catalog_progress(
+    con: sqlite3.Connection,
+    checkpoint: dict[str, Any],
+) -> None:
+    db_file_index, db_offset, db_generation = _catalog_progress(con)
+    try:
+        checkpoint_file_index = int(checkpoint.get("file_index") or 0)
+        checkpoint_offset = int(checkpoint.get("offset") or 0)
+        checkpoint_generation = int(checkpoint["catalog_generation"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CatalogBindingError("migration_checkpoint_progress_invalid") from exc
+    if (
+        db_generation < checkpoint_generation
+        or (db_file_index, db_offset)
+        < (checkpoint_file_index, checkpoint_offset)
+    ):
+        raise CatalogBindingError("migration_catalog_progress_behind")
+
+
+def _commit_catalog_progress(
+    con: sqlite3.Connection,
+    *,
+    file_index: int,
+    offset: int,
+) -> int:
+    current_file, current_offset, generation = _catalog_progress(con)
+    next_file, next_offset = max(
+        (current_file, current_offset),
+        (int(file_index), int(offset)),
+    )
+    next_generation = generation + 1
+    con.execute(
+        "UPDATE migration_progress SET file_index=?,offset=?,generation=? WHERE id=1",
+        (next_file, next_offset, next_generation),
+    )
+    con.commit()
+    return next_generation
 
 
 def _strict_daily_relpath(row: dict[str, Any]) -> str:
@@ -746,11 +837,16 @@ def _scan_catalog(
                                 checkpoint["completed_signatures"][relative]["mtime_ns"],
                             ),
                         )
-                        con.commit()
+                        catalog_generation = _commit_catalog_progress(
+                            con,
+                            file_index=file_index + 1,
+                            offset=0,
+                        )
                         after_catalog_commit_before_checkpoint()
                         file_index += 1
                         checkpoint["file_index"] = file_index
                         checkpoint["offset"] = 0
+                        checkpoint["catalog_generation"] = catalog_generation
                         checkpoint.pop("active_file", None)
                         checkpoint.pop("active_signature", None)
                         if is_gzip:
@@ -781,8 +877,13 @@ def _scan_catalog(
                         rows_since_checkpoint >= 500
                         or bytes_since_checkpoint >= 1024 * 1024
                     ):
-                        con.commit()
+                        catalog_generation = _commit_catalog_progress(
+                            con,
+                            file_index=file_index,
+                            offset=offset,
+                        )
                         after_catalog_commit_before_checkpoint()
+                        checkpoint["catalog_generation"] = catalog_generation
                         _write_checkpoint(vault, checkpoint)
                         rows_since_checkpoint = 0
                         bytes_since_checkpoint = 0
@@ -791,10 +892,15 @@ def _scan_catalog(
                     or bytes_read >= limits.max_bytes
                     or compressed_read >= limits.max_compressed_bytes
                 ):
-                    con.commit()
+                    catalog_generation = _commit_catalog_progress(
+                        con,
+                        file_index=file_index,
+                        offset=offset,
+                    )
                     after_catalog_commit_before_checkpoint()
                     checkpoint["file_index"] = file_index
                     checkpoint["offset"] = offset
+                    checkpoint["catalog_generation"] = catalog_generation
                     _write_checkpoint(vault, checkpoint)
                     break
             finally:
@@ -1261,6 +1367,7 @@ def _manifest_payload(con: sqlite3.Connection) -> dict[str, Any]:
         "index_rebuild_required": True,
         "last_successful_tx": None,
         "pending_transactions": [],
+        "applied_transactions": [],
         "sources": sources,
         "stats": {
             "committed_transactions": 0,
@@ -1323,8 +1430,19 @@ def _migrate_notes_locked(
                 recovered_publication
                 and _publication_changed(vault, recovered_publication)
             )
-            catalog = _connect_catalog(_catalog_path(vault), reset=False)
+            checkpoint = _load_checkpoint(vault)
+            if not isinstance(checkpoint, dict):
+                raise CatalogBindingError("migration_checkpoint_missing")
+            catalog_id = checkpoint.get("catalog_id")
+            if not isinstance(catalog_id, str) or not catalog_id:
+                raise CatalogBindingError("migration_checkpoint_catalog_id_missing")
+            catalog = _connect_catalog(
+                _catalog_path(vault),
+                reset=False,
+                catalog_id=catalog_id,
+            )
             try:
+                _validate_catalog_progress(catalog, checkpoint)
                 duplicates = int(
                     catalog.execute(
                         "SELECT COALESCE(SUM(MAX(seen_index-1,0)+MAX(seen_daily-1,0)),0) "
@@ -1335,9 +1453,6 @@ def _migrate_notes_locked(
                 _completed_manifest(vault, catalog, payload=manifest_payload)
             finally:
                 catalog.close()
-            checkpoint = _load_checkpoint(vault) or {
-                "migration_version": MIGRATION_VERSION
-            }
             checkpoint["stage"] = "complete"
             _write_checkpoint(vault, checkpoint)
             _cleanup_completed_publication(vault)
@@ -1386,6 +1501,7 @@ def _migrate_notes_locked(
     if existing_manifest is not None:
         if (
             isinstance(existing_manifest, dict)
+            and _manifest_semantically_valid(existing_manifest)
             and existing_manifest.get("schema_version") == MANIFEST_SCHEMA_VERSION
             and existing_manifest.get("migration_status") == "complete"
             and existing_manifest.get("migration_version") == MIGRATION_VERSION
@@ -1452,9 +1568,12 @@ def _migrate_notes_locked(
     if checkpoint is None:
         source_plan = [relative for relative, _path in discovered_files]
         source_signatures = _source_snapshot(discovered_files)
+        catalog_id = uuid.uuid4().hex
         checkpoint = {
             "migration_version": MIGRATION_VERSION,
             "run_id": uuid.uuid4().hex,
+            "catalog_id": catalog_id,
+            "catalog_generation": 0,
             "file_index": 0,
             "offset": 0,
             "completed_signatures": {},
@@ -1488,7 +1607,30 @@ def _migrate_notes_locked(
         for relative in checkpoint["source_plan"]
     ]
     try:
-        con = _connect_catalog(_catalog_path(vault), reset=reset)
+        catalog_id = checkpoint.get("catalog_id")
+        if not isinstance(catalog_id, str) or not catalog_id:
+            raise CatalogBindingError("migration_checkpoint_catalog_id_missing")
+        con = _connect_catalog(
+            _catalog_path(vault),
+            reset=reset,
+            catalog_id=catalog_id,
+        )
+        _validate_catalog_progress(con, checkpoint)
+    except CatalogBindingError:
+        try:
+            con.close()
+        except (NameError, sqlite3.Error):
+            pass
+        return {
+            "status": "error",
+            "error_code": "notes_migration_reset_required",
+            "run_id": checkpoint.get("run_id"),
+            "reset_command": (
+                "immortal notes-migrate-reset --run-id "
+                f"{checkpoint.get('run_id')} --json"
+            ),
+            "production_changed": False,
+        }
     except (OSError, sqlite3.DatabaseError):
         return {
             "status": "error",
