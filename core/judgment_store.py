@@ -10,7 +10,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from event_store import (
     EventConflict,
@@ -76,10 +76,6 @@ class JudgmentNotFound(InvalidJudgmentOperation):
         super().__init__("judgment_not_found", "judgment does not exist: " + card_id)
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _canonical(value: Any) -> str:
     return json.dumps(
         value,
@@ -128,7 +124,12 @@ def _parse_timestamp(value: str) -> datetime:
 class JudgmentStore:
     """Maintain immutable judgment events and deterministic derived views."""
 
-    def __init__(self, vault_dir: Path) -> None:
+    def __init__(
+        self,
+        vault_dir: Path,
+        *,
+        clock: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         absolute = os.path.abspath(str(vault_dir))
         if sys.platform == "darwin" and (
             absolute == "/var" or absolute.startswith("/var/")
@@ -139,8 +140,39 @@ class JudgmentStore:
         self.events = JsonlEventStore(self.root / "events.jsonl")
         self.current_path = self.root / "current.jsonl"
         self.evaluations_path = self.root / "evaluations.jsonl"
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         if self.events.exists():
             self._ensure_views()
+
+    def _clock_now(self) -> datetime:
+        try:
+            value = self._clock()
+        except Exception as exc:
+            raise InvalidJudgmentOperation(
+                "invalid_clock",
+                "judgment clock failed",
+            ) from exc
+        if (
+            not isinstance(value, datetime)
+            or value.tzinfo is None
+            or value.utcoffset() is None
+        ):
+            raise InvalidJudgmentOperation(
+                "invalid_clock",
+                "judgment clock must return a timezone-aware datetime",
+            )
+        return value.astimezone(timezone.utc)
+
+    def _operation_time(self, previous: Optional[Mapping[str, Any]] = None) -> datetime:
+        now = self._clock_now()
+        if previous is not None:
+            previous_time = _parse_timestamp(str(previous["updated_at"]))
+            if previous_time > now:
+                raise InvalidJudgmentOperation(
+                    "future_timestamp",
+                    "stored judgment timestamp is later than the trusted clock",
+                )
+        return now
 
     @staticmethod
     def _public_key(value: str) -> str:
@@ -277,16 +309,30 @@ class JudgmentStore:
 
         if event_type == "judgment.created":
             input_fields = operation.get("input")
+            initial_outcome = {
+                "status": "unknown",
+                "summary": "",
+                "observed_at": None,
+            }
+            try:
+                created_at = _parse_timestamp(str(raw_card["created_at"]))
+                updated_at = _parse_timestamp(str(raw_card["updated_at"]))
+                occurred_at = _parse_timestamp(str(event["occurred_at"]))
+            except InvalidJudgmentOperation as exc:
+                cls._corruption("judgment.created timestamps are invalid", exc)
             cls._require(
                 previous is None
                 and operation.get("method") == "create"
                 and operation.get("expected_revision") == 0
                 and isinstance(input_fields, Mapping)
-                and all(raw_card.get(key) == value for key, value in input_fields.items())
+                and _canonical(input_fields) == _canonical(raw_card)
                 and event.get("previous_status") is None
                 and int(event["expected_version"]) == 0
                 and int(event["stream_version"]) == 1
-                and projected["status"] == "candidate",
+                and projected["status"] == "candidate"
+                and projected["outcome"] == initial_outcome
+                and created_at == updated_at
+                and created_at <= occurred_at,
                 "judgment.created semantics are invalid",
             )
             current[card_id] = projected
@@ -300,6 +346,17 @@ class JudgmentStore:
             and projected["revision"] == previous["revision"] + 1
             and event.get("previous_status") == previous["status"],
             "judgment mutation revision or status is invalid",
+        )
+        try:
+            previous_updated = _parse_timestamp(str(previous["updated_at"]))
+            projected_updated = _parse_timestamp(str(projected["updated_at"]))
+            occurred_at = _parse_timestamp(str(event["occurred_at"]))
+        except InvalidJudgmentOperation as exc:
+            cls._corruption("judgment mutation timestamps are invalid", exc)
+        cls._require(
+            previous_updated <= projected_updated
+            and projected_updated == occurred_at,
+            "judgment mutation timestamp order is invalid",
         )
 
         if event_type == "judgment.transitioned":
@@ -345,6 +402,16 @@ class JudgmentStore:
                 and isinstance(outcome, Mapping)
                 and projected["outcome"] == outcome,
                 "judgment.outcome_recorded semantics are invalid",
+            )
+            try:
+                observed_at = _parse_timestamp(
+                    str(projected["outcome"]["observed_at"])
+                )
+            except InvalidJudgmentOperation as exc:
+                cls._corruption("judgment outcome timestamp is invalid", exc)
+            cls._require(
+                observed_at <= occurred_at,
+                "judgment outcome cannot be observed in the future",
             )
             cls._unchanged_except(
                 previous,
@@ -439,13 +506,24 @@ class JudgmentStore:
             if event["idempotency_key"] not in requested:
                 continue
             existing = event["payload"].get("operation")
-            if not isinstance(existing, Mapping) or _canonical(existing) != _canonical(operation):
+            if (
+                not isinstance(existing, Mapping)
+                or self._operation_intent(existing)
+                != self._operation_intent(operation)
+            ):
                 raise InvalidJudgmentOperation(
                     "idempotency_conflict",
                     "idempotency key was reused for a different intent",
                 )
             return event
         return None
+
+    @staticmethod
+    def _operation_intent(operation: Mapping[str, Any]) -> str:
+        value = dict(operation)
+        if value.get("method") == "create":
+            value.pop("input", None)
+        return _canonical(value)
 
     def _append(
         self,
@@ -459,6 +537,7 @@ class JudgmentStore:
         reason: str,
         expected_version: int,
         previous_status: Optional[str],
+        occurred_at: str,
     ) -> Dict[str, Any]:
         event = new_event(
             event_type=event_type,
@@ -474,11 +553,33 @@ class JudgmentStore:
                 "reason": reason,
             },
             previous_status=previous_status,
+            now=occurred_at,
         )
         try:
             return self.events.append(event)
         except EventConflict as exc:
             raise InvalidJudgmentOperation(exc.code, str(exc)) from exc
+
+    def _append_idempotent(
+        self,
+        *,
+        idempotency_key: str,
+        operation: Mapping[str, Any],
+        **append_args: Any,
+    ) -> Dict[str, Any]:
+        try:
+            return self._append(
+                idempotency_key=idempotency_key,
+                operation=operation,
+                **append_args,
+            )
+        except InvalidJudgmentOperation as exc:
+            if exc.code != "idempotency_conflict":
+                raise
+            prior = self._find_idempotent(idempotency_key, operation)
+            if prior is None:
+                raise
+            return prior
 
     def _return_projected(self, event: Mapping[str, Any]) -> Dict[str, Any]:
         self._ensure_views()
@@ -516,6 +617,17 @@ class JudgmentStore:
             reason=reason,
             default_reason="judgment created",
         )
+        operation_time = self._operation_time()
+        if now is None:
+            generated_at = operation_time.isoformat()
+        else:
+            supplied_time = _parse_timestamp(now)
+            if supplied_time > operation_time:
+                raise InvalidJudgmentOperation(
+                    "future_timestamp",
+                    "judgment creation timestamp is later than the trusted clock",
+                )
+            generated_at = now
         try:
             card = new_judgment_card(
                 title=title,
@@ -530,7 +642,7 @@ class JudgmentStore:
                 lesson=lesson,
                 next_trigger=next_trigger,
                 privacy=privacy,
-                now=now,
+                now=generated_at,
             )
             if card_id is not None:
                 card["card_id"] = card_id
@@ -561,7 +673,8 @@ class JudgmentStore:
         operation = {
             "actor": actor_value,
             "expected_revision": 0,
-            "input": intent,
+            "input": card,
+            "intent": intent,
             "method": "create",
             "reason": reason_value,
         }
@@ -573,7 +686,7 @@ class JudgmentStore:
                 "version_conflict",
                 "judgment already exists",
             )
-        event = self._append(
+        event = self._append_idempotent(
             event_type="judgment.created",
             card=card,
             operation=operation,
@@ -583,6 +696,7 @@ class JudgmentStore:
             reason=reason_value,
             expected_version=0,
             previous_status=None,
+            occurred_at=operation_time.isoformat(),
         )
         return self._return_projected(event)
 
@@ -614,6 +728,7 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
+        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -646,9 +761,12 @@ class JudgmentStore:
             )
         updated = _card_body(current)
         updated["status"] = status
-        updated["updated_at"] = _utc_now()
-        validate_judgment_card(updated)
-        event = self._append(
+        updated["updated_at"] = operation_time.isoformat()
+        try:
+            validate_judgment_card(updated)
+        except ModelValidationError as exc:
+            raise InvalidJudgmentOperation(exc.code, str(exc)) from exc
+        event = self._append_idempotent(
             event_type="judgment.transitioned",
             card=updated,
             operation=operation,
@@ -658,6 +776,7 @@ class JudgmentStore:
             reason=reason_value,
             expected_version=current["stream_version"],
             previous_status=current["status"],
+            occurred_at=operation_time.isoformat(),
         )
         return self._return_projected(event)
 
@@ -673,6 +792,7 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
+        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -716,12 +836,12 @@ class JudgmentStore:
         updated.update(dict(changes))
         if current["status"] in {"confirmed", "rejected"}:
             updated["status"] = "candidate"
-        updated["updated_at"] = _utc_now()
+        updated["updated_at"] = operation_time.isoformat()
         try:
             validate_judgment_card(updated)
         except ModelValidationError as exc:
             raise InvalidJudgmentOperation(exc.code, str(exc)) from exc
-        event = self._append(
+        event = self._append_idempotent(
             event_type="judgment.corrected",
             card=updated,
             operation=operation,
@@ -731,6 +851,7 @@ class JudgmentStore:
             reason=reason_value,
             expected_version=current["stream_version"],
             previous_status=current["status"],
+            occurred_at=operation_time.isoformat(),
         )
         return self._return_projected(event)
 
@@ -748,6 +869,7 @@ class JudgmentStore:
         actor: Optional[Mapping[str, str]] = None,
     ) -> Dict[str, Any]:
         current = self.get(card_id)
+        operation_time = self._operation_time(current)
         expected, request, idem, actor_value, reason_value = self._metadata(
             expected_revision=expected_revision,
             current_revision=current["revision"],
@@ -757,9 +879,17 @@ class JudgmentStore:
             reason=reason,
             default_reason="judgment outcome recorded",
         )
+        if current["status"] != "confirmed":
+            raise InvalidJudgmentOperation(
+                "invalid_transition",
+                "only confirmed judgments can record outcomes",
+            )
         observed = _parse_timestamp(observed_at)
-        now = datetime.now(timezone.utc)
-        updated_at = max(now, observed).isoformat()
+        if observed > operation_time:
+            raise InvalidJudgmentOperation(
+                "future_timestamp",
+                "judgment outcome is later than the trusted clock",
+            )
         outcome = {
             "status": status,
             "summary": summary,
@@ -781,14 +911,9 @@ class JudgmentStore:
                 "version_conflict",
                 "judgment revision changed",
             )
-        if current["status"] != "confirmed":
-            raise InvalidJudgmentOperation(
-                "invalid_transition",
-                "only confirmed judgments can record outcomes",
-            )
         updated = _card_body(current)
         updated["outcome"] = outcome
-        updated["updated_at"] = updated_at
+        updated["updated_at"] = operation_time.isoformat()
         try:
             validate_judgment_card(updated)
         except ModelValidationError as exc:
@@ -803,7 +928,7 @@ class JudgmentStore:
                 else exc.code
             )
             raise InvalidJudgmentOperation(code, str(exc)) from exc
-        event = self._append(
+        event = self._append_idempotent(
             event_type="judgment.outcome_recorded",
             card=updated,
             operation=operation,
@@ -813,6 +938,7 @@ class JudgmentStore:
             reason=reason_value,
             expected_version=current["stream_version"],
             previous_status=current["status"],
+            occurred_at=operation_time.isoformat(),
         )
         return self._return_projected(event)
 
@@ -894,12 +1020,16 @@ class JudgmentStore:
 def _main(argv: Optional[List[str]] = None) -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Immortal Judgment Store")
+    class JsonArgumentParser(argparse.ArgumentParser):
+        def error(self, message: str) -> None:
+            raise InvalidJudgmentOperation("invalid_argument", message)
+
+    parser = JsonArgumentParser(description="Immortal Judgment Store")
     parser.add_argument("action", choices=("build", "list", "stats"))
     parser.add_argument("extra", nargs="?", default=None)
     parser.add_argument("--vault-dir", default=str(Path.home() / ".immortal"))
-    args = parser.parse_args(argv)
     try:
+        args = parser.parse_args(argv)
         store = JudgmentStore(Path(args.vault_dir))
         if args.action == "build":
             return store.cli_build()

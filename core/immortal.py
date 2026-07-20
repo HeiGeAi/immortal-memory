@@ -226,6 +226,11 @@ def command_run(_args=None) -> int:
 def command_cards(args) -> int:
     try:
         store = JudgmentStore(configured_vault_dir())
+        if args.extra is not None and args.action != "list":
+            raise InvalidJudgmentOperation(
+                "invalid_argument",
+                "only cards list accepts a limit",
+            )
         if args.action == "build":
             return store.cli_build()
         if args.action == "list":
@@ -2300,6 +2305,40 @@ def main(argv: list[str] | None = None) -> int:
         parser = build_parser()
         args = parser.parse_args(argv)
         return int(args.func(args) or 0)
+    if argv and argv[0] == "cards" and "--help" not in argv[1:]:
+        if len(argv) > 3:
+            print(
+                json.dumps(
+                    {
+                        "error": "invalid_argument",
+                        "message": "cards accepts an action and optional list limit",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        action = argv[1] if len(argv) >= 2 else "build"
+        if action not in {"build", "list", "stats"}:
+            print(
+                json.dumps(
+                    {
+                        "error": "invalid_argument",
+                        "message": "cards action must be build, list, or stats",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        return command_cards(
+            argparse.Namespace(
+                action=action,
+                extra=argv[2] if len(argv) == 3 else None,
+            )
+        )
     if argv and argv[0] == "feishu-clean":
         return run_script("feishu_clean.py", argv[1:])
     if argv and argv[0] == "feishu-distill":

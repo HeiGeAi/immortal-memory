@@ -1,9 +1,11 @@
 import json
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+import immortal
 import orchestrator
 from judgment_store import (
     InvalidJudgmentOperation,
@@ -14,6 +16,12 @@ from judgment_store import (
 
 
 ACTOR = {"kind": "owner", "id": "owner"}
+TEST_NOW = datetime(2026, 7, 20, 12, tzinfo=timezone.utc)
+
+
+def advancing_store(tmp_path):
+    clock = {"now": datetime(2026, 7, 20, 7, tzinfo=timezone.utc)}
+    return JudgmentStore(tmp_path, clock=lambda: clock["now"]), clock
 
 
 def metadata(suffix: str, revision: int) -> dict:
@@ -38,8 +46,9 @@ def create_card(store: JudgmentStore, suffix: str = "create") -> dict:
 
 
 def test_card_result_is_event_backed_and_persistent(tmp_path):
-    store = JudgmentStore(tmp_path)
+    store, clock = advancing_store(tmp_path)
     card = create_card(store)
+    clock["now"] = TEST_NOW
     confirmed = store.transition(
         card["card_id"],
         "confirmed",
@@ -69,13 +78,14 @@ def test_card_result_is_event_backed_and_persistent(tmp_path):
 
 
 def test_ergonomic_defaults_from_plan_remain_supported(tmp_path):
-    store = JudgmentStore(tmp_path)
+    store, clock = advancing_store(tmp_path)
     card = store.create(
         title="先审计",
         situation="生产升级",
         decision="先读后写",
         evidence_ids=["ev-1"],
     )
+    clock["now"] = TEST_NOW
     confirmed = store.transition(card["card_id"], "confirmed", reason="owner confirmed")
     updated = store.record_outcome(
         card["card_id"],
@@ -177,8 +187,9 @@ def test_correct_is_event_backed_and_confirmed_correction_returns_to_candidate(t
 
 
 def test_outcome_requires_confirmed_card_and_a_valid_timestamp(tmp_path):
-    store = JudgmentStore(tmp_path)
+    store, clock = advancing_store(tmp_path)
     card = create_card(store)
+    clock["now"] = TEST_NOW
 
     with pytest.raises(InvalidJudgmentOperation) as state_error:
         store.record_outcome(
@@ -203,8 +214,9 @@ def test_outcome_requires_confirmed_card_and_a_valid_timestamp(tmp_path):
 
 
 def test_current_and_evaluations_are_rebuilt_from_authoritative_events(tmp_path):
-    store = JudgmentStore(tmp_path)
+    store, clock = advancing_store(tmp_path)
     card = create_card(store)
+    clock["now"] = TEST_NOW
     store.transition(card["card_id"], "confirmed", **metadata("confirm", 1))
     store.record_outcome(
         card["card_id"],
@@ -400,6 +412,21 @@ def test_cli_failure_is_json_on_stderr_with_nonzero_exit(tmp_path, capsys):
     assert error["error"] == "invalid_argument"
 
 
+def test_cards_syntax_errors_are_json_for_standalone_and_packaged_cli(
+    tmp_path,
+    capsys,
+):
+    assert _main(["invalid", "--vault-dir", str(tmp_path)]) == 2
+    standalone = capsys.readouterr()
+    assert standalone.out == ""
+    assert json.loads(standalone.err)["error"] == "invalid_argument"
+
+    assert immortal.main(["cards", "invalid"]) == 2
+    packaged = capsys.readouterr()
+    assert packaged.out == ""
+    assert json.loads(packaged.err)["error"] == "invalid_argument"
+
+
 def test_orchestrator_cards_stage_calls_packaged_cli(monkeypatch):
     calls = []
 
@@ -413,3 +440,144 @@ def test_orchestrator_cards_stage_calls_packaged_cli(monkeypatch):
     assert calls == [
         (("immortal.py", "cards", "build"), {"timeout": 180})
     ]
+
+
+def test_created_event_binds_initial_outcome_and_timestamps(tmp_path):
+    store = JudgmentStore(
+        tmp_path,
+        clock=lambda: datetime(2026, 7, 20, 8, tzinfo=timezone.utc),
+    )
+    create_card(store)
+    rows = [
+        json.loads(line)
+        for line in store.events.path.read_text(encoding="utf-8").splitlines()
+    ]
+    card = rows[0]["payload"]["card"]
+    card["outcome"] = {
+        "status": "positive",
+        "summary": "forged",
+        "observed_at": card["created_at"],
+    }
+    rows[0]["payload"]["operation"]["input"]["outcome"] = dict(card["outcome"])
+    store.events.path.write_text(
+        json.dumps(rows[0], ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvalidJudgmentOperation) as captured:
+        JudgmentStore(tmp_path)
+    assert captured.value.code == "judgment_event_corruption"
+
+
+def test_future_create_and_outcome_are_rejected_with_stable_errors(tmp_path):
+    now = datetime(2026, 7, 20, 8, tzinfo=timezone.utc)
+    store = JudgmentStore(tmp_path, clock=lambda: now)
+
+    with pytest.raises(InvalidJudgmentOperation) as future_create:
+        store.create(
+            title="未来卡片",
+            situation="未来",
+            decision="未来",
+            evidence_ids=["ev-1"],
+            now="2099-01-01T00:00:00+00:00",
+        )
+    assert future_create.value.code == "future_timestamp"
+
+    card = create_card(store)
+    store.transition(card["card_id"], "confirmed", **metadata("confirm", 1))
+    with pytest.raises(InvalidJudgmentOperation) as future_outcome:
+        store.record_outcome(
+            card["card_id"],
+            status="positive",
+            summary="未来结果",
+            observed_at="2099-01-01T00:00:00+00:00",
+            **metadata("future-outcome", 2),
+        )
+    assert future_outcome.value.code == "future_timestamp"
+
+
+def test_future_existing_card_does_not_leak_model_validation_error(tmp_path):
+    store = JudgmentStore(
+        tmp_path,
+        clock=lambda: datetime(2099, 1, 1, tzinfo=timezone.utc),
+    )
+    card = store.create(
+        title="未来卡片",
+        situation="未来",
+        decision="未来",
+        evidence_ids=["ev-1"],
+        now="2099-01-01T00:00:00+00:00",
+    )
+    reopened = JudgmentStore(
+        tmp_path,
+        clock=lambda: datetime(2026, 7, 20, 8, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(InvalidJudgmentOperation) as captured:
+        reopened.transition(
+            card["card_id"],
+            "confirmed",
+            **metadata("future-transition", 1),
+        )
+    assert captured.value.code == "future_timestamp"
+
+
+def test_concurrent_same_idempotency_create_converges(
+    tmp_path,
+    monkeypatch,
+):
+    seed = JudgmentStore(tmp_path)
+    seed.create(
+        title="seed",
+        situation="seed",
+        decision="seed",
+        evidence_ids=["ev-seed"],
+        card_id="jdg_seed",
+        **metadata("seed", 0),
+    )
+    barrier = threading.Barrier(2)
+    original = JudgmentStore._find_idempotent
+    first_checks = threading.local()
+
+    def synchronize_initial_check(self, idempotency_key, operation):
+        if not getattr(first_checks, "done", False):
+            first_checks.done = True
+            result = original(self, idempotency_key, operation)
+            barrier.wait()
+            return result
+        return original(self, idempotency_key, operation)
+
+    monkeypatch.setattr(
+        JudgmentStore,
+        "_find_idempotent",
+        synchronize_initial_check,
+    )
+    outcomes = []
+
+    def create_concurrently():
+        try:
+            outcomes.append(
+                JudgmentStore(tmp_path).create(
+                    title="并发创建",
+                    situation="并发",
+                    decision="收敛",
+                    evidence_ids=["ev-concurrent"],
+                    **metadata("concurrent-create", 0),
+                )
+            )
+        except InvalidJudgmentOperation as exc:
+            outcomes.append(exc.code)
+
+    threads = [
+        threading.Thread(target=create_concurrently),
+        threading.Thread(target=create_concurrently),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(outcomes) == 2
+    assert isinstance(outcomes[0], dict)
+    assert outcomes[0] == outcomes[1]
+    assert JudgmentStore(tmp_path).events.watermark() == 2
