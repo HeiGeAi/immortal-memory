@@ -79,6 +79,26 @@ def test_supported_release_archive_types_are_scanned(tmp_path, suffix, writer):
     assert any(hit["member"] == "pkg/data.txt" for hit in result["hits"])
 
 
+def test_clean_single_file_under_user_directory_shape_does_not_scan_host_parents(
+    tmp_path,
+):
+    artifact = (
+        tmp_path
+        / "Users"
+        / "private-owner"
+        / "release"
+        / "immortal-clean.zip"
+    )
+    artifact.parent.mkdir(parents=True)
+    write_zip(artifact, {"pkg/data.txt": "clean release content"})
+
+    direct = private_scan.scan_paths([artifact])
+    via_parent = private_scan.scan_paths([artifact.parent])
+
+    assert direct["ok"] is True
+    assert via_parent["ok"] is True
+
+
 def test_tar_traversal_member_is_never_extracted_and_is_reported_safely(tmp_path):
     artifact = tmp_path / "artifact.tar"
     outside = tmp_path / "escaped.txt"
@@ -257,7 +277,7 @@ def test_unreadable_file_fails_closed(tmp_path, monkeypatch):
 
     assert result["ok"] is False
     assert result["errors"] == [
-        {"path": str(target), "member": None, "rule": "file_unreadable"}
+        {"path": target.name, "member": None, "rule": "file_unreadable"}
     ]
 
 

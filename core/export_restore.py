@@ -490,16 +490,20 @@ def read_manifest(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _open_absolute_nofollow(path: Path, *, directory: bool = False) -> int:
+def _canonical_system_alias_path(path: Path) -> Path:
     absolute = path.expanduser().absolute()
     for alias_text in ("/var", "/tmp", "/etc"):
         alias = Path(alias_text)
         try:
             if alias.is_symlink() and (absolute == alias or alias in absolute.parents):
-                absolute = alias.resolve(strict=True) / absolute.relative_to(alias)
-                break
+                return alias.resolve(strict=True) / absolute.relative_to(alias)
         except (OSError, ValueError):
             continue
+    return absolute
+
+
+def _open_absolute_nofollow(path: Path, *, directory: bool = False) -> int:
+    absolute = _canonical_system_alias_path(path)
     parts = absolute.parts
     current_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -560,16 +564,23 @@ def _read_json_nofollow(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dic
     return payload if isinstance(payload, dict) else {}
 
 
-def _secure_directory(path: Path) -> bool:
+def _secure_directory_identity(path: Path) -> tuple[int, int] | None:
     fd = -1
     try:
         fd = _open_absolute_nofollow(path, directory=True)
-        return stat.S_ISDIR(os.fstat(fd).st_mode)
+        metadata = os.fstat(fd)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return None
+        return metadata.st_dev, metadata.st_ino
     except OSError:
-        return False
+        return None
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _secure_directory(path: Path) -> bool:
+    return _secure_directory_identity(path) is not None
 
 
 def _secure_file_size_and_sha256(path: Path) -> tuple[int, str] | None:
@@ -762,28 +773,38 @@ def get_migration_backup_status(
     requested = Path(raw_export_dir).expanduser()
     if not requested.is_absolute() or not requested.name.startswith(EXPORT_PREFIX):
         return failed("state_export_path_invalid")
-    if not _secure_directory(requested):
+    export_identity = _secure_directory_identity(requested)
+    if export_identity is None:
         return failed("state_export_path_missing")
-    export_dir = requested.absolute()
+    export_dir = _canonical_system_alias_path(requested)
 
     manifest = _read_json_nofollow(export_dir / MANIFEST_NAME)
     if not manifest:
         return failed("state_export_manifest_missing_or_invalid")
     manifest_export = manifest.get("export_dir")
     manifest_vault = manifest.get("vault_dir")
-    try:
-        manifest_export_ok = (
-            isinstance(manifest_export, str)
-            and Path(manifest_export).expanduser().resolve(strict=True) == export_dir
-        )
-        manifest_vault_ok = (
-            isinstance(manifest_vault, str)
-            and Path(manifest_vault).expanduser().resolve(strict=True)
-            == vault.resolve(strict=True)
-        )
-    except OSError:
-        manifest_export_ok = False
-        manifest_vault_ok = False
+    manifest_export_path = (
+        Path(manifest_export).expanduser()
+        if isinstance(manifest_export, str)
+        else None
+    )
+    manifest_vault_path = (
+        Path(manifest_vault).expanduser()
+        if isinstance(manifest_vault, str)
+        else None
+    )
+    manifest_export_ok = bool(
+        manifest_export_path is not None
+        and manifest_export_path.is_absolute()
+        and _secure_directory_identity(manifest_export_path) == export_identity
+    )
+    vault_identity = _secure_directory_identity(vault)
+    manifest_vault_ok = bool(
+        vault_identity is not None
+        and manifest_vault_path is not None
+        and manifest_vault_path.is_absolute()
+        and _secure_directory_identity(manifest_vault_path) == vault_identity
+    )
 
     check = restore_check(export_dir, strict=True)
     check["mode"] = "strict-sha256"

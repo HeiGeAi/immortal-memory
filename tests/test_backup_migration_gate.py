@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -434,6 +435,47 @@ def test_migration_status_rejects_symlink_in_export_parent_chain(tmp_path, monke
     monkeypatch.setattr(export_restore, "classify_storage_location", lambda *args: "external_disk")
 
     assert export_restore.get_migration_backup_status(vault)["ok"] is False
+
+
+def test_migration_status_accepts_system_tmp_alias_for_same_directory(monkeypatch):
+    if not Path("/tmp").is_symlink():
+        pytest.skip("system /tmp alias is specific to macOS-style layouts")
+    with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+        root = Path(temporary)
+        vault = root / "vault"
+        export_dir = root / "immortal-export-system-tmp-alias"
+        _write_external_migration_evidence(vault, export_dir)
+        monkeypatch.setattr(
+            export_restore,
+            "classify_storage_location",
+            lambda *args: "external_disk",
+        )
+
+        status = export_restore.get_migration_backup_status(vault)
+
+    assert status["ok"] is True
+
+
+def test_migration_status_rejects_manifest_export_through_arbitrary_symlink(
+    tmp_path, monkeypatch
+):
+    vault = tmp_path / "vault"
+    export_dir = tmp_path / "external" / "immortal-export-real"
+    manifest, _ = _write_external_migration_evidence(vault, export_dir)
+    linked_export = tmp_path / "immortal-export-linked"
+    linked_export.symlink_to(export_dir, target_is_directory=True)
+    manifest["export_dir"] = str(linked_export)
+    (export_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(
+        export_restore,
+        "classify_storage_location",
+        lambda *args: "external_disk",
+    )
+
+    status = export_restore.get_migration_backup_status(vault)
+
+    assert status["ok"] is False
+    assert "manifest_export_dir_mismatch" in status["check"]["warnings"]
 
 
 def test_migration_preflight_cli_uses_real_temporary_vault_evidence(tmp_path):

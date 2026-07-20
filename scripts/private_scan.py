@@ -385,14 +385,15 @@ def scan_paths(
         if not root.exists() and not root.is_symlink():
             errors.append({"path": str(root), "member": None, "rule": "scan_target_missing"})
             continue
+        root_is_directory = root.is_dir() and not root.is_symlink()
         for path in iter_files(root):
             scanned_files += 1
-            raw_display = str(path)
-            if root.is_dir():
+            raw_display = path.name
+            if root_is_directory:
                 try:
                     raw_display = path.relative_to(root).as_posix()
                 except ValueError:
-                    pass
+                    raw_display = path.name
             path_rules = _matching_rules(
                 raw_display,
                 include_private_literals=True,
