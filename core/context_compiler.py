@@ -507,6 +507,8 @@ class ContextCompiler:
     ) -> Dict[str, Any]:
         if not isinstance(task, str) or not task.strip():
             raise ContextCompilerError("task_required", "task is required")
+        safe_task = _safe_summary(task)
+        safe_reason = _safe_summary(reason)
         if mode not in CONTEXT_MODES:
             raise ContextCompilerError("invalid_context_mode", "mode is unsupported")
         if (
@@ -662,7 +664,7 @@ class ContextCompiler:
         idem = idempotency_key or ("idem_" + uuid.uuid4().hex)
         actor_value = dict(actor or {"kind": "owner", "id": "owner"})
         stored = self.context_store.create_preview(
-            task=task.strip(),
+            task=safe_task,
             mode=mode,
             source_revision=source_revision,
             sections=sections,
@@ -675,7 +677,7 @@ class ContextCompiler:
             request_id=request,
             idempotency_key=idem,
             actor=actor_value,
-            reason=reason,
+            reason=safe_reason,
         )
         provenance = {
             "evidence_ids": evidence_ids,

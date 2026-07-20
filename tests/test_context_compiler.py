@@ -471,3 +471,40 @@ def test_authority_change_during_preview_fails_closed(tmp_path):
     with pytest.raises(ContextCompilerError) as failure:
         preview(instance)
     assert failure.value.code == "source_changed"
+
+
+def test_task_and_reason_are_redacted_in_response_cache_and_events(tmp_path):
+    instance = compiler(
+        tmp_path,
+        claims=[
+            claim(
+                "clm_fact",
+                "客户技术方案需要可回滚",
+            )
+        ],
+    )
+    task_secret = "sk-" + "a" * 24
+    reason_secret = "ghp_" + "b" * 24
+
+    result = instance.preview(
+        "评审客户技术方案，临时凭证 " + task_secret,
+        mode="reviewer",
+        role_scope=["work"],
+        domain_scope=["technical"],
+        request_id="req_redacted_metadata",
+        idempotency_key="idem_redacted_metadata",
+        actor=ACTOR,
+        reason="预览原因 " + reason_secret,
+    )
+    cache_text = (
+        instance.context_store.previews_dir
+        / (result["preview_id"] + ".json")
+    ).read_text(encoding="utf-8")
+    event_text = instance.context_store.events.path.read_text(encoding="utf-8")
+
+    assert task_secret not in json.dumps(result, ensure_ascii=False)
+    assert reason_secret not in json.dumps(result, ensure_ascii=False)
+    assert task_secret not in cache_text
+    assert reason_secret not in cache_text
+    assert task_secret not in event_text
+    assert reason_secret not in event_text
