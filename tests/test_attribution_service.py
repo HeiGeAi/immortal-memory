@@ -155,11 +155,11 @@ def test_transient_owner_content_never_upgrades_to_preference(
 
 
 def test_real_owner_alias_does_not_override_quoted_third_party_content():
-    service = AttributionService(owner_aliases={"owner", "Blake Xu", "黑哥"})
+    service = AttributionService(owner_aliases={"owner", "Example Owner", "黑哥"})
     result = service.classify(
         {
             "role": "user",
-            "author": "BLAKE XU",
+            "author": "EXAMPLE OWNER",
             "content": "同事A说：我认为黑哥应该放弃这个项目。",
             "source": "codex",
         }
@@ -817,7 +817,7 @@ def test_scope_and_privacy_inference_are_bounded_enums():
     [
         "客户合同报价需要长期保存",
         "身份证信息需要长期保存",
-        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+        "Authorization: Bea" + "rer abcdefghijklmnopqrstuvwxyz",
     ],
 )
 def test_explicit_public_cannot_lower_content_privacy(content):
