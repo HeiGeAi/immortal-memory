@@ -410,10 +410,11 @@ class EvidenceCatalog:
                     str(row[0])
                     for row in connection.execute(
                         "SELECT name FROM sqlite_master "
-                        "WHERE type='table' AND name IN ('docs','meta')"
+                        "WHERE type='table' "
+                        "AND name IN ('docs','docs_fts','meta')"
                     )
                 }
-                if tables != {"docs", "meta"}:
+                if tables != {"docs", "docs_fts", "meta"}:
                     raise EvidenceCatalogError(
                         "database_untrusted",
                         "SQLite index is missing required tables",
@@ -506,6 +507,50 @@ class EvidenceCatalog:
             else "changed"
         )
 
+    @contextmanager
+    def _verified_source_snapshot(self) -> Iterator[None]:
+        expected = self._source_signature
+        if expected is None:
+            raise EvidenceCatalogError(
+                "source_changed",
+                "evidence source is not available for snapshot verification",
+            )
+        with _open_regular_nofollow(self.index_path) as handle:
+            if _signature(os.fstat(handle.fileno())) != expected:
+                raise EvidenceCatalogError(
+                    "source_changed",
+                    "evidence source changed before resolution",
+                )
+            body_failed = False
+            try:
+                yield
+            except BaseException:
+                body_failed = True
+                raise
+            finally:
+                opened_after = os.fstat(handle.fileno())
+                try:
+                    current = _safe_regular_stat(self.index_path)
+                except EvidenceCatalogError as exc:
+                    if not body_failed:
+                        raise EvidenceCatalogError(
+                            "source_changed",
+                            "evidence source changed during resolution",
+                        ) from exc
+                    current = None
+                if (
+                    not body_failed
+                    and (
+                        current is None
+                        or _signature(opened_after) != expected
+                        or _signature(current) != expected
+                    )
+                ):
+                    raise EvidenceCatalogError(
+                        "source_changed",
+                        "evidence source changed during resolution",
+                    )
+
     def _cache_get(self, raw_id: str) -> Optional[Dict[str, Any]]:
         existing = self._resolved_cache.get(raw_id)
         if existing is None:
@@ -530,8 +575,10 @@ class EvidenceCatalog:
             )
         with _readonly_database(self.database_path) as connection:
             rows = connection.execute(
-                "SELECT rec_id,ts,source,content FROM docs "
-                "INDEXED BY idx_docs_rec_id WHERE rec_id=? LIMIT 2",
+                "SELECT d.rec_id,d.ts,d.source,d.content,f.content "
+                "FROM docs AS d INDEXED BY idx_docs_rec_id "
+                "LEFT JOIN docs_fts AS f ON f.rowid=d.rowid "
+                "WHERE d.rec_id=? LIMIT 2",
                 (raw_id,),
             ).fetchall()
         if len(rows) > 1:
@@ -541,7 +588,16 @@ class EvidenceCatalog:
             )
         if not rows:
             return None
-        rec_id, timestamp, source, content = rows[0]
+        rec_id, timestamp, source, content, fts_content = rows[0]
+        if (
+            not isinstance(content, str)
+            or not isinstance(fts_content, str)
+            or content != fts_content
+        ):
+            raise EvidenceCatalogError(
+                "database_source_mismatch",
+                "SQLite document differs from its FTS content copy",
+            )
         return {
             "id": str(rec_id),
             "timestamp": str(timestamp),
@@ -791,25 +847,26 @@ class EvidenceCatalog:
                 "source_changed",
                 "evidence source changed after catalog preflight",
             )
-        if cached is not None:
-            return cached
-        if self.database_path is not None:
-            candidate = self._database_candidate(raw_id)
-            if candidate is None:
-                raise EvidenceCatalogError(
-                    "evidence_not_found",
-                    "requested evidence ID was not present in verified SQLite",
+        with self._verified_source_snapshot():
+            if cached is not None:
+                return cached
+            if self.database_path is not None:
+                candidate = self._database_candidate(raw_id)
+                if candidate is None:
+                    raise EvidenceCatalogError(
+                        "evidence_not_found",
+                        "requested evidence ID was not present in verified SQLite",
+                    )
+                ref = self._make_ref(
+                    evidence_id=raw_id,
+                    source=candidate["source"],
+                    raw_id=raw_id,
+                    content=candidate["content"],
+                    status="available",
+                    observed_at=candidate["timestamp"],
                 )
-            ref = self._make_ref(
-                evidence_id=raw_id,
-                source=candidate["source"],
-                raw_id=raw_id,
-                content=candidate["content"],
-                status="available",
-                observed_at=candidate["timestamp"],
-            )
-        else:
-            ref = self._scan_for_id(raw_id)
+            else:
+                ref = self._scan_for_id(raw_id)
         self._cache_put(raw_id, ref)
         return dict(ref)
 

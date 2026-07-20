@@ -1,5 +1,7 @@
 import json
+import shutil
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -285,6 +287,83 @@ def test_verified_database_hit_uses_bound_snapshot_without_jsonl_rescan(
     assert ref["evidence_id"] == "raw-1"
     assert ref["content_hash"].startswith("sha256:")
     validate_evidence_ref(ref)
+
+
+def test_single_resolve_rejects_docs_content_tampered_without_fts_update(
+    tmp_path,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "权威正文")])
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute(
+            "UPDATE docs SET content='伪造正文' WHERE rec_id='raw-1'"
+        )
+        connection.commit()
+
+    catalog = EvidenceCatalog(index, database_path=database)
+
+    assert_error(
+        "database_source_mismatch",
+        lambda: catalog.resolve("raw-1"),
+    )
+
+
+def test_single_resolve_rejects_source_replaced_during_database_lookup(
+    tmp_path,
+    monkeypatch,
+):
+    index = tmp_path / "index.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "权威正文")])
+    write_records(replacement, [record("raw-1", "替换正文")])
+    reconcile_index(index, database)
+    catalog = EvidenceCatalog(index, database_path=database)
+    real_candidate = catalog._database_candidate
+
+    def replace_then_query(raw_id):
+        replacement.replace(index)
+        return real_candidate(raw_id)
+
+    monkeypatch.setattr(catalog, "_database_candidate", replace_then_query)
+
+    assert_error(
+        "source_changed",
+        lambda: catalog.resolve("raw-1"),
+    )
+
+
+def test_single_resolve_rejects_database_swap_during_query(
+    tmp_path,
+    monkeypatch,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    moved = tmp_path / "moved.db"
+    write_records(index, [record("raw-1", "权威正文")])
+    reconcile_index(index, database)
+    catalog = EvidenceCatalog(index, database_path=database)
+    real_readonly_database = evidence_catalog._readonly_database
+
+    @contextmanager
+    def swap_after_query(path):
+        with real_readonly_database(path) as connection:
+            yield connection
+            database.rename(moved)
+            shutil.copyfile(moved, database)
+
+    monkeypatch.setattr(
+        evidence_catalog,
+        "_readonly_database",
+        swap_after_query,
+    )
+
+    assert_error(
+        "unsafe_path",
+        lambda: catalog.resolve("raw-1"),
+    )
 
 
 def test_resolve_many_confirms_candidates_in_one_authoritative_jsonl_scan(
