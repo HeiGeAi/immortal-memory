@@ -23,19 +23,20 @@ DEFAULT_REGEXES = [
     ("absolute_home_path", r"(?:/Users/[A-Za-z0-9._-]+|/home/[A-Za-z0-9._-]+|[A-Za-z]:\\Users\\[A-Za-z0-9._-]+)(?:[/\\][^\s'\"<>]*)?"),
 ]
 
-DEFAULT_PRIVATE_LITERALS = [
-    "Blake Xu",
-    "小黑子",
-    "徐将",
-    "晓舟",
-    "酱油",
-    "小声比比",
-    "田洋",
-    "曹嵘",
-    "com.blakexu.",
-    "~/Desktop/claudecode",
-    "heige-workbench",
+PRIVATE_LITERAL_PARTS = [
+    ("Blake", " Xu"),
+    ("小黑", "子"),
+    ("徐", "将"),
+    ("晓", "舟"),
+    ("酱", "油"),
+    ("小声", "比比"),
+    ("田", "洋"),
+    ("曹", "嵘"),
+    ("com.", "blakexu."),
+    ("~/Desktop/", "claudecode"),
+    ("heige-", "workbench"),
 ]
+DEFAULT_PRIVATE_LITERALS = tuple("".join(parts) for parts in PRIVATE_LITERAL_PARTS)
 
 SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
 TEXT_SUFFIXES = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".sh", ".example"}

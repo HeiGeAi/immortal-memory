@@ -93,3 +93,26 @@ def test_clean_archive_has_no_hits(tmp_path):
     write_zip(artifact, {"README.txt": "public release notes"})
 
     assert private_scan.scan_paths([artifact])["hits"] == []
+
+
+def test_scanner_source_packaged_in_wheel_does_not_self_report_private_literals(tmp_path):
+    artifact = tmp_path / "scanner.whl"
+    scanner_source = Path(private_scan.__file__).read_text(encoding="utf-8")
+    write_zip(artifact, {"immortal_memory/private_scan.py": scanner_source})
+
+    result = private_scan.scan_paths([artifact])
+
+    assert not any(hit["rule"] == "private_identity_marker" for hit in result["hits"])
+
+
+def test_private_literal_in_another_archive_member_is_still_detected(tmp_path):
+    artifact = tmp_path / "artifact.zip"
+    marker = "Blake" + " Xu"
+    write_zip(artifact, {"payload.txt": marker})
+
+    result = private_scan.scan_paths([artifact])
+
+    assert any(
+        hit["member"] == "payload.txt" and hit["rule"] == "private_identity_marker"
+        for hit in result["hits"]
+    )

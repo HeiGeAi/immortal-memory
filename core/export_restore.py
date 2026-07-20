@@ -342,11 +342,15 @@ def get_backup_status(vault_dir: str | Path | None = None, verify: bool = False)
         trust_level = "verified" if check.get("ok") else "failed"
     else:
         trust_level = "manifest_only"
+    actual_location = classify_storage_location(
+        Path(latest["export_dir"]),
+        Path(latest["vault_dir"]),
+    )
     return {
         "ok": bool(check.get("ok")),
         "trust_level": trust_level,
         "generated_at": manifest.get("generated_at", ""),
-        "storage_location": manifest.get("storage_location", "unknown"),
+        "storage_location": actual_location,
         "secret_scan": manifest.get("secret_scan", {}),
         "generation_warnings": manifest.get("warnings", []),
         "vault_dir": latest["vault_dir"],
@@ -438,7 +442,7 @@ def migration_backup_gate(
     if secret_count > 0 or any("secret_shapes_present" in item for item in warning_codes):
         blockers.append("secret_shapes_present")
 
-    current = now or now_utc()
+    current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
     current = current.astimezone(timezone.utc)

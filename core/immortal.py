@@ -37,7 +37,12 @@ from config import (
     slug_prefix,
 )
 from command_hints import cli_command
-from export_restore import create_export, get_backup_status, restore_check
+from export_restore import (
+    create_export,
+    get_backup_status,
+    migration_backup_gate,
+    restore_check,
+)
 from index_writer import append_jsonl_records
 from maintenance_gate import writer_access
 from state_store import mutate_state_atomic, update_state_atomic
@@ -1725,6 +1730,65 @@ def command_backup_status(args) -> int:
     return 0 if ok else 1
 
 
+def command_migration_preflight(args) -> int:
+    """Prove backup, runtime health, and read-model parity before migration."""
+    import index_db
+    import preflight
+
+    status = get_backup_status(IMMORTAL_DIR, verify=True)
+    health_report = preflight.gather_preflight(
+        max_age_hours=float(args.max_age_hours),
+        vault_dir=IMMORTAL_DIR,
+    )
+    state = read_json(STATE_FILE, {})
+    current_errors = state.get("errors") if isinstance(state, dict) else []
+    health_ok = (
+        health_report.get("context_status") == preflight.STATUS_READY
+        and health_report.get("vault_status") == "healthy"
+        and not current_errors
+    )
+    parity_ok = bool(index_db.is_ready())
+    status["health"] = {"ok": health_ok}
+    status["index_parity"] = {"ok": parity_ok}
+    try:
+        secret_candidates = int(
+            ((status.get("secret_scan") or {}).get("unique_candidates") or 0)
+        )
+    except (TypeError, ValueError):
+        secret_candidates = 1
+
+    result = migration_backup_gate(
+        status,
+        require_external=bool(args.require_external_backup),
+        max_age_hours=float(args.max_age_hours),
+    )
+    result["evidence"] = {
+        "generated_at": status.get("generated_at"),
+        "storage_location": status.get("storage_location"),
+        "verification_mode": (status.get("check") or {}).get("mode"),
+        "restore_check": {"ok": bool((status.get("check") or {}).get("ok"))},
+        "secret_scan": {
+            "unique_candidates": secret_candidates
+        },
+        "health": {"ok": health_ok},
+        "index_parity": {"ok": parity_ok},
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("Immortal Migration Preflight")
+        print()
+        print(f"Status: {'OK' if result['ok'] else 'FAIL'}")
+        print(f"Storage: {result['storage_location']}")
+        print(f"Verification: {result['verification_mode'] or 'missing'}")
+        print(f"Backup age: {result['backup_age_hours']}")
+        print(f"Health: {'OK' if health_ok else 'FAIL'}")
+        print(f"Index parity: {'OK' if parity_ok else 'FAIL'}")
+        if result["blockers"]:
+            print("Blockers: " + ", ".join(result["blockers"]))
+    return 0 if result["ok"] else 1
+
+
 def command_restore_guide(args) -> int:
     status = get_backup_status(args.vault_dir, verify=False)
     latest = status.get("latest_export") or {}
@@ -1859,6 +1923,15 @@ def build_parser() -> argparse.ArgumentParser:
     backup_status.add_argument("--max-age-hours", type=float, default=168)
     backup_status.add_argument("--json", action="store_true")
     backup_status.set_defaults(func=command_backup_status)
+
+    migration_preflight = sub.add_parser(
+        "migration-preflight",
+        help="Fail-closed backup, health, and index parity gate before migration",
+    )
+    migration_preflight.add_argument("--require-external-backup", action="store_true")
+    migration_preflight.add_argument("--max-age-hours", type=float, default=168)
+    migration_preflight.add_argument("--json", action="store_true")
+    migration_preflight.set_defaults(func=command_migration_preflight)
 
     restore = sub.add_parser("restore-check", help="Verify an exported backup before restore")
     restore.add_argument("export_path")
