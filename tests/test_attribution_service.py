@@ -137,6 +137,85 @@ def test_real_owner_alias_does_not_override_quoted_third_party_content():
     )
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "同事A说，我认为你做事太激进了",
+        "同事A说“黑哥应该放弃这个项目”",
+        "同事A说 '黑哥应该放弃这个项目'",
+        "同事A表示，黑哥应该放弃这个项目",
+        "同事A认为黑哥应该放弃这个项目",
+        "同事A提到\n黑哥应该放弃这个项目",
+        "同事A说，同事B认为：黑哥应该放弃这个项目",
+        ("前置信息" * 80) + "\n同事A说：黑哥应该放弃这个项目",
+    ],
+)
+def test_common_third_party_restatements_fail_closed_as_quoted(content):
+    service = AttributionService(owner_aliases={"owner", "黑哥"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2026-07-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2026-07-02T00:00:00Z"},
+                {"evidence_id": "ev_3", "observed_at": "2026-07-03T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert result["speaker"]["kind"] == "other"
+    assert result["claim_type"] == "external_view"
+    assert result["source_kind"] == "quoted"
+    assert result["auto_confirm_allowed"] is False
+    assert "third_party_quote" in result["trust_flags"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "我说，我认为先做只读审计更稳妥。",
+        "我之前说，先做只读审计更稳妥。",
+        "我认为先做只读审计更稳妥。",
+        "这是我认为最稳妥的处理方式。",
+        "黑哥提到自己的长期原则是先验证再发布。",
+    ],
+)
+def test_owner_first_person_expressions_are_not_false_positive_quotes(content):
+    service = AttributionService(owner_aliases={"owner", "黑哥"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+        }
+    )
+
+    assert result["speaker"] == {"kind": "owner", "id": "owner"}
+    assert result["source_kind"] == "direct"
+    assert "third_party_quote" not in result["trust_flags"]
+
+
+def test_explicit_quoted_author_always_fails_closed():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "quoted_author": "外部顾问",
+            "content": "建议保留原方案。",
+            "source": "codex",
+        }
+    )
+
+    assert result["speaker"]["kind"] == "other"
+    assert result["claim_type"] == "external_view"
+    assert result["auto_confirm_allowed"] is False
+
+
 def test_confidence_policy_is_recomputable_and_auto_confirm_is_strict():
     service = AttributionService(owner_aliases={"owner"})
     durable = service.classify(
@@ -149,6 +228,11 @@ def test_confidence_policy_is_recomputable_and_auto_confirm_is_strict():
             "role_scope": ["work"],
             "domain_scope": ["technical", "risk"],
             "privacy": "context_safe",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2026-07-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2026-07-02T00:00:00Z"},
+                {"evidence_id": "ev_3", "observed_at": "2026-07-03T00:00:00Z"},
+            ],
         }
     )
     one_off = service.classify(
@@ -175,6 +259,77 @@ def test_confidence_policy_is_recomputable_and_auto_confirm_is_strict():
     assert durable["domain_scope"] == ["technical", "risk"]
     assert durable["privacy"] == "context_safe"
     assert one_off["auto_confirm_allowed"] is False
+
+
+def test_transient_semantics_override_explicit_claim_type_and_raw_recurrence():
+    service = AttributionService(owner_aliases={"owner"})
+    emotion = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "今天我有点焦虑",
+            "source": "codex",
+            "claim_type": "preference",
+            "recurrence": 1.0,
+            "recurrence_count": 999,
+        }
+    )
+    temporary_preference = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "今天我喜欢写详细一点",
+            "source": "codex",
+            "claim_type": "preference",
+            "recurrence_count": 3,
+        }
+    )
+
+    assert emotion["claim_type"] == "emotion"
+    assert temporary_preference["claim_type"] == "request"
+    assert emotion["confidence_basis"]["recurrence"] == 0.0
+    assert temporary_preference["confidence_basis"]["recurrence"] == 0.0
+    assert emotion["auto_confirm_allowed"] is False
+    assert temporary_preference["auto_confirm_allowed"] is False
+    assert "one_off_content" in emotion["trust_flags"]
+    assert "one_off_content" in temporary_preference["trust_flags"]
+
+
+def test_only_distinct_verifiable_evidence_and_times_create_recurrence():
+    service = AttributionService(owner_aliases={"owner"})
+    repeated_same_event = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence": 1.0,
+            "recurrence_count": 99,
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2026-07-01T00:00:00Z"},
+                {"evidence_id": "ev_1", "observed_at": "2026-07-02T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "not-a-time"},
+            ],
+        }
+    )
+    verified = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2026-07-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2026-07-02T00:00:00Z"},
+                {"evidence_id": "ev_3", "observed_at": "2026-07-03T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert repeated_same_event["confidence_basis"]["recurrence"] == 0.0
+    assert repeated_same_event["auto_confirm_allowed"] is False
+    assert verified["confidence_basis"]["recurrence"] == 1.0
+    assert verified["auto_confirm_allowed"] is True
 
 
 def test_scope_and_privacy_inference_are_bounded_enums():
@@ -208,6 +363,99 @@ def test_scope_and_privacy_inference_are_bounded_enums():
     }
     assert result["privacy"] == "private"
     assert result["auto_confirm_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "客户合同报价需要长期保存",
+        "身份证信息需要长期保存",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+    ],
+)
+def test_explicit_public_cannot_lower_content_privacy(content):
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "privacy": "public",
+        }
+    )
+
+    assert result["privacy"] in {"restricted", "private"}
+    assert result["auto_confirm_allowed"] is False
+
+
+def test_custom_scopes_are_claim_compatible_or_safely_downgraded():
+    service = AttributionService(owner_aliases={"owner"})
+    stable = service.classify(
+        {
+            "role": "assistant",
+            "author": "同事A",
+            "content": "项目内使用严格审查。",
+            "source": "feishu",
+            "role_scope": ["custom"],
+            "domain_scope": ["custom"],
+            "custom_scope_ids": ["role_immortal", "domain_living_self"],
+        }
+    )
+    missing = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "项目内使用严格审查。",
+            "source": "codex",
+            "role_scope": ["custom"],
+            "domain_scope": ["custom"],
+        }
+    )
+
+    claim = new_claim(
+        statement="同事建议项目内使用严格审查。",
+        source_kind=stable["source_kind"],
+        evidence_ids=["ev_1"],
+        claim_type=stable["claim_type"],
+        speaker_kind=stable["speaker"]["kind"],
+        speaker_id=stable["speaker"]["id"],
+        subject_kind=stable["subject"]["kind"],
+        subject_id=stable["subject"]["id"],
+        confidence=stable["confidence"],
+        confidence_basis=stable["confidence_basis"],
+        role_scope=stable["role_scope"],
+        domain_scope=stable["domain_scope"],
+        custom_scope_ids=stable["custom_scope_ids"],
+        privacy=stable["privacy"],
+        now="2026-07-20T00:00:00+00:00",
+    )
+
+    assert claim["custom_scope_ids"] == [
+        "role_immortal",
+        "domain_living_self",
+    ]
+    assert missing["role_scope"] == ["general"]
+    assert missing["domain_scope"] == ["general"]
+    assert missing["custom_scope_ids"] == []
+    assert "custom_scope_missing_id" in missing["trust_flags"]
+
+
+def test_system_role_with_author_remains_system():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "system",
+            "author": "system",
+            "content": "自动生成的状态观察。",
+            "source": "local",
+        }
+    )
+
+    assert result["speaker"] == {"kind": "system", "id": "system"}
+    assert result["subject"] == {"kind": "system", "id": "system"}
+    assert result["source_kind"] == "observed"
+    assert result["claim_type"] != "external_view"
 
 
 def test_latest_report_is_bounded_and_contains_no_raw_body():

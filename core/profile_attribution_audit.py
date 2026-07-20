@@ -233,9 +233,10 @@ def trust_record(row: dict[str, Any]) -> dict[str, Any]:
         "author": author,
         "content": str(row.get("statement") or ""),
         "source": str(source.get("source") or ""),
-        "recurrence_count": row.get("recurrence_count", 0),
+        "recurrence_evidence": row.get("recurrence_evidence"),
         "role_scope": row.get("role_scope"),
         "domain_scope": row.get("domain_scope"),
+        "custom_scope_ids": row.get("custom_scope_ids"),
     }
     if privacy is not None:
         result["privacy"] = privacy

@@ -37,8 +37,10 @@ DEFAULT_MAX_REPORT_SAMPLES = 20
 MAX_REPORT_SAMPLES = 50
 
 THIRD_PARTY_QUOTE_RE = re.compile(
-    r"(?P<author>[\w\u4e00-\u9fff]{1,32})"
-    r"(?:说|表示|认为|指出|反馈|提到|评价)[：:]"
+    r"(?:^|[\s，,。！？!?；;：:“”\"'‘’（）()\[\]])"
+    r"(?P<author>[A-Za-z0-9_\u4e00-\u9fff·.-]{1,32})"
+    r"(?:说|表示|认为|指出|反馈|提到|评价)"
+    r"(?:\s*[,，:：\"'“‘]?\s*)"
 )
 ONE_OFF_RE = re.compile(r"(这一次|这次|本次|今天|现在|临时|先暂时)")
 REQUEST_RE = re.compile(r"(请|帮我|麻烦|需要|先|立刻|马上|尽快|这一次|这次)")
@@ -51,8 +53,16 @@ SECRET_RE = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
 RESTRICTED_RE = re.compile(
-    r"(客户|合同|报价|付款|发票|法务|绩效|薪资|招聘|商业化|手机号|身份证)"
+    r"(客户|合同|报价|付款|发票|法务|绩效|薪资|招聘|商业化|"
+    r"手机号|身份证|身份信息)"
 )
+CUSTOM_SCOPE_ID_RE = re.compile(r"^[a-z][a-z0-9_:-]{2,63}$")
+PRIVACY_RANK = {
+    "public": 0,
+    "context_safe": 1,
+    "restricted": 2,
+    "private": 3,
+}
 
 
 def _clean_text(value: Any) -> str:
@@ -64,6 +74,26 @@ def _stable_other_id(value: str) -> str:
         return "other"
     digest = hashlib.sha256(value.casefold().encode("utf-8")).hexdigest()[:12]
     return "person_" + digest
+
+
+def _is_owner_reference(author: str, aliases: Set[str]) -> bool:
+    normalized = _clean_text(author).casefold()
+    if normalized in aliases or normalized in {
+        "我",
+        "我们",
+        "咱们",
+        "用户",
+        "本人",
+    }:
+        return True
+    if normalized.startswith(("我", "我们", "咱们")):
+        return True
+    return bool(
+        re.fullmatch(
+            r"(?:这是|这就是|那是|那就是|按|依|对|对于)?我(?:个人)?",
+            normalized,
+        )
+    )
 
 
 def _counter_map(counter: Counter) -> Dict[str, int]:
@@ -123,18 +153,12 @@ class AttributionService:
         explicit = _clean_text(record.get("quoted_author"))
         if explicit and explicit.casefold() not in self.owner_aliases:
             return explicit
-        match = THIRD_PARTY_QUOTE_RE.search(content[:240])
-        if not match:
-            return ""
-        author = _clean_text(match.group("author"))
-        if author.casefold() in self.owner_aliases or author in {
-            "我",
-            "我们",
-            "用户",
-            "本人",
-        }:
-            return ""
-        return author
+        for match in THIRD_PARTY_QUOTE_RE.finditer(content):
+            author = _clean_text(match.group("author"))
+            if _is_owner_reference(author, self.owner_aliases):
+                continue
+            return author
+        return ""
 
     def _speaker(
         self,
@@ -154,13 +178,15 @@ class AttributionService:
             or record.get("speaker")
         )
         role = _clean_text(record.get("role")).casefold()
+        if role in {"system", "tool", "bot"}:
+            return {"kind": "system", "id": "system"}, False
         if author and author.casefold() in self.owner_aliases:
             return {"kind": "owner", "id": "owner"}, False
         if author:
             return {"kind": "other", "id": _stable_other_id(author)}, False
         if role == "user":
             return {"kind": "owner", "id": "owner"}, False
-        if role in {"assistant", "system", "tool", "bot"}:
+        if role == "assistant":
             return {"kind": "system", "id": "system"}, False
         return {"kind": "unknown", "id": "unknown"}, False
 
@@ -207,6 +233,12 @@ class AttributionService:
     ) -> str:
         if speaker["kind"] == "other":
             return "external_view"
+        if EMOTION_RE.search(content):
+            return "emotion"
+        if ONE_OFF_RE.search(content):
+            return "request"
+        if REQUEST_RE.search(content) and not DURABLE_RE.search(content):
+            return "request"
         explicit = _clean_text(record.get("claim_type")).casefold()
         if explicit in {
             "fact",
@@ -222,14 +254,6 @@ class AttributionService:
             "external_view",
         }:
             return explicit
-        if EMOTION_RE.search(content) and (
-            ONE_OFF_RE.search(content) or not DURABLE_RE.search(content)
-        ):
-            return "emotion"
-        if ONE_OFF_RE.search(content) and REQUEST_RE.search(content):
-            return "request"
-        if REQUEST_RE.search(content) and not DURABLE_RE.search(content):
-            return "request"
         if PREFERENCE_RE.search(content) or DURABLE_RE.search(content):
             return "preference"
         if re.search(r"(决定|选择|不再|改为)", content):
@@ -249,6 +273,20 @@ class AttributionService:
         for item in value:
             normalized = _clean_text(item).casefold()
             if normalized in allowed and normalized not in result:
+                result.append(normalized)
+        return result
+
+    def _custom_scope_ids(self, record: Mapping[str, Any]) -> List[str]:
+        values = record.get("custom_scope_ids")
+        if not isinstance(values, list):
+            return []
+        result: List[str] = []
+        for value in values:
+            normalized = _clean_text(value).casefold()
+            if (
+                CUSTOM_SCOPE_ID_RE.fullmatch(normalized)
+                and normalized not in result
+            ):
                 result.append(normalized)
         return result
 
@@ -293,26 +331,43 @@ class AttributionService:
 
     def _privacy(self, record: Mapping[str, Any], content: str) -> str:
         if SECRET_RE.search(content):
-            return "private"
+            detected = "private"
+        elif RESTRICTED_RE.search(content):
+            detected = "restricted"
+        else:
+            detected = "public"
         explicit = _clean_text(record.get("privacy")).casefold()
-        if explicit in PRIVACY_LEVELS:
-            return explicit
-        if RESTRICTED_RE.search(content):
-            return "restricted"
-        return "context_safe"
+        if explicit not in PRIVACY_LEVELS:
+            explicit = "context_safe"
+        return max((detected, explicit), key=PRIVACY_RANK.__getitem__)
 
     def _recurrence_score(self, record: Mapping[str, Any]) -> float:
-        explicit = record.get("recurrence")
-        if (
-            isinstance(explicit, (int, float))
-            and not isinstance(explicit, bool)
-            and 0.0 <= float(explicit) <= 1.0
-        ):
-            return float(explicit)
-        count = record.get("recurrence_count", 0)
-        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+        evidence = record.get("recurrence_evidence")
+        if not isinstance(evidence, list):
             return 0.0
-        if count == 2:
+        evidence_ids: Set[str] = set()
+        observed_times: Set[str] = set()
+        for item in evidence:
+            if not isinstance(item, Mapping):
+                continue
+            evidence_id = _clean_text(item.get("evidence_id"))
+            observed_at = _clean_text(item.get("observed_at"))
+            if not evidence_id or not observed_at:
+                continue
+            try:
+                parsed = datetime.fromisoformat(
+                    observed_at.replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                continue
+            evidence_ids.add(evidence_id)
+            observed_times.add(parsed.isoformat())
+        distinct = min(len(evidence_ids), len(observed_times))
+        if distinct < 2:
+            return 0.0
+        if distinct == 2:
             return 0.7
         return 1.0
 
@@ -342,8 +397,29 @@ class AttributionService:
         }[speaker["kind"]]
         role_scope = self._role_scope(record, content)
         domain_scope = self._domain_scope(record, content)
+        custom_scope_ids = self._custom_scope_ids(record)
+        custom_scope_missing_id = bool(
+            (
+                "custom" in role_scope
+                or "custom" in domain_scope
+            )
+            and not custom_scope_ids
+        )
+        if custom_scope_missing_id:
+            role_scope = [
+                scope for scope in role_scope if scope != "custom"
+            ] or ["general"]
+            domain_scope = [
+                scope for scope in domain_scope if scope != "custom"
+            ] or ["general"]
+        elif (
+            "custom" not in role_scope
+            and "custom" not in domain_scope
+        ):
+            custom_scope_ids = []
         privacy = self._privacy(record, content)
         recurrence = self._recurrence_score(record)
+        one_off_content = bool(ONE_OFF_RE.search(content))
         speaker_score = {
             "owner": 1.0,
             "other": 0.35,
@@ -377,6 +453,10 @@ class AttributionService:
             flags.append("third_party_quote")
         if claim_type in TRANSIENT_TYPES:
             flags.append("transient_content")
+        if one_off_content:
+            flags.append("one_off_content")
+        if custom_scope_missing_id:
+            flags.append("custom_scope_missing_id")
         if recurrence < 0.7:
             flags.append("insufficient_recurrence")
         if privacy == "private":
@@ -387,7 +467,9 @@ class AttributionService:
             and source_kind == "direct"
             and claim_type not in TRANSIENT_TYPES
             and claim_type != "external_view"
+            and not one_off_content
             and privacy != "private"
+            and privacy != "restricted"
             and recurrence >= 0.7
             and source_quality >= 0.75
             and confidence >= self.auto_confirm_threshold
@@ -400,6 +482,7 @@ class AttributionService:
             "source_kind": source_kind,
             "role_scope": role_scope,
             "domain_scope": domain_scope,
+            "custom_scope_ids": custom_scope_ids,
             "privacy": privacy,
             "confidence": confidence,
             "confidence_basis": basis,
