@@ -42,22 +42,30 @@ REPORTING_SPEECH_RE = re.compile(
     r"(?P<verb>说(?!明|服|法|辞|话)|表示|认为|指出|反馈|提到|评价)"
     r"(?:\s*[,，:：\"'“‘]?\s*)"
 )
-SELF_UTTERANCE_SAY_AUTHORS = frozenset(
-    {
-        "一般来",
-        "总的来",
-        "换句话",
-        "也就是",
-        "不得不",
-        "可以",
-        "应该",
-        "比如",
-        "话",
-        "我想",
-        "我不得不",
-        "我可以",
-        "我应该",
-    }
+ENTITY_REFERENCE_RE = re.compile(
+    r"^(?:"
+    r"他|她|他们|她们|对方|别人|有人|大家|"
+    r"(?:我的)?[\u4e00-\u9fffA-Za-z0-9_-]{0,24}"
+    r"(?:负责人|经理|主管|代表|专员|成员|员工|"
+    r"工程师|架构师|设计师|律师|医师|医生|老师|顾问|"
+    r"法务|财务|客服|同事|朋友|队友|伙伴|供应商|厂商|"
+    r"客户|老板|领导|上级|下属|"
+    r"儿子|女儿|哥哥|姐姐|弟弟|妹妹|奶奶|爷爷|"
+    r"妈妈|爸爸|母亲|父亲|妻子|丈夫|配偶|伴侣|"
+    r"公司|团队|部门|委员会|先生|女士)"
+    r"[A-Za-z0-9_-]*"
+    r")$"
+)
+STRUCTURED_PERSON_REFERENCE_RE = re.compile(
+    r"^(?:"
+    r"[老小][赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕"
+    r"施张孔曹华金魏陶姜谢邹苏潘葛范彭鲁韦马苗方俞任袁柳"
+    r"唐罗薛雷贺倪汤滕殷郝邬安常乐傅齐康伍余元顾孟黄萧尹"
+    r"姚邵汪毛米戴宋熊纪舒项董梁杜阮蓝季贾路江童颜郭梅盛"
+    r"林钟徐邱骆高夏蔡田樊胡凌霍万卢莫房裘解宗丁宣邓郁单"
+    r"杭洪包左石崔吉龚程邢裴陆荣翁]"
+    r"|张三|李四|王五|赵六"
+    r")$"
 )
 OWNER_SPEECH_MODIFIERS = frozenset(
     {"之前", "刚才", "曾经", "当时", "本人", "自己", "也"}
@@ -123,6 +131,19 @@ def _is_owner_reference(author: str, aliases: Set[str]) -> bool:
             r"(?:这是|这就是|那是|那就是|按|依|对|对于)?我(?:个人)?",
             normalized,
         )
+    )
+
+
+def _is_entity_shaped_say_author(author: str) -> bool:
+    normalized = _clean_text(author).casefold()
+    if not normalized or normalized.endswith(("来", "地", "点")):
+        return False
+    if re.fullmatch(r"[a-z][a-z0-9_.-]{0,31}", normalized):
+        return normalized not in {"owner", "system", "tool", "bot"}
+    return bool(
+        ENTITY_REFERENCE_RE.fullmatch(normalized)
+        or STRUCTURED_PERSON_REFERENCE_RE.fullmatch(normalized)
+        or "·" in normalized
     )
 
 
@@ -226,10 +247,18 @@ class AttributionService:
             return "local"
         return "custom"
 
-    def _quoted_author(self, record: Mapping[str, Any], content: str) -> str:
+    def _reported_speech(
+        self,
+        record: Mapping[str, Any],
+        content: str,
+    ) -> tuple:
         explicit = _clean_text(record.get("quoted_author"))
-        if explicit and explicit.casefold() not in self.owner_aliases:
-            return explicit
+        if explicit and not _is_owner_reference(
+            explicit,
+            self.owner_aliases,
+        ):
+            return explicit, False
+        ambiguous = False
         for match in REPORTING_SPEECH_RE.finditer(content):
             author = _clean_text(match.group("author"))
             if _is_owner_reference(author, self.owner_aliases):
@@ -249,24 +278,25 @@ class AttributionService:
                 ):
                     continue
             verb = _clean_text(match.group("verb"))
-            if (
-                verb == "说"
-                and author.casefold() in SELF_UTTERANCE_SAY_AUTHORS
-            ):
-                continue
-            return author
-        return ""
+            if verb != "说" or _is_entity_shaped_say_author(author):
+                return author, False
+            ambiguous = True
+        return "", ambiguous
 
     def _speaker(
         self,
         record: Mapping[str, Any],
         content: str,
     ) -> tuple:
-        quoted_author = self._quoted_author(record, content)
+        quoted_author, reported_speech_ambiguous = self._reported_speech(
+            record,
+            content,
+        )
         if quoted_author:
             return (
                 {"kind": "other", "id": _stable_other_id(quoted_author)},
                 True,
+                False,
             )
         author = _clean_text(
             record.get("author")
@@ -277,18 +307,46 @@ class AttributionService:
         role = _clean_text(record.get("role")).casefold()
         actor = _clean_text(record.get("actor")).casefold()
         if role in {"system", "tool", "bot"}:
-            return {"kind": "system", "id": "system"}, False
+            return (
+                {"kind": "system", "id": "system"},
+                False,
+                reported_speech_ambiguous,
+            )
         if not role and actor in {"system", "tool", "bot"}:
-            return {"kind": "system", "id": "system"}, False
+            return (
+                {"kind": "system", "id": "system"},
+                False,
+                reported_speech_ambiguous,
+            )
         if author and author.casefold() in self.owner_aliases:
-            return {"kind": "owner", "id": "owner"}, False
+            return (
+                {"kind": "owner", "id": "owner"},
+                False,
+                reported_speech_ambiguous,
+            )
         if author:
-            return {"kind": "other", "id": _stable_other_id(author)}, False
+            return (
+                {"kind": "other", "id": _stable_other_id(author)},
+                False,
+                reported_speech_ambiguous,
+            )
         if role == "user":
-            return {"kind": "owner", "id": "owner"}, False
+            return (
+                {"kind": "owner", "id": "owner"},
+                False,
+                reported_speech_ambiguous,
+            )
         if role == "assistant":
-            return {"kind": "system", "id": "system"}, False
-        return {"kind": "unknown", "id": "unknown"}, False
+            return (
+                {"kind": "system", "id": "system"},
+                False,
+                reported_speech_ambiguous,
+            )
+        return (
+            {"kind": "unknown", "id": "unknown"},
+            False,
+            reported_speech_ambiguous,
+        )
 
     def _subject(
         self,
@@ -533,7 +591,11 @@ class AttributionService:
         if not isinstance(record, Mapping):
             raise TypeError("record must be a mapping")
         content = _clean_text(record.get("content") or record.get("statement"))
-        speaker, third_party_quote = self._speaker(record, content)
+        (
+            speaker,
+            third_party_quote,
+            reported_speech_ambiguous,
+        ) = self._speaker(record, content)
         subject = self._subject(record, speaker, content)
         claim_type = self._claim_type(record, speaker, content)
         source = self._source(record)
@@ -606,6 +668,8 @@ class AttributionService:
             flags.append("unknown_speaker")
         if third_party_quote:
             flags.append("third_party_quote")
+        if reported_speech_ambiguous:
+            flags.append("reported_speech_ambiguous")
         if claim_type in TRANSIENT_TYPES:
             flags.append("transient_content")
         if one_off_content:
@@ -632,6 +696,7 @@ class AttributionService:
             and source_quality >= 0.75
             and confidence >= self.auto_confirm_threshold
             and "third_party_quote" not in flags
+            and "reported_speech_ambiguous" not in flags
         )
         return {
             "speaker": speaker,

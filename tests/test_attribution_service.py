@@ -305,6 +305,87 @@ def test_owner_first_person_expressions_are_not_false_positive_quotes(content):
     assert "third_party_quote" not in result["trust_flags"]
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "严格来说，我一直偏好先验证再发布。",
+        "客观来说，我一直偏好先验证再发布。",
+        "准确来说，我一直偏好先验证再发布。",
+        "具体来说，我一直偏好先验证再发布。",
+        "相对来说，我一直偏好先验证再发布。",
+        "整体来说，我一直偏好先验证再发布。",
+        "简单来说，我一直偏好先验证再发布。",
+        "坦白说，我一直偏好先验证再发布。",
+        "老实说，我一直偏好先验证再发布。",
+        "实话说，我一直偏好先验证再发布。",
+        "只能说，我一直偏好先验证再发布。",
+        "这么说，我一直偏好先验证再发布。",
+        "谨慎地说，我一直偏好先验证再发布。",
+        "保守点说，我一直偏好先验证再发布。",
+        "通俗来说，我一直偏好先验证再发布。",
+    ],
+)
+def test_ambiguous_say_markers_preserve_owner_but_block_auto_confirm(content):
+    resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-01T00:00:00Z"),
+            ("ev_2", "2026-07-02T00:00:00Z"),
+            ("ev_3", "2026-07-03T00:00:00Z"),
+        ),
+    )
+    service = AttributionService(
+        owner_aliases={"owner", "黑哥"},
+        evidence_resolver=resolver,
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    )
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1"},
+                {"evidence_id": "ev_2"},
+                {"evidence_id": "ev_3"},
+            ],
+        }
+    )
+
+    assert result["speaker"] == {"kind": "owner", "id": "owner"}
+    assert result["source_kind"] == "direct"
+    assert "third_party_quote" not in result["trust_flags"]
+    assert "reported_speech_ambiguous" in result["trust_flags"]
+    assert result["auto_confirm_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Alice说，这个实现存在竞态。",
+        "她说，这个安排需要调整。",
+        "我的架构师说，这个实现需要重写。",
+        "甲方代表说，交付时间需要延后。",
+    ],
+)
+def test_entity_shaped_say_authors_still_fail_closed_as_quoted(content):
+    result = AttributionService(owner_aliases={"owner", "黑哥"}).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+        }
+    )
+
+    assert result["speaker"]["kind"] == "other"
+    assert result["source_kind"] == "quoted"
+    assert "third_party_quote" in result["trust_flags"]
+    assert "reported_speech_ambiguous" not in result["trust_flags"]
+    assert result["auto_confirm_allowed"] is False
+
+
 def test_explicit_quoted_author_always_fails_closed():
     service = AttributionService(owner_aliases={"owner"})
     result = service.classify(
