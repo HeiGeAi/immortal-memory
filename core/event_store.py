@@ -73,6 +73,49 @@ def _directory_flags() -> int:
     return flags
 
 
+def _open_verified_directory_at(parent_fd: int, name: str) -> int:
+    try:
+        observed = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise _unsafe_path(
+            "concurrently created parent cannot be inspected safely",
+            exc,
+        )
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise _unsafe_path(
+            "concurrently created parent must be a real directory",
+        )
+    try:
+        child = os.open(
+            name,
+            _directory_flags(),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise _unsafe_path(
+            "concurrently created parent cannot be opened safely",
+            exc,
+        )
+    try:
+        opened = os.fstat(child)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (observed.st_dev, observed.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise _unsafe_path(
+                "concurrently created parent identity changed",
+            )
+        return child
+    except Exception:
+        os.close(child)
+        raise
+
+
 @contextmanager
 def _anchored_parent(path: Path, *, create: bool) -> Iterator[tuple]:
     absolute = Path(os.path.abspath(str(path)))
@@ -96,6 +139,11 @@ def _anchored_parent(path: Path, *, create: bool) -> Iterator[tuple]:
                         component,
                         _directory_flags(),
                         dir_fd=descriptor,
+                    )
+                except FileExistsError:
+                    child = _open_verified_directory_at(
+                        descriptor,
+                        component,
                     )
                 except OSError as exc:
                     raise _unsafe_path(

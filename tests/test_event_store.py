@@ -45,6 +45,16 @@ def append_in_process(path: str, event_id: str, stream_id: str) -> None:
     )
 
 
+def append_after_barrier_in_process(
+    path: str,
+    event_id: str,
+    stream_id: str,
+    barrier,
+) -> None:
+    barrier.wait(timeout=10)
+    append_in_process(path, event_id, stream_id)
+
+
 def enter_event_lock_in_process(
     path,
     role,
@@ -352,6 +362,220 @@ def test_same_stream_concurrency_never_silently_loses_a_write(tmp_path):
 
     assert sorted(outcomes) == ["ok", "version_conflict"]
     assert len(JsonlEventStore(path).read_stream("stream-1")) == 2
+
+
+def test_concurrent_first_parent_creation_recovers_only_real_directory(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    path = tmp_path / "shared-parent" / "events.jsonl"
+    barrier = threading.Barrier(2)
+    real_mkdir = module.os.mkdir
+    outcomes = []
+
+    def synchronized_mkdir(component, *args, **kwargs):
+        if component == "shared-parent":
+            barrier.wait(timeout=5)
+        return real_mkdir(component, *args, **kwargs)
+
+    def append(event_id, stream_id):
+        try:
+            stored = JsonlEventStore(path).append(
+                event(event_id, stream_id=stream_id)
+            )
+            outcomes.append(("ok", stored["event_id"]))
+        except Exception as exc:
+            outcomes.append((getattr(exc, "code", type(exc).__name__), event_id))
+
+    monkeypatch.setattr(module.os, "mkdir", synchronized_mkdir)
+    threads = [
+        threading.Thread(target=append, args=("evt-a", "stream-a")),
+        threading.Thread(target=append, args=("evt-b", "stream-b")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(outcomes) == [("ok", "evt-a"), ("ok", "evt-b")]
+    assert {row["event_id"] for row in JsonlEventStore(path).read_all()} == {
+        "evt-a",
+        "evt-b",
+    }
+
+
+@pytest.mark.parametrize("replacement_kind", ["symlink", "file"])
+def test_parent_creation_collision_rejects_non_directory_replacement(
+    tmp_path,
+    monkeypatch,
+    replacement_kind,
+):
+    import event_store as module
+
+    path = tmp_path / "collided-parent" / "events.jsonl"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_mkdir = module.os.mkdir
+
+    def inject_collision(component, *args, **kwargs):
+        if component != "collided-parent":
+            return real_mkdir(component, *args, **kwargs)
+        parent_fd = kwargs["dir_fd"]
+        if replacement_kind == "symlink":
+            os.symlink(str(outside), component, dir_fd=parent_fd)
+        else:
+            fd = os.open(
+                component,
+                os.O_CREAT | os.O_WRONLY,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            os.close(fd)
+        raise FileExistsError(17, "injected collision", component)
+
+    monkeypatch.setattr(module.os, "mkdir", inject_collision)
+
+    with pytest.raises(Exception) as captured:
+        JsonlEventStore(path).append(event("evt-collision"))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert not (outside / "events.jsonl").exists()
+    assert not (outside / "events.jsonl.lock").exists()
+
+
+def test_parent_creation_collision_rejects_directory_inode_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    path = tmp_path / "replaced-parent" / "events.jsonl"
+    moved = tmp_path / "moved-parent"
+    real_mkdir = module.os.mkdir
+    real_open = module.os.open
+    collision_injected = [False]
+    replacement_injected = [False]
+
+    def inject_collision(component, *args, **kwargs):
+        if component != "replaced-parent":
+            return real_mkdir(component, *args, **kwargs)
+        real_mkdir(component, *args, **kwargs)
+        collision_injected[0] = True
+        raise FileExistsError(17, "injected collision", component)
+
+    def replace_before_verified_open(component, flags, *args, **kwargs):
+        if (
+            collision_injected[0]
+            and not replacement_injected[0]
+            and component == "replaced-parent"
+        ):
+            parent_fd = kwargs["dir_fd"]
+            os.rename(
+                component,
+                moved.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            real_mkdir(component, 0o700, dir_fd=parent_fd)
+            replacement_injected[0] = True
+        return real_open(component, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "mkdir", inject_collision)
+    monkeypatch.setattr(module.os, "open", replace_before_verified_open)
+
+    with pytest.raises(Exception) as captured:
+        JsonlEventStore(path).append(event("evt-replaced"))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert collision_injected == [True]
+    assert not path.exists()
+
+
+def test_process_stress_concurrent_first_multilevel_parent_creation(tmp_path):
+    path = tmp_path / "fresh" / "nested" / "events.jsonl"
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(8)
+    processes = [
+        context.Process(
+            target=append_after_barrier_in_process,
+            args=(
+                str(path),
+                f"evt-first-{number}",
+                f"stream-first-{number}",
+                barrier,
+            ),
+        )
+        for number in range(8)
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+
+    assert [process.exitcode for process in processes] == [0] * len(processes)
+    assert {row["event_id"] for row in JsonlEventStore(path).read_all()} == {
+        f"evt-first-{number}" for number in range(8)
+    }
+
+
+def test_thread_stress_concurrent_first_multilevel_parent_creation(tmp_path):
+    path = tmp_path / "thread-fresh" / "nested" / "events.jsonl"
+    barrier = threading.Barrier(32)
+    outcomes = []
+
+    def append(number):
+        barrier.wait(timeout=10)
+        try:
+            stored = JsonlEventStore(path).append(
+                event(
+                    f"evt-thread-{number}",
+                    stream_id=f"stream-thread-{number}",
+                )
+            )
+            outcomes.append(("ok", stored["event_id"]))
+        except Exception as exc:
+            outcomes.append(
+                (getattr(exc, "code", type(exc).__name__), str(number))
+            )
+
+    threads = [
+        threading.Thread(target=append, args=(number,))
+        for number in range(32)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(outcomes) == 32
+    assert {status for status, _value in outcomes} == {"ok"}
+    assert len(JsonlEventStore(path).read_all()) == 32
+
+
+def test_parent_creation_permission_error_still_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    path = tmp_path / "denied-parent" / "events.jsonl"
+    real_mkdir = module.os.mkdir
+
+    def deny_parent(component, *args, **kwargs):
+        if component == "denied-parent":
+            raise PermissionError(13, "injected permission denial", component)
+        return real_mkdir(component, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "mkdir", deny_parent)
+
+    with pytest.raises(Exception) as captured:
+        JsonlEventStore(path).append(event("evt-denied"))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert not path.exists()
 
 
 def test_append_fsyncs_file_and_new_parent_entry(tmp_path, monkeypatch):
