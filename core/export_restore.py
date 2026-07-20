@@ -14,7 +14,7 @@ import json
 import os
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -327,7 +327,8 @@ def get_backup_status(vault_dir: str | Path | None = None, verify: bool = False)
         and int((manifest.get("totals") or {}).get("files") or 0) > 0
     )
     if verify:
-        check = restore_check(latest["export_dir"], strict=False)
+        check = restore_check(latest["export_dir"], strict=True)
+        check["mode"] = "strict-sha256"
     else:
         check = {
             "ok": manifest_ok,
@@ -344,6 +345,10 @@ def get_backup_status(vault_dir: str | Path | None = None, verify: bool = False)
     return {
         "ok": bool(check.get("ok")),
         "trust_level": trust_level,
+        "generated_at": manifest.get("generated_at", ""),
+        "storage_location": manifest.get("storage_location", "unknown"),
+        "secret_scan": manifest.get("secret_scan", {}),
+        "generation_warnings": manifest.get("warnings", []),
         "vault_dir": latest["vault_dir"],
         "exports_dir": latest["exports_dir"],
         "latest_export": latest,
@@ -357,6 +362,114 @@ def get_backup_status(vault_dir: str | Path | None = None, verify: bool = False)
             "warnings": check.get("warnings", []),
         },
         "warnings": check.get("warnings", []),
+    }
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def migration_backup_gate(
+    evidence: dict[str, Any],
+    require_external: bool = True,
+    *,
+    max_age_hours: float = 168,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless migration evidence proves a fresh, restorable backup.
+
+    The returned result contains classifications and blocker codes only. It
+    intentionally never copies warning bodies or credential candidates into
+    the result.
+    """
+    payload = evidence if isinstance(evidence, dict) else {}
+    blockers: list[str] = []
+
+    storage = payload.get("storage")
+    if isinstance(storage, dict):
+        location = str(storage.get("location") or "unknown")
+    else:
+        location = str(payload.get("storage_location") or "unknown")
+    if require_external and location != "external_disk":
+        blockers.append("backup_not_external")
+
+    verification = payload.get("verification")
+    if not isinstance(verification, dict):
+        verification = {}
+    status_check = payload.get("check")
+    if not isinstance(status_check, dict):
+        status_check = {}
+    verification_mode = str(
+        verification.get("mode")
+        or payload.get("verification_mode")
+        or status_check.get("mode")
+        or payload.get("mode")
+        or ""
+    )
+    verification_ok = verification.get("ok")
+    if verification_ok is None:
+        verification_ok = status_check.get("ok")
+    if verification_mode != "strict-sha256" or verification_ok is not True:
+        blockers.append("verification_not_strict")
+
+    restore_evidence = payload.get("restore_check")
+    if not isinstance(restore_evidence, dict):
+        restore_evidence = payload.get("check")
+    if not isinstance(restore_evidence, dict) or restore_evidence.get("ok") is not True:
+        blockers.append("restore_check_missing_or_failed")
+
+    warnings = payload.get("warnings")
+    warning_codes = [str(item) for item in warnings] if isinstance(warnings, list) else []
+    secret_scan = payload.get("secret_scan")
+    secret_count = 0
+    if isinstance(secret_scan, dict):
+        try:
+            secret_count = int(secret_scan.get("unique_candidates") or 0)
+        except (TypeError, ValueError):
+            secret_count = 1
+    if secret_count > 0 or any("secret_shapes_present" in item for item in warning_codes):
+        blockers.append("secret_shapes_present")
+
+    current = now or now_utc()
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    current = current.astimezone(timezone.utc)
+    generated = _parse_utc_timestamp(payload.get("generated_at"))
+    age_hours: float | None = None
+    if generated is None or max_age_hours <= 0:
+        blockers.append("backup_timestamp_invalid")
+    else:
+        age = current - generated
+        age_hours = age.total_seconds() / 3600
+        if age < timedelta(0):
+            blockers.append("backup_timestamp_invalid")
+        elif age > timedelta(hours=max_age_hours):
+            blockers.append("backup_stale")
+
+    health = payload.get("health")
+    if not isinstance(health, dict) or health.get("ok") is not True:
+        blockers.append("health_check_failed")
+
+    index_parity = payload.get("index_parity")
+    if not isinstance(index_parity, dict) or index_parity.get("ok") is not True:
+        blockers.append("index_parity_failed")
+
+    unique_blockers = list(dict.fromkeys(blockers))
+    return {
+        "ok": not unique_blockers,
+        "blockers": unique_blockers,
+        "storage_location": location,
+        "verification_mode": verification_mode,
+        "backup_age_hours": round(age_hours, 3) if age_hours is not None else None,
+        "max_age_hours": max_age_hours,
     }
 
 
