@@ -369,18 +369,125 @@ def _migration_provenance(
     )
 
 
-def _valid_migration_provenance(
+def _migration_provenance_index_digest(
     value: Any,
     *,
     source_name: str,
     source_digest: str,
-    index_digest: str,
-) -> bool:
-    return value == _migration_provenance(
-        source_name,
-        source_digest=source_digest,
-        index_digest=index_digest,
+) -> Optional[str]:
+    prefix = (
+        source_name
+        + "#sha256:"
+        + source_digest
+        + ";index_sha256:"
     )
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    index_digest = value[len(prefix) :]
+    return index_digest if _is_sha256(index_digest) else None
+
+
+def _trusted_index_prefix_digests(
+    binding: Mapping[str, Any],
+    requirements: Mapping[str, Iterable[str]],
+) -> set:
+    pending = {
+        digest: set(evidence_ids)
+        for digest, evidence_ids in requirements.items()
+    }
+    if not pending or not binding.get("exists"):
+        return set()
+    candidate = Path(str(binding["path"]))
+    try:
+        before = os.lstat(str(candidate))
+    except OSError as exc:
+        raise MigrationError(
+            "source_changed",
+            "evidence index changed before provenance recovery",
+        ) from exc
+    if _signature(before) != binding.get("signature"):
+        raise MigrationError(
+            "source_changed",
+            "evidence index changed before provenance recovery",
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise MigrationError(
+            "source_unreadable",
+            "evidence index cannot be opened for provenance recovery",
+        ) from exc
+    digest = hashlib.sha256()
+    buffer = b""
+    total = 0
+    seen_ids = set()
+    trusted = set()
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _signature(opened) != binding.get("signature")
+        ):
+            raise MigrationError(
+                "source_changed",
+                "evidence index changed during provenance recovery",
+            )
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_EVIDENCE_SOURCE_BYTES:
+                raise MigrationError(
+                    "migration_source_too_large",
+                    "evidence index exceeds the size limit",
+                )
+            parts = (buffer + chunk).split(b"\n")
+            buffer = parts.pop()
+            for part in parts:
+                encoded_line = part + b"\n"
+                digest.update(encoded_line)
+                try:
+                    row = json.loads(part.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise MigrationError(
+                        "malformed_evidence",
+                        "evidence index is malformed during provenance recovery",
+                    ) from exc
+                if isinstance(row, Mapping):
+                    evidence_id = row.get("id")
+                    if isinstance(evidence_id, str):
+                        seen_ids.add(evidence_id)
+                current_digest = digest.hexdigest()
+                if (
+                    current_digest in pending
+                    and pending[current_digest].issubset(seen_ids)
+                ):
+                    trusted.add(current_digest)
+        if buffer:
+            raise MigrationError(
+                "malformed_evidence",
+                "evidence index has an unterminated provenance record",
+            )
+        if digest.hexdigest() != binding.get("digest"):
+            raise MigrationError(
+                "source_changed",
+                "evidence index digest changed during provenance recovery",
+            )
+        after = os.lstat(str(candidate))
+        if _signature(after) != binding.get("signature"):
+            raise MigrationError(
+                "source_changed",
+                "evidence index changed during provenance recovery",
+            )
+        return trusted
+    finally:
+        os.close(descriptor)
 
 
 def _stable_digest(kind: str, legacy_id: str) -> str:
@@ -808,15 +915,16 @@ def _verify_existing_migration_state(
     current: Mapping[str, Mapping[str, Any]],
     *,
     committed_index_digests: Mapping[str, str],
-    current_index_digest: str,
-) -> None:
+    index_binding: Mapping[str, Any],
+) -> Dict[str, str]:
+    recovered_index_digests = dict(committed_index_digests)
     expected = {
         item["claim_id"]: item
         for item in raw_items
         if item["claim_id"] in current
     }
     if not expected:
-        return
+        return recovered_index_digests
     events_by_stream: Dict[str, List[Dict[str, Any]]] = {
         claim_id: [] for claim_id in expected
     }
@@ -832,13 +940,16 @@ def _verify_existing_migration_state(
             "malformed_current_state",
             "claim events cannot be inspected for migration provenance",
         ) from exc
+    unbound_claim_digests: Dict[str, str] = {}
+    prefix_requirements: Dict[str, set] = {}
     for claim_id, item in expected.items():
-        expected_index_digest = committed_index_digests.get(
-            claim_id,
-            current_index_digest,
-        )
         events = events_by_stream[claim_id]
         first = events[0] if events else {}
+        event_index_digest = _migration_provenance_index_digest(
+            first.get("migration_source"),
+            source_name=item["source_name"],
+            source_digest=item["source_digest"],
+        )
         initial = item.get("initial")
         payload = first.get("payload")
         first_claim = payload.get("claim") if isinstance(payload, Mapping) else None
@@ -853,12 +964,7 @@ def _verify_existing_migration_state(
             and first.get("idempotency_key")
             == ClaimStore._public_idempotency_key(initial["idempotency_key"])
             and first.get("actor") == MIGRATION_ACTOR
-            and _valid_migration_provenance(
-                first.get("migration_source"),
-                source_name=item["source_name"],
-                source_digest=item["source_digest"],
-                index_digest=expected_index_digest,
-            )
+            and event_index_digest is not None
             and isinstance(first_claim, Mapping)
             and _canonical(_claim_intent(first_claim))
             == _canonical(_claim_intent(initial["claim"]))
@@ -868,6 +974,30 @@ def _verify_existing_migration_state(
                 "migration_state_conflict",
                 "existing deterministic Claim does not match migration provenance",
             )
+        checkpoint_digest = committed_index_digests.get(claim_id)
+        if checkpoint_digest is not None:
+            if event_index_digest != checkpoint_digest:
+                raise MigrationError(
+                    "migration_state_conflict",
+                    "existing Claim index provenance conflicts with checkpoint",
+                )
+            continue
+        assert event_index_digest is not None
+        unbound_claim_digests[claim_id] = event_index_digest
+        prefix_requirements.setdefault(event_index_digest, set()).update(
+            item["evidence_ids"]
+        )
+    trusted = _trusted_index_prefix_digests(
+        index_binding,
+        prefix_requirements,
+    )
+    if trusted != set(prefix_requirements):
+        raise MigrationError(
+            "migration_state_conflict",
+            "existing Claim index provenance is not a trusted index prefix",
+        )
+    recovered_index_digests.update(unbound_claim_digests)
+    return recovered_index_digests
 
 
 def _prepare_candidates(
@@ -1136,12 +1266,12 @@ def _migrate_legacy_profile(
     committed_index_digests = dict(
         checkpoint["committed_index_digests"] if checkpoint else {}
     )
-    _verify_existing_migration_state(
+    committed_index_digests = _verify_existing_migration_state(
         vault,
         raw_items,
         current,
         committed_index_digests=committed_index_digests,
-        current_index_digest=index_binding["digest"],
+        index_binding=index_binding,
     )
     committed_claim_ids = sorted(set(candidate_ids) & existing_ids)
     if checkpoint and checkpoint["candidate_ids"] != candidate_ids:

@@ -315,6 +315,60 @@ def test_interrupted_run_restarts_from_deterministic_event_without_duplicates(
     assert len({row["event_id"] for row in event_rows(tmp_path)}) == 3
 
 
+def test_crash_before_first_checkpoint_resumes_after_unrelated_index_append(
+    tmp_path,
+    monkeypatch,
+):
+    seed_evidence(tmp_path, "ev-1", "ev-2", "ev-3")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [
+            legacy_row("mem-1", "ev-1"),
+            legacy_row("mem-2", "ev-2"),
+            legacy_row("mem-3", "ev-3"),
+        ],
+    )
+    import model_migration
+
+    def interrupt(created):
+        if created == 1:
+            raise RuntimeError("crash before first checkpoint")
+
+    monkeypatch.setattr(model_migration, "after_claim_commit", interrupt)
+    with pytest.raises(RuntimeError, match="crash before first checkpoint"):
+        migrate_legacy_profile(tmp_path, checkpoint_every=100)
+
+    checkpoint = (
+        tmp_path
+        / "model"
+        / "migrations"
+        / "legacy-profile-v1"
+        / "checkpoint.json"
+    )
+    assert not checkpoint.exists()
+    with (tmp_path / "index.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "id": "ev-unrelated",
+                    "timestamp": "2026-07-01T00:00:00+00:00",
+                    "source": "codex",
+                    "content": "authoritative evidence ev-unrelated",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+
+    monkeypatch.setattr(model_migration, "after_claim_commit", lambda created: None)
+    resumed = migrate_legacy_profile(tmp_path, checkpoint_every=100)
+
+    assert resumed["created"] == 2
+    assert len(event_rows(tmp_path)) == 3
+    assert len({row["event_id"] for row in event_rows(tmp_path)}) == 3
+
+
 def test_malformed_source_fails_before_any_migration_write(tmp_path):
     seed_evidence(tmp_path, "ev-1")
     source = tmp_path / "reviewed" / "profile_memories.jsonl"
@@ -484,6 +538,29 @@ def test_tampered_first_migration_index_digest_conflicts(tmp_path):
         [legacy_row("mem-1", "ev-1")],
     )
     migrate_legacy_profile(tmp_path)
+    events_path = tmp_path / "model" / "claims" / "events.jsonl"
+    rows = event_rows(tmp_path)
+    prefix, _index_digest = rows[0]["migration_source"].split(
+        ";index_sha256:",
+        1,
+    )
+    rows[0]["migration_source"] = prefix + ";index_sha256:" + ("f" * 64)
+    write_jsonl(events_path, rows)
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "migration_state_conflict"
+
+
+def test_uncheckpointed_forged_index_digest_is_not_recovered(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    Path(report["checkpoint"]).unlink()
     events_path = tmp_path / "model" / "claims" / "events.jsonl"
     rows = event_rows(tmp_path)
     prefix, _index_digest = rows[0]["migration_source"].split(
