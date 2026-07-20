@@ -162,6 +162,180 @@ def test_forced_rebuild_uses_staging_without_predeleting_database(tmp_path):
     assert database.read_bytes() == before
 
 
+def test_full_rebuild_records_exact_utf8_jsonl_byte_locators(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    rows = [
+        record("ascii", "alpha"),
+        record("utf8", "中文正文"),
+        record("long", "长" * 20_000),
+    ]
+    encoded_lines = [
+        (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        for row in rows
+    ]
+    source.write_bytes(b"".join(encoded_lines))
+
+    reconcile_index(source, database)
+
+    with sqlite3.connect(str(database)) as con:
+        stored = con.execute(
+            "SELECT rec_id,source_offset,source_length,line_number,content_sha256 "
+            "FROM docs ORDER BY line_number"
+        ).fetchall()
+        meta = dict(con.execute("SELECT key,value FROM meta"))
+    expected = []
+    offset = 0
+    for line_number, (row, raw) in enumerate(zip(rows, encoded_lines), 1):
+        expected.append(
+            (
+                row["id"],
+                offset,
+                len(raw),
+                line_number,
+                hashlib.sha256(row["content"].encode("utf-8")).hexdigest(),
+            )
+        )
+        offset += len(raw)
+    assert stored == expected
+    assert meta["index_schema_version"] == "2"
+
+
+def test_incremental_sync_records_offsets_from_previous_source_size(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    first = (json.dumps(record("first", "第一条"), ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+    second = (
+        json.dumps(record("second", "第二条"), ensure_ascii=False) + "\n"
+    ).encode("utf-8")
+    source.write_bytes(first)
+    reconcile_index(source, database)
+    with source.open("ab") as handle:
+        handle.write(second)
+
+    report = reconcile_index(source, database)
+
+    assert report["mode"] == "incremental"
+    with sqlite3.connect(str(database)) as con:
+        locator = con.execute(
+            "SELECT source_offset,source_length,line_number "
+            "FROM docs WHERE rec_id='second'"
+        ).fetchone()
+    assert locator == (len(first), len(second), 2)
+
+
+def test_old_locator_schema_forces_staging_rebuild_and_failure_preserves_database(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("safe", "existing")])
+    reconcile_index(source, database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute("DELETE FROM meta WHERE key='index_schema_version'")
+        con.commit()
+    before = database.read_bytes()
+
+    def fail_build(*_args, **_kwargs):
+        raise index_integrity.IndexIntegrityError("forced locator rebuild failure")
+
+    monkeypatch.setattr(index_integrity, "_build_staging_once", fail_build)
+
+    with pytest.raises(
+        index_integrity.IndexIntegrityError,
+        match="forced locator rebuild failure",
+    ):
+        reconcile_index(source, database)
+
+    assert database.read_bytes() == before
+    assert db_ids(database) == {"safe"}
+
+
+def test_same_name_wrong_column_index_forces_locator_rebuild(tmp_path):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("safe", "existing")])
+    reconcile_index(source, database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute("DROP INDEX idx_docs_rec_id")
+        con.execute("CREATE INDEX idx_docs_rec_id ON docs(source)")
+        con.commit()
+
+    report = reconcile_index(source, database)
+
+    assert report["mode"] == "full_rebuild"
+    assert report["reason"] == "locator_schema_missing"
+    with sqlite3.connect(str(database)) as con:
+        columns = [
+            row[2]
+            for row in con.execute("PRAGMA index_info(idx_docs_rec_id)")
+        ]
+    assert columns == ["rec_id"]
+
+
+def test_locator_gap_forces_rebuild_instead_of_marking_database_current(
+    tmp_path,
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        source,
+        [
+            record("first", "第一条"),
+            record("second", "第二条"),
+            record("third", "第三条"),
+        ],
+    )
+    reconcile_index(source, database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute(
+            "UPDATE docs SET source_offset=source_offset+1,"
+            "source_length=source_length-1 WHERE rec_id='second'"
+        )
+        con.commit()
+
+    report = reconcile_index(source, database)
+
+    assert report["mode"] == "full_rebuild"
+    assert report["reason"] == "locator_invalid"
+
+
+def test_source_symlink_is_rejected_before_locator_build(tmp_path):
+    real_source = tmp_path / "real-index.jsonl"
+    source_link = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(real_source, [record("safe", "existing")])
+    source_link.symlink_to(real_source)
+
+    with pytest.raises(
+        index_integrity.IndexIntegrityError,
+        match="unsafe source path",
+    ):
+        reconcile_index(source_link, database)
+
+    assert not database.exists()
+
+
+def test_source_parent_symlink_is_rejected_before_locator_build(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    write_records(real_parent / "index.jsonl", [record("safe", "existing")])
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    database = tmp_path / "search_index.db"
+
+    with pytest.raises(
+        index_integrity.IndexIntegrityError,
+        match="unsafe source path",
+    ):
+        reconcile_index(parent_link / "index.jsonl", database)
+
+    assert not database.exists()
+
+
 @pytest.mark.parametrize(
     ("body", "message"),
     [

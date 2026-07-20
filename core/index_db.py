@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from index_integrity import INDEX_SCHEMA_VERSION, locator_schema_is_current
 from index_locks import database_lock, index_lock_pair
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -96,11 +97,21 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS docs("
         "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
-        "role TEXT, project TEXT, content TEXT)"
+        "role TEXT, project TEXT, content TEXT, "
+        "source_offset INTEGER NOT NULL, source_length INTEGER NOT NULL, "
+        "line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_source_offset "
+        "ON docs(source_offset)"
+    )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_line_number "
+        "ON docs(line_number)"
+    )
     con.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5("
         "content, tokenize='trigram')"
@@ -193,9 +204,10 @@ def _is_ready_unlocked(*, ignore_notes_rebuild_marker: bool = False) -> bool:
                 "SELECT key,value FROM meta WHERE key IN "
                 "('parity_status','last_size','source_dev','source_ino',"
                 "'source_mtime_ns','source_ctime_ns','indexed_id_count',"
-                "'indexed_ids_sha256')"
+                "'indexed_ids_sha256','index_schema_version')"
             ).fetchall()
         )
+        locator_schema_current = locator_schema_is_current(con)
         source_after = INDEX_FILE.stat()
     except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
         return False
@@ -211,8 +223,14 @@ def _is_ready_unlocked(*, ignore_notes_rebuild_marker: bool = False) -> bool:
         "source_ctime_ns",
         "indexed_id_count",
         "indexed_ids_sha256",
+        "index_schema_version",
     }
-    if set(rows) != required or rows["parity_status"] != "trusted":
+    if (
+        set(rows) != required
+        or rows["parity_status"] != "trusted"
+        or rows["index_schema_version"] != str(INDEX_SCHEMA_VERSION)
+        or not locator_schema_current
+    ):
         return False
     before_signature = (
         source_before.st_dev,

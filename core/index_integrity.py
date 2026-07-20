@@ -8,8 +8,9 @@ import json
 import os
 import sqlite3
 import stat as stat_module
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
 from index_locks import (
     database_lock_path,
@@ -28,6 +29,20 @@ from index_publication import (
 
 SOURCE_STABILITY_ATTEMPTS = 3
 MISSING_ID_SAMPLE_LIMIT = 100
+INDEX_SCHEMA_VERSION = 2
+LOCATOR_COLUMNS = frozenset(
+    {
+        "source_offset",
+        "source_length",
+        "line_number",
+        "content_sha256",
+    }
+)
+LOCATOR_INDEXES = {
+    "idx_docs_rec_id": ("rec_id", None),
+    "idx_docs_source_offset": ("source_offset", True),
+    "idx_docs_line_number": ("line_number", True),
+}
 
 
 class IndexIntegrityError(RuntimeError):
@@ -36,6 +51,83 @@ class IndexIntegrityError(RuntimeError):
 
 class SourceChangedError(IndexIntegrityError):
     """The source changed while a consistency-sensitive scan was running."""
+
+
+def _normalized_source_path(path: Path) -> Path:
+    candidate = Path(os.path.abspath(str(path)))
+    for system_root in (Path("/var"), Path("/tmp")):
+        try:
+            relative = candidate.relative_to(system_root)
+        except ValueError:
+            continue
+        if system_root.is_symlink():
+            return Path(os.path.realpath(str(system_root))) / relative
+        break
+    return candidate
+
+
+def _safe_source_stat(path: Path) -> os.stat_result:
+    candidate = _normalized_source_path(path)
+    current = candidate
+    while True:
+        try:
+            metadata = os.lstat(str(current))
+        except FileNotFoundError:
+            if current == candidate:
+                raise
+            raise IndexIntegrityError(
+                "unsafe source path: ancestor is missing"
+            )
+        except OSError as exc:
+            raise IndexIntegrityError(
+                "unsafe source path: cannot inspect path chain"
+            ) from exc
+        if stat_module.S_ISLNK(metadata.st_mode):
+            raise IndexIntegrityError(
+                "unsafe source path: symlinks are not allowed"
+            )
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    source_stat = os.lstat(str(candidate))
+    if not stat_module.S_ISREG(source_stat.st_mode):
+        raise IndexIntegrityError(
+            "unsafe source path: regular file required"
+        )
+    return source_stat
+
+
+@contextmanager
+def _open_source_nofollow(path: Path) -> Iterator[Any]:
+    candidate = _normalized_source_path(path)
+    expected = _safe_source_stat(candidate)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise IndexIntegrityError(
+            "unsafe source path: cannot open source safely"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        current = _safe_source_stat(candidate)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or _stat_signature(opened) != _stat_signature(expected)
+            or _stat_signature(current) != _stat_signature(expected)
+        ):
+            raise SourceChangedError(
+                "source identity changed during safe open"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            yield handle
+    finally:
+        os.close(descriptor)
 
 
 def ids_sha256(ids) -> str:
@@ -54,7 +146,7 @@ def sha256_prefix(path: Path, length: int) -> str:
         raise ValueError("length must be non-negative")
     digest = hashlib.sha256()
     remaining = length
-    with Path(path).open("rb") as handle:
+    with _open_source_nofollow(Path(path)) as handle:
         while remaining:
             chunk = handle.read(min(1024 * 1024, remaining))
             if not chunk:
@@ -94,10 +186,10 @@ def _revision(
 
 def _read_source_revision_once(path: Path) -> Dict[str, object]:
     path = Path(path)
-    path_before = path.stat()
+    path_before = _safe_source_stat(path)
     digest = hashlib.sha256()
     read_size = 0
-    with path.open("rb") as handle:
+    with _open_source_nofollow(path) as handle:
         fd_before = os.fstat(handle.fileno())
         if _stat_signature(fd_before) != _stat_signature(path_before):
             raise SourceChangedError("source identity changed before revision scan")
@@ -108,7 +200,7 @@ def _read_source_revision_once(path: Path) -> Dict[str, object]:
             digest.update(block)
             read_size += len(block)
         fd_after = os.fstat(handle.fileno())
-    path_after = path.stat()
+    path_after = _safe_source_stat(path)
     expected = _stat_signature(path_before)
     if (
         _stat_signature(fd_after) != expected
@@ -141,8 +233,8 @@ def _revision_stat_matches(
     revision: Dict[str, object],
 ) -> bool:
     try:
-        value = Path(path).stat()
-    except OSError:
+        value = _safe_source_stat(Path(path))
+    except (OSError, IndexIntegrityError):
         return False
     return _stat_signature(value) == (
         int(revision["dev"]),
@@ -157,11 +249,21 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS docs("
         "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
-        "role TEXT, project TEXT, content TEXT)"
+        "role TEXT, project TEXT, content TEXT, "
+        "source_offset INTEGER NOT NULL, source_length INTEGER NOT NULL, "
+        "line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_source_offset "
+        "ON docs(source_offset)"
+    )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_line_number "
+        "ON docs(line_number)"
+    )
     con.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5("
         "content, tokenize='trigram')"
@@ -185,23 +287,87 @@ def _meta_set(con: sqlite3.Connection, key: str, value: object) -> None:
     )
 
 
-def _insert_record(con: sqlite3.Connection, row: Dict) -> None:
+def locator_schema_is_current(con: sqlite3.Connection) -> bool:
+    """Verify locator columns and the actual semantics of every named index."""
+    try:
+        columns = {
+            str(row[1])
+            for row in con.execute("PRAGMA table_info(docs)")
+        }
+        if (
+            not LOCATOR_COLUMNS.issubset(columns)
+            or str(_meta_get(con, "index_schema_version"))
+            != str(INDEX_SCHEMA_VERSION)
+        ):
+            return False
+        index_rows = {
+            str(row[1]): row
+            for row in con.execute("PRAGMA index_list(docs)")
+        }
+        for name, (expected_column, expected_unique) in LOCATOR_INDEXES.items():
+            index_row = index_rows.get(name)
+            if index_row is None:
+                return False
+            is_unique = bool(index_row[2])
+            is_partial = bool(index_row[4])
+            if is_partial or (
+                expected_unique is not None
+                and is_unique is not expected_unique
+            ):
+                return False
+            key_columns = [
+                row
+                for row in con.execute(
+                    "SELECT cid,name,coll,key FROM pragma_index_xinfo(?) "
+                    "ORDER BY seqno",
+                    (name,),
+                )
+                if bool(row[3])
+            ]
+            if (
+                len(key_columns) != 1
+                or int(key_columns[0][0]) < 0
+                or str(key_columns[0][1]) != expected_column
+                or str(key_columns[0][2]).upper() != "BINARY"
+            ):
+                return False
+    except (IndexError, sqlite3.DatabaseError):
+        return False
+    return True
+
+
+def _insert_record(
+    con: sqlite3.Connection,
+    row: Dict,
+    *,
+    source_offset: int,
+    source_length: int,
+    line_number: int,
+) -> None:
     content = row.get("content", "") or ""
+    content_text = str(content)
+    content_sha256 = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
     cur = con.execute(
-        "INSERT INTO docs(rec_id,ts,source,role,project,content) "
-        "VALUES(?,?,?,?,?,?)",
+        "INSERT INTO docs("
+        "rec_id,ts,source,role,project,content,"
+        "source_offset,source_length,line_number,content_sha256"
+        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
         (
             str(row.get("id") or ""),
             str(row.get("timestamp") or ""),
             str(row.get("source") or ""),
             str(row.get("role") or ""),
             str(row.get("project") or ""),
-            str(content),
+            content_text,
+            source_offset,
+            source_length,
+            line_number,
+            content_sha256,
         ),
     )
     con.execute(
         "INSERT INTO docs_fts(rowid,content) VALUES(?,?)",
-        (cur.lastrowid, str(content)),
+        (cur.lastrowid, content_text),
     )
 
 
@@ -226,10 +392,11 @@ def _load_source(
 ) -> Tuple[int, int, Set[str]]:
     ids = set(known_ids or ())
     added = 0
-    with source.open("rb") as handle:
+    with _open_source_nofollow(source) as handle:
         handle.seek(start_offset)
         line_number = start_line_number
         while True:
+            source_offset = handle.tell()
             raw = handle.readline()
             if not raw:
                 break
@@ -245,7 +412,13 @@ def _load_source(
                     f"duplicate record id at line {line_number}"
                 )
             ids.add(rec_id)
-            _insert_record(con, row)
+            _insert_record(
+                con,
+                row,
+                source_offset=source_offset,
+                source_length=len(raw),
+                line_number=line_number,
+            )
             added += 1
         processed_offset = handle.tell()
     return added, processed_offset, ids
@@ -295,16 +468,22 @@ def _scan_jsonl_once(
     connection: Optional[sqlite3.Connection] = None,
 ) -> Tuple[Set[str], Dict[str, object]]:
     source = Path(source)
-    path_before = source.stat()
+    path_before = _safe_source_stat(source)
     ids: Set[str] = set()
     digest = hashlib.sha256()
     read_size = 0
-    with source.open("rb") as handle:
+    with _open_source_nofollow(source) as handle:
         fd_before = os.fstat(handle.fileno())
         if _stat_signature(fd_before) != _stat_signature(path_before):
             raise SourceChangedError("source identity changed before JSONL scan")
         try:
-            for line_number, raw in enumerate(handle, 1):
+            line_number = 0
+            while True:
+                source_offset = handle.tell()
+                raw = handle.readline()
+                if not raw:
+                    break
+                line_number += 1
                 digest.update(raw)
                 read_size += len(raw)
                 if not raw.endswith(b"\n"):
@@ -319,13 +498,21 @@ def _scan_jsonl_once(
                     )
                 ids.add(rec_id)
                 if connection is not None:
-                    _insert_record(connection, row)
+                    _insert_record(
+                        connection,
+                        row,
+                        source_offset=source_offset,
+                        source_length=len(raw),
+                        line_number=line_number,
+                    )
         except IndexIntegrityError as exc:
-            if _stat_signature(source.stat()) != _stat_signature(path_before):
+            if _stat_signature(_safe_source_stat(source)) != _stat_signature(
+                path_before
+            ):
                 raise SourceChangedError("source changed during JSONL scan") from exc
             raise
         fd_after = os.fstat(handle.fileno())
-    path_after = source.stat()
+    path_after = _safe_source_stat(source)
     expected = _stat_signature(path_before)
     if (
         _stat_signature(fd_after) != expected
@@ -356,6 +543,11 @@ def _empty_db_state(exists: bool) -> Dict[str, object]:
         "source_ino": None,
         "source_mtime_ns": None,
         "source_ctime_ns": None,
+        "locator_schema_current": False,
+        "locator_count": 0,
+        "locator_invalid_count": 0,
+        "locator_overlap_count": 0,
+        "locator_topology_invalid_count": 0,
     }
 
 
@@ -379,11 +571,13 @@ def _rebuild_reason(
 ) -> Optional[str]:
     if not state["exists"]:
         return "database_missing"
+    if not state["locator_schema_current"]:
+        return "locator_schema_missing"
     last_size = int(state["last_size"])
     source_size = (
         int(revision["size"])
         if revision is not None
-        else source.stat().st_size
+        else _safe_source_stat(source).st_size
     )
     if source_size < last_size:
         return "source_shrank"
@@ -399,6 +593,13 @@ def _rebuild_reason(
         return "id_digest_missing"
     if state["indexed_ids_sha256"] != state["actual_ids_sha256"]:
         return "id_digest_mismatch"
+    if (
+        state["locator_count"] != state["record_count"]
+        or state["locator_invalid_count"]
+        or state["locator_overlap_count"]
+        or state["locator_topology_invalid_count"]
+    ):
+        return "locator_invalid"
     if revision is not None and source_size == last_size:
         current_prefix = str(revision["content_sha256"])
     else:
@@ -430,6 +631,7 @@ def _write_metadata(
     _meta_set(con, "indexed_id_count", id_count)
     _meta_set(con, "indexed_ids_sha256", ids_sha256(ids))
     _meta_set(con, "parity_status", "trusted")
+    _meta_set(con, "index_schema_version", INDEX_SCHEMA_VERSION)
 
 
 def _parity_result(source_ids: Set[str], database_ids: Set[str]) -> Dict:
@@ -500,6 +702,15 @@ def verify_id_parity(staging: Path, expected_ids: Set[str]) -> Dict:
             raise IndexIntegrityError(
                 f"staging FTS count mismatch: docs={docs_count} fts={fts_count}"
             )
+        state = _db_state_from_connection(con, db_ids)
+        if (
+            not state["locator_schema_current"]
+            or state["locator_count"] != docs_count
+            or state["locator_invalid_count"]
+            or state["locator_overlap_count"]
+            or state["locator_topology_invalid_count"]
+        ):
+            raise IndexIntegrityError("staging locator validation failed")
     return _parity_result(expected_ids, db_ids)
 
 
@@ -731,6 +942,66 @@ def _db_state_from_connection(
     unique_count = len(database_ids)
     fts_count = int(con.execute("SELECT count(*) FROM docs_fts").fetchone()[0])
     indexed = _meta_get(con, "indexed_id_count")
+    locator_schema_current = locator_schema_is_current(con)
+    locator_count = 0
+    locator_invalid_count = 0
+    locator_overlap_count = 0
+    locator_topology_invalid_count = 0
+    if locator_schema_current:
+        last_size = int(_meta_get(con, "last_size", 0) or 0)
+        locator_count = int(
+            con.execute(
+                "SELECT count(*) FROM docs "
+                "WHERE source_offset IS NOT NULL "
+                "AND source_length IS NOT NULL "
+                "AND line_number IS NOT NULL "
+                "AND content_sha256 IS NOT NULL"
+            ).fetchone()[0]
+        )
+        locator_invalid_count = int(
+            con.execute(
+                "SELECT count(*) FROM docs "
+                "WHERE typeof(source_offset) != 'integer' "
+                "OR typeof(source_length) != 'integer' "
+                "OR typeof(line_number) != 'integer' "
+                "OR source_offset < 0 OR source_length <= 0 "
+                "OR line_number <= 0 "
+                "OR source_offset + source_length > ? "
+                "OR length(content_sha256) != 64 "
+                "OR content_sha256 GLOB '*[^0-9a-f]*'",
+                (last_size,),
+            ).fetchone()[0]
+        )
+        locator_overlap_count = int(
+            con.execute(
+                "SELECT count(*) FROM ("
+                "SELECT source_offset,source_length,"
+                "lag(source_offset + source_length) OVER "
+                "(ORDER BY source_offset) AS previous_end "
+                "FROM docs"
+                ") WHERE previous_end > source_offset"
+            ).fetchone()[0]
+        )
+        locator_topology_invalid_count = int(
+            con.execute(
+                "SELECT count(*) FROM ("
+                "SELECT source_offset,source_length,line_number,"
+                "row_number() OVER (ORDER BY line_number) AS expected_line,"
+                "count(*) OVER () AS total_lines,"
+                "lag(source_offset + source_length) OVER "
+                "(ORDER BY line_number) AS previous_end,"
+                "lag(source_offset) OVER "
+                "(ORDER BY line_number) AS previous_offset "
+                "FROM docs"
+                ") WHERE line_number != expected_line "
+                "OR (expected_line = 1 AND source_offset != 0) "
+                "OR (expected_line > 1 AND previous_end != source_offset) "
+                "OR (expected_line > 1 AND previous_offset >= source_offset) "
+                "OR (expected_line = total_lines "
+                "AND source_offset + source_length != ?)",
+                (last_size,),
+            ).fetchone()[0]
+        )
     return {
         "exists": True,
         "last_size": int(_meta_get(con, "last_size", 0) or 0),
@@ -746,6 +1017,11 @@ def _db_state_from_connection(
         "source_ino": _meta_get(con, "source_ino"),
         "source_mtime_ns": _meta_get(con, "source_mtime_ns"),
         "source_ctime_ns": _meta_get(con, "source_ctime_ns"),
+        "locator_schema_current": locator_schema_current,
+        "locator_count": locator_count,
+        "locator_invalid_count": locator_invalid_count,
+        "locator_overlap_count": locator_overlap_count,
+        "locator_topology_invalid_count": locator_topology_invalid_count,
     }
 
 
@@ -884,8 +1160,9 @@ def reconcile_index(
     """Reconcile ``database`` against the authoritative JSONL ``source``."""
     source = Path(source)
     database = Path(database)
-    if not source.exists():
+    if not os.path.lexists(str(source)):
         raise FileNotFoundError(source)
+    _safe_source_stat(source)
     if _paths_collide(source, database):
         raise ValueError("source and database paths must not collide")
     if report_only:

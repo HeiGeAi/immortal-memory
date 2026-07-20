@@ -289,7 +289,7 @@ def test_verified_database_hit_uses_bound_snapshot_without_jsonl_rescan(
     validate_evidence_ref(ref)
 
 
-def test_single_resolve_rejects_docs_content_tampered_without_fts_update(
+def test_single_resolve_ignores_non_authoritative_docs_content(
     tmp_path,
 ):
     index = tmp_path / "index.jsonl"
@@ -302,11 +302,280 @@ def test_single_resolve_rejects_docs_content_tampered_without_fts_update(
         )
         connection.commit()
 
+    ref = EvidenceCatalog(index, database_path=database).resolve("raw-1")
+
+    assert ref["content_hash"] == (
+        "sha256:"
+        + evidence_catalog.hashlib.sha256("权威正文".encode("utf-8")).hexdigest()
+    )
+
+
+def test_single_resolve_uses_jsonl_body_when_docs_and_fts_are_both_forged(
+    tmp_path,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "权威正文")])
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute(
+            "UPDATE docs SET content='伪造正文' WHERE rec_id='raw-1'"
+        )
+        connection.execute(
+            "UPDATE docs_fts SET content='伪造正文' WHERE rowid=1"
+        )
+        connection.commit()
+
+    ref = EvidenceCatalog(index, database_path=database).resolve("raw-1")
+
+    assert ref["status"] == "available"
+    assert ref["content_hash"] == (
+        "sha256:"
+        + evidence_catalog.hashlib.sha256("权威正文".encode("utf-8")).hexdigest()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        (
+            "UPDATE docs SET source_offset=999999 WHERE rec_id='raw-1'",
+            "database_untrusted",
+        ),
+        (
+            "UPDATE docs SET source_length=1 WHERE rec_id='raw-1'",
+            "database_untrusted",
+        ),
+    ],
+)
+def test_single_resolve_rejects_invalid_or_overlapping_locator(
+    tmp_path,
+    mutation,
+    code,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        index,
+        [record("raw-1", "第一条"), record("raw-2", "第二条")],
+    )
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute(mutation)
+        connection.commit()
+
     catalog = EvidenceCatalog(index, database_path=database)
 
+    assert_error(code, lambda: catalog.resolve("raw-1"))
+
+
+def test_single_resolve_rejects_overlapping_locator_even_if_index_is_removed(
+    tmp_path,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        index,
+        [record("raw-1", "第一条"), record("raw-2", "第二条")],
+    )
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute("DROP INDEX idx_docs_source_offset")
+        connection.execute(
+            "UPDATE docs SET source_offset=1 WHERE rec_id='raw-2'"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_docs_source_offset ON docs(source_offset)"
+        )
+        connection.commit()
+
     assert_error(
-        "database_source_mismatch",
-        lambda: catalog.resolve("raw-1"),
+        "database_untrusted",
+        lambda: EvidenceCatalog(index, database_path=database).resolve("raw-1"),
+    )
+
+
+def test_single_resolve_rejects_locator_pointing_to_another_record(tmp_path):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        index,
+        [record("raw-1", "第一条"), record("raw-2", "第二条")],
+    )
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        first = connection.execute(
+            "SELECT source_offset,source_length,line_number "
+            "FROM docs WHERE rec_id='raw-1'"
+        ).fetchone()
+        second = connection.execute(
+            "SELECT source_offset,source_length,line_number "
+            "FROM docs WHERE rec_id='raw-2'"
+        ).fetchone()
+        connection.execute("DROP INDEX idx_docs_source_offset")
+        connection.execute("DROP INDEX idx_docs_line_number")
+        connection.execute(
+            "UPDATE docs SET source_offset=?,source_length=?,line_number=? "
+            "WHERE rec_id='raw-2'",
+            first,
+        )
+        connection.execute(
+            "UPDATE docs SET source_offset=?,source_length=?,line_number=? "
+            "WHERE rec_id='raw-1'",
+            second,
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_docs_source_offset ON docs(source_offset)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX idx_docs_line_number ON docs(line_number)"
+        )
+        connection.commit()
+
+    catalog = EvidenceCatalog(index, database_path=database)
+
+    assert_error("database_source_mismatch", lambda: catalog.resolve("raw-1"))
+
+
+def test_single_resolve_rejects_nonadjacent_locator_overlapping_target(
+    tmp_path,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        index,
+        [
+            record("raw-1", "第一条"),
+            record("raw-2", "第二条"),
+            record("raw-3", "第三条"),
+            record("raw-4", "第四条"),
+        ],
+    )
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        target_offset = int(
+            connection.execute(
+                "SELECT source_offset FROM docs WHERE rec_id='raw-2'"
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "UPDATE docs SET source_offset=? WHERE rec_id='raw-4'",
+            (target_offset + 1,),
+        )
+        connection.commit()
+
+    catalog = EvidenceCatalog(index, database_path=database)
+
+    assert_error("database_untrusted", lambda: catalog.resolve("raw-2"))
+
+
+def test_single_resolve_initialization_does_not_count_full_sqlite_tables(
+    tmp_path,
+    monkeypatch,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(
+        index,
+        [record("raw-1", "第一条"), record("raw-2", "第二条")],
+    )
+    reconcile_index(index, database)
+    statements = []
+    real_readonly_database = evidence_catalog._readonly_database
+
+    @contextmanager
+    def traced_database(path):
+        with real_readonly_database(path) as connection:
+            connection.set_trace_callback(statements.append)
+            yield connection
+
+    monkeypatch.setattr(
+        evidence_catalog,
+        "_readonly_database",
+        traced_database,
+    )
+
+    EvidenceCatalog(index, database_path=database).resolve("raw-2")
+
+    assert not [
+        statement
+        for statement in statements
+        if "count(" in statement.lower()
+    ]
+
+
+def test_verified_locator_handles_utf8_and_large_single_line(tmp_path):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    content = "长正文" * 100_000
+    write_records(
+        index,
+        [record("raw-1", "前置"), record("raw-2", content)],
+    )
+    reconcile_index(index, database)
+
+    ref = EvidenceCatalog(
+        index,
+        database_path=database,
+        max_line_bytes=index.stat().st_size,
+    ).resolve("raw-2")
+
+    assert ref["content_hash"] == (
+        "sha256:" + evidence_catalog.hashlib.sha256(content.encode("utf-8")).hexdigest()
+    )
+
+
+def test_old_database_without_locator_schema_is_untrusted(tmp_path):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "事实")])
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute("DELETE FROM meta WHERE key='index_schema_version'")
+        connection.commit()
+
+    assert_error(
+        "database_untrusted",
+        lambda: EvidenceCatalog(index, database_path=database),
+    )
+
+
+@pytest.mark.parametrize(
+    "replacement_sql",
+    [
+        "CREATE INDEX idx_docs_rec_id ON docs(source)",
+        (
+            "CREATE INDEX idx_docs_rec_id ON docs(rec_id) "
+            "WHERE rec_id != ''"
+        ),
+        "CREATE INDEX idx_docs_rec_id ON docs(rec_id COLLATE NOCASE)",
+        (
+            "CREATE UNIQUE INDEX idx_docs_source_offset "
+            "ON docs(source_length)"
+        ),
+        (
+            "CREATE UNIQUE INDEX idx_docs_line_number "
+            "ON docs(source_offset)"
+        ),
+    ],
+)
+def test_same_name_wrong_or_partial_locator_index_is_untrusted(
+    tmp_path,
+    replacement_sql,
+):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "事实")])
+    reconcile_index(index, database)
+    index_name = replacement_sql.split("INDEX ", 1)[1].split(" ", 1)[0]
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute("DROP INDEX " + index_name)
+        connection.execute(replacement_sql)
+        connection.commit()
+
+    assert_error(
+        "database_untrusted",
+        lambda: EvidenceCatalog(index, database_path=database),
     )
 
 
@@ -429,7 +698,8 @@ def test_sqlite_candidate_is_verified_against_authoritative_jsonl(tmp_path):
     reconcile_index(index, database)
     with sqlite3.connect(str(database)) as connection:
         connection.execute(
-            "UPDATE docs SET content='伪造正文' WHERE rec_id='raw-1'"
+            "UPDATE docs SET content_sha256=? WHERE rec_id='raw-1'",
+            (evidence_catalog.hashlib.sha256("伪造正文".encode("utf-8")).hexdigest(),),
         )
         connection.commit()
 

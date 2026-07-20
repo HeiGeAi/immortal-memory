@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
+from index_integrity import INDEX_SCHEMA_VERSION, locator_schema_is_current
 from model_types import (
     ModelValidationError,
     canonical_evidence_source,
@@ -41,6 +42,7 @@ REQUIRED_DATABASE_META = frozenset(
         "indexed_id_count",
         "last_line",
         "parity_status",
+        "index_schema_version",
     }
 )
 
@@ -419,6 +421,7 @@ class EvidenceCatalog:
                         "database_untrusted",
                         "SQLite index is missing required tables",
                     )
+                locator_schema_current = locator_schema_is_current(connection)
                 meta = {
                     str(key): str(value)
                     for key, value in connection.execute(
@@ -431,6 +434,14 @@ class EvidenceCatalog:
             raise EvidenceCatalogError(
                 "database_untrusted",
                 "SQLite index is missing trusted revision metadata",
+            )
+        if (
+            meta["index_schema_version"] != str(INDEX_SCHEMA_VERSION)
+            or not locator_schema_current
+        ):
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite index locator schema is missing or obsolete",
             )
         if meta["parity_status"] != "trusted":
             raise EvidenceCatalogError(
@@ -469,7 +480,10 @@ class EvidenceCatalog:
                 "database_stale",
                 "SQLite revision does not match the JSONL source",
             )
-        if indexed_count < 0 or last_line != indexed_count:
+        if (
+            indexed_count < 0
+            or last_line != indexed_count
+        ):
             raise EvidenceCatalogError(
                 "database_untrusted",
                 "SQLite indexed count metadata is inconsistent",
@@ -508,7 +522,7 @@ class EvidenceCatalog:
         )
 
     @contextmanager
-    def _verified_source_snapshot(self) -> Iterator[None]:
+    def _verified_source_snapshot(self) -> Iterator[Any]:
         expected = self._source_signature
         if expected is None:
             raise EvidenceCatalogError(
@@ -523,7 +537,7 @@ class EvidenceCatalog:
                 )
             body_failed = False
             try:
-                yield
+                yield handle
             except BaseException:
                 body_failed = True
                 raise
@@ -564,7 +578,7 @@ class EvidenceCatalog:
         while len(self._resolved_cache) > self.max_cache_entries:
             self._resolved_cache.popitem(last=False)
 
-    def _database_candidate(self, raw_id: str) -> Optional[Dict[str, str]]:
+    def _database_candidate(self, raw_id: str) -> Optional[Dict[str, Any]]:
         assert self.database_path is not None
         database_stat = _safe_regular_stat(self.database_path)
         assert database_stat is not None
@@ -575,45 +589,234 @@ class EvidenceCatalog:
             )
         with _readonly_database(self.database_path) as connection:
             rows = connection.execute(
-                "SELECT d.rec_id,d.ts,d.source,d.content,f.content "
+                "SELECT d.rec_id,d.ts,d.source,"
+                "d.source_offset,d.source_length,d.line_number,d.content_sha256 "
                 "FROM docs AS d INDEXED BY idx_docs_rec_id "
-                "LEFT JOIN docs_fts AS f ON f.rowid=d.rowid "
                 "WHERE d.rec_id=? LIMIT 2",
                 (raw_id,),
             ).fetchall()
-        if len(rows) > 1:
-            raise EvidenceCatalogError(
-                "database_untrusted",
-                "SQLite index contains duplicate stable IDs",
+            if len(rows) > 1:
+                raise EvidenceCatalogError(
+                    "database_untrusted",
+                    "SQLite index contains duplicate stable IDs",
+                )
+            if not rows:
+                return None
+            (
+                rec_id,
+                timestamp,
+                source,
+                source_offset,
+                source_length,
+                line_number,
+                content_sha256,
+            ) = rows[0]
+            if (
+                not isinstance(source_offset, int)
+                or isinstance(source_offset, bool)
+                or not isinstance(source_length, int)
+                or isinstance(source_length, bool)
+                or not isinstance(line_number, int)
+                or isinstance(line_number, bool)
+                or source_offset < 0
+                or source_length < 1
+                or line_number < 1
+                or line_number > int(self._database_meta["indexed_id_count"])
+                or source_offset + source_length > self._source_size
+                or not isinstance(content_sha256, str)
+                or len(content_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in content_sha256
+                )
+            ):
+                raise EvidenceCatalogError(
+                    "database_untrusted",
+                    "SQLite evidence locator is invalid",
+                )
+            previous = connection.execute(
+                "SELECT source_offset,source_length FROM docs "
+                "INDEXED BY idx_docs_line_number WHERE line_number=?",
+                (line_number - 1,),
+            ).fetchone()
+            following = connection.execute(
+                "SELECT source_offset FROM docs "
+                "INDEXED BY idx_docs_line_number WHERE line_number=?",
+                (line_number + 1,),
+            ).fetchone()
+            offset_previous = connection.execute(
+                "SELECT source_offset,source_length FROM docs "
+                "INDEXED BY idx_docs_source_offset "
+                "WHERE source_offset < ? "
+                "ORDER BY source_offset DESC LIMIT 1",
+                (source_offset,),
+            ).fetchone()
+            offset_following = connection.execute(
+                "SELECT source_offset FROM docs "
+                "INDEXED BY idx_docs_source_offset "
+                "WHERE source_offset > ? "
+                "ORDER BY source_offset ASC LIMIT 1",
+                (source_offset,),
+            ).fetchone()
+        indexed_count = int(self._database_meta["indexed_id_count"])
+        previous_valid = (
+            (line_number == 1 and source_offset == 0 and previous is None)
+            or (
+                line_number > 1
+                and previous is not None
+                and int(previous[0]) + int(previous[1]) == source_offset
             )
-        if not rows:
-            return None
-        rec_id, timestamp, source, content, fts_content = rows[0]
+        )
+        following_valid = (
+            (
+                line_number == indexed_count
+                and source_offset + source_length == self._source_size
+                and following is None
+            )
+            or (
+                line_number < indexed_count
+                and following is not None
+                and source_offset + source_length == int(following[0])
+            )
+        )
+        offset_previous_valid = (
+            (source_offset == 0 and offset_previous is None)
+            or (
+                source_offset > 0
+                and offset_previous is not None
+                and int(offset_previous[0]) + int(offset_previous[1])
+                == source_offset
+            )
+        )
+        offset_following_valid = (
+            (
+                source_offset + source_length == self._source_size
+                and offset_following is None
+            )
+            or (
+                source_offset + source_length < self._source_size
+                and offset_following is not None
+                and int(offset_following[0])
+                == source_offset + source_length
+            )
+        )
         if (
-            not isinstance(content, str)
-            or not isinstance(fts_content, str)
-            or content != fts_content
+            not previous_valid
+            or not following_valid
+            or not offset_previous_valid
+            or not offset_following_valid
         ):
             raise EvidenceCatalogError(
-                "database_source_mismatch",
-                "SQLite document differs from its FTS content copy",
+                "database_untrusted",
+                "SQLite evidence locator is not contiguous with its neighbors",
+            )
+        if not isinstance(timestamp, str) or not isinstance(source, str):
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite evidence metadata is invalid",
             )
         return {
             "id": str(rec_id),
             "timestamp": str(timestamp),
             "source": str(source),
-            "content": str(content),
+            "source_offset": source_offset,
+            "source_length": source_length,
+            "line_number": line_number,
+            "content_sha256": content_sha256,
         }
 
     @staticmethod
     def _candidate_matches(
         row: Mapping[str, Any],
-        candidate: Mapping[str, str],
+        candidate: Mapping[str, Any],
     ) -> bool:
-        return all(
-            isinstance(row.get(field), str)
-            and row[field] == candidate[field]
-            for field in ("id", "timestamp", "source", "content")
+        content = row.get("content")
+        return (
+            isinstance(content, str)
+            and hashlib.sha256(content.encode("utf-8")).hexdigest()
+            == candidate.get("content_sha256")
+            and all(
+                isinstance(row.get(field), str)
+                and row[field] == candidate[field]
+                for field in ("id", "timestamp", "source")
+            )
+        )
+
+    def _resolve_locator(
+        self,
+        handle: Any,
+        raw_id: str,
+        candidate: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        source_length = int(candidate["source_length"])
+        line_number = int(candidate["line_number"])
+        if source_length > self.max_line_bytes:
+            raise EvidenceCatalogError(
+                "catalog_line_too_large",
+                "evidence record exceeds the bounded line size",
+                line_number=line_number,
+            )
+        try:
+            raw = os.pread(
+                handle.fileno(),
+                source_length,
+                int(candidate["source_offset"]),
+            )
+        except OSError as exc:
+            raise EvidenceCatalogError(
+                "source_unreadable",
+                "authoritative evidence record cannot be read",
+                line_number=line_number,
+            ) from exc
+        if (
+            len(raw) != source_length
+            or not raw.endswith(b"\n")
+            or not raw.strip()
+            or b"\n" in raw[:-1]
+        ):
+            raise EvidenceCatalogError(
+                "database_untrusted",
+                "SQLite evidence locator does not identify one JSONL record",
+                line_number=line_number,
+            )
+        row = _decode_record(raw[:-1], line_number)
+        authoritative_id = _required_identifier(
+            row.get("id"),
+            code="missing_evidence_id",
+            field="id",
+            line_number=line_number,
+        )
+        if authoritative_id != raw_id or not self._candidate_matches(row, candidate):
+            raise EvidenceCatalogError(
+                "database_source_mismatch",
+                "SQLite locator metadata does not match authoritative JSONL",
+                line_number=line_number,
+            )
+        content = _required_body(
+            row.get("content"),
+            code="invalid_evidence_record",
+            field="content",
+            line_number=line_number,
+        )
+        observed_at = _required_text(
+            row.get("timestamp"),
+            code="invalid_evidence_record",
+            field="timestamp",
+            line_number=line_number,
+        )
+        source = _required_text(
+            row.get("source"),
+            code="invalid_evidence_source",
+            field="source",
+            line_number=line_number,
+        )
+        return self._make_ref(
+            evidence_id=authoritative_id,
+            source=source,
+            raw_id=authoritative_id,
+            content=content,
+            status="available",
+            observed_at=observed_at,
         )
 
     @staticmethod
@@ -648,7 +851,7 @@ class EvidenceCatalog:
         self,
         *,
         requested_ids: Optional[set],
-        candidates: Optional[Mapping[str, Mapping[str, str]]],
+        candidates: Optional[Mapping[str, Mapping[str, Any]]],
         collect: bool,
     ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
         if self._source_state() != "current":
@@ -806,7 +1009,7 @@ class EvidenceCatalog:
     def _scan_for_id(
         self,
         raw_id: str,
-        candidate: Optional[Mapping[str, str]] = None,
+        candidate: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         candidates = {raw_id: candidate} if candidate is not None else None
         found, _rows = self._scan_source(
@@ -847,7 +1050,7 @@ class EvidenceCatalog:
                 "source_changed",
                 "evidence source changed after catalog preflight",
             )
-        with self._verified_source_snapshot():
+        with self._verified_source_snapshot() as handle:
             if cached is not None:
                 return cached
             if self.database_path is not None:
@@ -857,14 +1060,7 @@ class EvidenceCatalog:
                         "evidence_not_found",
                         "requested evidence ID was not present in verified SQLite",
                     )
-                ref = self._make_ref(
-                    evidence_id=raw_id,
-                    source=candidate["source"],
-                    raw_id=raw_id,
-                    content=candidate["content"],
-                    status="available",
-                    observed_at=candidate["timestamp"],
-                )
+                ref = self._resolve_locator(handle, raw_id, candidate)
             else:
                 ref = self._scan_for_id(raw_id)
         self._cache_put(raw_id, ref)
@@ -897,7 +1093,7 @@ class EvidenceCatalog:
                 "evidence source changed after catalog preflight",
             )
         unique_ids = set(normalized)
-        candidates: Optional[Dict[str, Dict[str, str]]] = None
+        candidates: Optional[Dict[str, Dict[str, Any]]] = None
         if self.database_path is not None:
             candidates = {}
             for raw_id in unique_ids:
