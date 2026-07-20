@@ -127,16 +127,30 @@ def _latest(values: Iterable[str]) -> str:
     return max(values, key=_parsed_time)
 
 
-def _is_expired(claim: Mapping[str, Any], now: str) -> bool:
-    valid_to = claim.get("valid_to")
-    if valid_to is None:
-        return False
+def _try_parse_aware(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
     try:
-        return datetime.fromisoformat(str(valid_to).replace("Z", "+00:00")) <= (
-            datetime.fromisoformat(now.replace("Z", "+00:00"))
-        )
+        parsed = _parsed_time(value)
     except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _is_effective(claim: Mapping[str, Any], now: str) -> bool:
+    current = _try_parse_aware(now)
+    valid_from = _try_parse_aware(
+        claim.get("valid_from") or claim.get("created_at")
+    )
+    if current is None or valid_from is None or current < valid_from:
+        return False
+    raw_valid_to = claim.get("valid_to")
+    if raw_valid_to is None:
         return True
+    valid_to = _try_parse_aware(raw_valid_to)
+    return valid_to is not None and current < valid_to
 
 
 def _claim_sort_key(claim: Mapping[str, Any]) -> Any:
@@ -160,7 +174,6 @@ class LivingSelfService:
         self.root = self.vault_dir / "model" / "living-self"
         self.current_path = self.root / "current.json"
         self._clock = clock or _utc_now
-        self._started_at = self._clock()
         self._generated_at = ""
 
     def _eligible_claims(
@@ -177,7 +190,7 @@ class LivingSelfService:
                 continue
             if claim.get("privacy") in NON_MODEL_PRIVACY:
                 continue
-            if _is_expired(claim, now):
+            if not _is_effective(claim, now):
                 continue
             eligible.append(claim)
         return sorted(eligible, key=_claim_sort_key)
@@ -512,17 +525,28 @@ class LivingSelfService:
             (int(claim.get("based_on_event_seq") or 0) for claim in all_claims),
             default=0,
         )
-        now = self._started_at
+        now = self._clock()
         eligible = self._eligible_claims(all_claims, now)
-        timestamp_sources = eligible if eligible else all_claims
-        self._generated_at = (
-            _latest(
-                str(claim.get("updated_at") or claim.get("created_at"))
-                for claim in timestamp_sources
+        if eligible:
+            latest_source_time = _latest(
+                timestamp
+                for claim in eligible
+                for timestamp in (
+                    str(claim.get("updated_at") or claim.get("created_at")),
+                    *(
+                        [str(claim["valid_from"])]
+                        if claim.get("valid_from") is not None
+                        else []
+                    ),
+                )
             )
-            if timestamp_sources
-            else now
-        )
+            self._generated_at = (
+                latest_source_time
+                if _parsed_time(latest_source_time) <= _parsed_time(now)
+                else now
+            )
+        else:
+            self._generated_at = now
         sections = {
             section: sorted(
                 getattr(self, SECTION_BUILDERS[section])(eligible),

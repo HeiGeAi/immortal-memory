@@ -28,6 +28,7 @@ def add_claim(
     source_kind="direct",
     privacy="context_safe",
     at="2026-03-01T00:00:00+00:00",
+    valid_from=None,
     valid_to=None,
 ):
     value = new_claim(
@@ -42,6 +43,7 @@ def add_claim(
     )
     value["claim_id"] = claim_id
     value["counter_evidence_ids"] = list(counter_evidence_ids or [])
+    value["valid_from"] = valid_from
     value["valid_to"] = valid_to
     created = store.create(
         value,
@@ -152,6 +154,101 @@ def test_only_confirmed_current_non_private_claims_are_sources(tmp_path):
     assert model["based_on_claim_seq"] == max(
         claim["based_on_event_seq"] for claim in service.claims.list()
     )
+
+
+def test_future_valid_from_claim_is_not_included_before_it_becomes_effective(
+    tmp_path,
+):
+    current_time = {"value": "2026-07-20T12:00:00+00:00"}
+    from living_self_service import LivingSelfService
+
+    service = LivingSelfService(
+        tmp_path,
+        clock=lambda: current_time["value"],
+    )
+    add_claim(
+        service.claims,
+        "clm_future_value",
+        "长期选择可恢复性",
+        claim_type="value",
+        valid_from="2026-07-21T00:00:00+00:00",
+    )
+
+    before = service.build_candidate()
+    current_time["value"] = "2026-07-21T00:00:00+00:00"
+    after = service.build_candidate()
+
+    assert before["sections"]["values"] == []
+    assert before["generated_at"] == "2026-07-20T12:00:00+00:00"
+    assert after["sections"]["values"][0]["claim_ids"] == ["clm_future_value"]
+
+
+def test_long_lived_service_excludes_claim_after_valid_to(tmp_path):
+    current_time = {"value": "2026-07-20T12:00:00+00:00"}
+    from living_self_service import LivingSelfService
+
+    service = LivingSelfService(
+        tmp_path,
+        clock=lambda: current_time["value"],
+    )
+    add_claim(
+        service.claims,
+        "clm_expiring_value",
+        "长期选择可恢复性",
+        claim_type="value",
+        valid_from="2026-07-01T00:00:00+00:00",
+        valid_to="2026-07-21T00:00:00+00:00",
+    )
+
+    before = service.build_candidate()
+    current_time["value"] = "2026-07-21T00:00:00+00:00"
+    after = service.build_candidate()
+
+    assert before["sections"]["values"][0]["claim_ids"] == [
+        "clm_expiring_value"
+    ]
+    assert after["sections"]["values"] == []
+
+
+def test_invalid_or_naive_validity_timestamps_fail_closed():
+    from living_self_service import _is_effective
+
+    base = {
+        "created_at": "2026-07-01T00:00:00+00:00",
+        "valid_from": "2026-07-01T00:00:00+00:00",
+        "valid_to": None,
+    }
+    assert _is_effective(base, "2026-07-20T00:00:00+00:00") is True
+
+    naive_from = dict(base, valid_from="2026-07-01T00:00:00")
+    invalid_to = dict(base, valid_to="not-a-timestamp")
+
+    assert _is_effective(naive_from, "2026-07-20T00:00:00+00:00") is False
+    assert _is_effective(invalid_to, "2026-07-20T00:00:00+00:00") is False
+    assert _is_effective(base, "2026-07-20T00:00:00") is False
+
+
+def test_inactive_claims_do_not_choose_candidate_generation_time(tmp_path):
+    current_time = {"value": "2026-07-20T12:00:00+00:00"}
+    from living_self_service import LivingSelfService
+
+    service = LivingSelfService(
+        tmp_path,
+        clock=lambda: current_time["value"],
+    )
+    add_claim(
+        service.claims,
+        "clm_future_candidate",
+        "未审核且未来的 Claim",
+        claim_type="value",
+        status="candidate",
+        at="2026-08-01T00:00:00+00:00",
+    )
+
+    model = service.build_candidate()
+
+    assert model["sections"]["values"] == []
+    assert model["generated_at"] == current_time["value"]
 
 
 def test_cross_time_cross_domain_claims_form_candidate_mental_model(tmp_path):
