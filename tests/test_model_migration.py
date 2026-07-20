@@ -477,6 +477,28 @@ def test_tampered_first_migration_digest_conflicts_after_legal_transition(
     assert captured.value.code == "migration_state_conflict"
 
 
+def test_tampered_first_migration_index_digest_conflicts(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    migrate_legacy_profile(tmp_path)
+    events_path = tmp_path / "model" / "claims" / "events.jsonl"
+    rows = event_rows(tmp_path)
+    prefix, _index_digest = rows[0]["migration_source"].split(
+        ";index_sha256:",
+        1,
+    )
+    rows[0]["migration_source"] = prefix + ";index_sha256:" + ("f" * 64)
+    write_jsonl(events_path, rows)
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "migration_state_conflict"
+
+
 @pytest.mark.parametrize("status", ["confirmed", "rejected"])
 def test_rerun_accepts_legal_post_migration_transition(tmp_path, status):
     seed_evidence(tmp_path, "ev-1")
@@ -671,6 +693,51 @@ def test_checkpoint_rejects_malformed_digest_contract(tmp_path, digest_field):
     assert captured.value.code in {
         "malformed_checkpoint",
         "migration_source_changed",
+    }
+
+
+def test_checkpoint_rejects_unbound_well_formed_index_digest(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(report["checkpoint"])
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["index_digest"] = "f" * 64
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "malformed_checkpoint"
+
+
+def test_unrelated_index_growth_preserves_historical_claim_binding(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    first = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(first["checkpoint"])
+    original = json.loads(checkpoint.read_text(encoding="utf-8"))
+    original_claim_digest = next(
+        iter(original["committed_index_digests"].values())
+    )
+
+    seed_evidence(tmp_path, "ev-1", "ev-unrelated")
+    second = migrate_legacy_profile(tmp_path)
+    third = migrate_legacy_profile(tmp_path)
+    updated = json.loads(checkpoint.read_text(encoding="utf-8"))
+
+    assert second["created"] == third["created"] == 0
+    assert updated["index_digest"] != original_claim_digest
+    assert original_claim_digest in updated["observed_index_digests"]
+    assert updated["index_digest"] in updated["observed_index_digests"]
+    assert set(updated["committed_index_digests"].values()) == {
+        original_claim_digest
     }
 
 

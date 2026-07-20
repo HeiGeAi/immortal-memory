@@ -374,19 +374,12 @@ def _valid_migration_provenance(
     *,
     source_name: str,
     source_digest: str,
+    index_digest: str,
 ) -> bool:
-    prefix = (
-        source_name
-        + "#sha256:"
-        + source_digest
-        + ";index_sha256:"
-    )
-    if not isinstance(value, str) or not value.startswith(prefix):
-        return False
-    index_digest = value[len(prefix) :]
-    return (
-        len(index_digest) == 64
-        and all(character in "0123456789abcdef" for character in index_digest)
+    return value == _migration_provenance(
+        source_name,
+        source_digest=source_digest,
+        index_digest=index_digest,
     )
 
 
@@ -631,7 +624,11 @@ def _read_checkpoint(
             "migration checkpoint is malformed",
         ) from exc
     valid_lists = True
-    for field in ("candidate_ids", "committed_claim_ids"):
+    for field in (
+        "candidate_ids",
+        "committed_claim_ids",
+        "observed_index_digests",
+    ):
         items = value.get(field) if isinstance(value, dict) else None
         if (
             not isinstance(items, list)
@@ -639,15 +636,49 @@ def _read_checkpoint(
             or items != sorted(set(items))
         ):
             valid_lists = False
+    committed_index_digests = (
+        value.get("committed_index_digests")
+        if isinstance(value, dict)
+        else None
+    )
+    valid_committed_digests = (
+        isinstance(committed_index_digests, dict)
+        and list(committed_index_digests) == sorted(committed_index_digests)
+        and all(
+            isinstance(claim_id, str)
+            and claim_id
+            and _is_sha256(index_digest)
+            for claim_id, index_digest in committed_index_digests.items()
+        )
+        and set(committed_index_digests)
+        == set(value.get("committed_claim_ids") or [])
+    )
+    observed_index_digests = (
+        value.get("observed_index_digests")
+        if isinstance(value, dict)
+        else None
+    )
+    index_bindings_are_consistent = (
+        isinstance(observed_index_digests, list)
+        and all(_is_sha256(item) for item in observed_index_digests)
+        and value.get("index_digest") in observed_index_digests
+        and set(
+            committed_index_digests.values()
+            if isinstance(committed_index_digests, dict)
+            else []
+        ).issubset(set(observed_index_digests))
+    )
     if (
         not isinstance(value, dict)
         or set(value)
         != {
             "candidate_ids",
             "committed_claim_ids",
+            "committed_index_digests",
             "complete",
             "index_digest",
             "migration_id",
+            "observed_index_digests",
             "schema_version",
             "source_digest",
         }
@@ -657,6 +688,8 @@ def _read_checkpoint(
         or not _is_sha256(value.get("source_digest"))
         or not _is_sha256(value.get("index_digest"))
         or not valid_lists
+        or not valid_committed_digests
+        or not index_bindings_are_consistent
         or not set(value.get("committed_claim_ids") or []).issubset(
             set(value.get("candidate_ids") or [])
         )
@@ -680,15 +713,24 @@ def _write_checkpoint(
     index_digest: str,
     candidate_ids: List[str],
     committed_claim_ids: List[str],
+    committed_index_digests: Mapping[str, str],
     complete: bool,
 ) -> None:
+    committed = sorted(set(committed_claim_ids))
     payload = {
         "schema_version": CHECKPOINT_VERSION,
         "migration_id": MIGRATION_ID,
         "source_digest": source_digest,
         "index_digest": index_digest,
         "candidate_ids": sorted(set(candidate_ids)),
-        "committed_claim_ids": sorted(set(committed_claim_ids)),
+        "committed_claim_ids": committed,
+        "committed_index_digests": {
+            claim_id: committed_index_digests[claim_id]
+            for claim_id in committed
+        },
+        "observed_index_digests": sorted(
+            set(committed_index_digests.values()) | {index_digest}
+        ),
         "complete": complete,
     }
     safe_atomic_write_text(
@@ -748,6 +790,9 @@ def _verify_existing_migration_state(
     vault: Path,
     raw_items: List[Dict[str, Any]],
     current: Mapping[str, Mapping[str, Any]],
+    *,
+    committed_index_digests: Mapping[str, str],
+    current_index_digest: str,
 ) -> None:
     expected = {
         item["claim_id"]: item
@@ -772,6 +817,10 @@ def _verify_existing_migration_state(
             "claim events cannot be inspected for migration provenance",
         ) from exc
     for claim_id, item in expected.items():
+        expected_index_digest = committed_index_digests.get(
+            claim_id,
+            current_index_digest,
+        )
         events = events_by_stream[claim_id]
         first = events[0] if events else {}
         initial = item.get("initial")
@@ -792,6 +841,7 @@ def _verify_existing_migration_state(
                 first.get("migration_source"),
                 source_name=item["source_name"],
                 source_digest=item["source_digest"],
+                index_digest=expected_index_digest,
             )
             and isinstance(first_claim, Mapping)
             and _canonical(_claim_intent(first_claim))
@@ -912,6 +962,7 @@ def _prepare_candidates(
                     migration_source=provenance,
                     nuwa=nuwa_row,
                 )
+                initial["index_digest"] = index_digest
             except (ModelValidationError, ValueError) as exc:
                 raise MigrationError(
                     "malformed_legacy_source",
@@ -926,6 +977,7 @@ def _prepare_candidates(
                 "legacy_id": legacy_id,
                 "source_name": source_name,
                 "source_digest": source_digests[source_name],
+                "index_digest": index_digest,
             }
         )
 
@@ -1061,7 +1113,16 @@ def _migrate_legacy_profile(
     _verify_bindings(bindings)
     existing_ids = set(current)
     candidate_ids = sorted(item["claim_id"] for item in raw_items)
-    _verify_existing_migration_state(vault, raw_items, current)
+    committed_index_digests = dict(
+        checkpoint["committed_index_digests"] if checkpoint else {}
+    )
+    _verify_existing_migration_state(
+        vault,
+        raw_items,
+        current,
+        committed_index_digests=committed_index_digests,
+        current_index_digest=index_binding["digest"],
+    )
     committed_claim_ids = sorted(set(candidate_ids) & existing_ids)
     if checkpoint and checkpoint["candidate_ids"] != candidate_ids:
         raise MigrationError(
@@ -1074,6 +1135,11 @@ def _migrate_legacy_profile(
         raise MigrationError(
             "checkpoint_state_mismatch",
             "migration checkpoint references an uncommitted Claim",
+        )
+    for claim_id in committed_claim_ids:
+        committed_index_digests.setdefault(
+            claim_id,
+            index_binding["digest"],
         )
     planned = [
         item for item in prepared if item["claim"]["claim_id"] not in existing_ids
@@ -1127,6 +1193,7 @@ def _migrate_legacy_profile(
         except InvalidTransition as exc:
             raise MigrationError(exc.code, str(exc)) from exc
         existing_ids.add(claim_id)
+        committed_index_digests[claim_id] = item["index_digest"]
         created += 1
         after_claim_commit(created)
         _verify_bindings(bindings)
@@ -1138,6 +1205,7 @@ def _migrate_legacy_profile(
                 index_digest=index_binding["digest"],
                 candidate_ids=candidate_ids,
                 committed_claim_ids=committed_claim_ids,
+                committed_index_digests=committed_index_digests,
                 complete=False,
             )
             _verify_bindings(bindings)
@@ -1149,6 +1217,7 @@ def _migrate_legacy_profile(
         index_digest=index_binding["digest"],
         candidate_ids=candidate_ids,
         committed_claim_ids=committed_claim_ids,
+        committed_index_digests=committed_index_digests,
         complete=True,
     )
     _verify_bindings(bindings)
