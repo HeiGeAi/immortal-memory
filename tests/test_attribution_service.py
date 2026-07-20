@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -7,6 +8,38 @@ import pytest
 from attribution_service import AttributionService
 from model_types import new_claim
 import profile_attribution_audit
+
+
+def claim_fingerprint(content):
+    normalized = " ".join(content.split())
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+class EvidenceResolver:
+    def __init__(self, content, refs, *, error=None):
+        self.expected_fingerprint = claim_fingerprint(content)
+        self.refs = refs
+        self.error = error
+
+    def resolve_for_claim(self, evidence_id, fingerprint):
+        if self.error is not None:
+            raise self.error
+        if fingerprint != self.expected_fingerprint:
+            raise LookupError("unrelated claim")
+        ref = dict(self.refs[evidence_id])
+        ref["claim_fingerprint"] = self.expected_fingerprint
+        return ref
+
+
+def available_refs(*pairs):
+    return {
+        evidence_id: {
+            "evidence_id": evidence_id,
+            "status": "available",
+            "observed_at": observed_at,
+        }
+        for evidence_id, observed_at in pairs
+    }
 
 
 def test_speaker_and_subject_cover_owner_other_system_and_unknown():
@@ -146,6 +179,7 @@ def test_real_owner_alias_does_not_override_quoted_third_party_content():
         "同事A表示，黑哥应该放弃这个项目",
         "同事A认为黑哥应该放弃这个项目",
         "同事A提到\n黑哥应该放弃这个项目",
+        "张三说这项决定应该重新评估",
         "同事A说，同事B认为：黑哥应该放弃这个项目",
         ("前置信息" * 80) + "\n同事A说：黑哥应该放弃这个项目",
     ],
@@ -181,6 +215,10 @@ def test_common_third_party_restatements_fail_closed_as_quoted(content):
         "我认为先做只读审计更稳妥。",
         "这是我认为最稳妥的处理方式。",
         "黑哥提到自己的长期原则是先验证再发布。",
+        "项目说明需要写清楚风险。",
+        "这个功能需要说明风险。",
+        "黑哥之前说，先验证再发布。",
+        "owner 刚才说，先验证再发布。",
     ],
 )
 def test_owner_first_person_expressions_are_not_false_positive_quotes(content):
@@ -217,12 +255,24 @@ def test_explicit_quoted_author_always_fails_closed():
 
 
 def test_confidence_policy_is_recomputable_and_auto_confirm_is_strict():
-    service = AttributionService(owner_aliases={"owner"})
+    content = "我一直偏好先做只读审计。"
+    resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-01T00:00:00Z"),
+            ("ev_2", "2026-07-02T00:00:00Z"),
+            ("ev_3", "2026-07-03T00:00:00Z"),
+        ),
+    )
+    service = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+    )
     durable = service.classify(
         {
             "role": "user",
             "author": "owner",
-            "content": "我一直偏好先做只读审计。",
+            "content": content,
             "source": "codex",
             "recurrence_count": 3,
             "role_scope": ["work"],
@@ -296,12 +346,21 @@ def test_transient_semantics_override_explicit_claim_type_and_raw_recurrence():
 
 
 def test_only_distinct_verifiable_evidence_and_times_create_recurrence():
-    service = AttributionService(owner_aliases={"owner"})
-    repeated_same_event = service.classify(
+    content = "我一直偏好先验证再发布。"
+    repeated_resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-01T00:00:00Z"),
+        ),
+    )
+    repeated_same_event = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=repeated_resolver,
+    ).classify(
         {
             "role": "user",
             "author": "owner",
-            "content": "我一直偏好先验证再发布。",
+            "content": content,
             "source": "codex",
             "recurrence": 1.0,
             "recurrence_count": 99,
@@ -312,11 +371,22 @@ def test_only_distinct_verifiable_evidence_and_times_create_recurrence():
             ],
         }
     )
-    verified = service.classify(
+    verified_resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-11T00:00:00Z"),
+            ("ev_2", "2026-07-12T00:00:00Z"),
+            ("ev_3", "2026-07-13T00:00:00Z"),
+        ),
+    )
+    verified = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=verified_resolver,
+    ).classify(
         {
             "role": "user",
             "author": "owner",
-            "content": "我一直偏好先验证再发布。",
+            "content": content,
             "source": "codex",
             "recurrence_evidence": [
                 {"evidence_id": "ev_1", "observed_at": "2026-07-01T00:00:00Z"},
@@ -330,6 +400,214 @@ def test_only_distinct_verifiable_evidence_and_times_create_recurrence():
     assert repeated_same_event["auto_confirm_allowed"] is False
     assert verified["confidence_basis"]["recurrence"] == 1.0
     assert verified["auto_confirm_allowed"] is True
+
+
+def test_recurrence_fails_closed_without_authoritative_resolver():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence": 1.0,
+            "recurrence_count": 999,
+            "recurrence_evidence": [
+                {
+                    "evidence_id": f"does_not_exist_{index}",
+                    "observed_at": f"2026-07-0{index}T00:00:00Z",
+                }
+                for index in range(1, 4)
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+    assert "recurrence_unverified" in result["trust_flags"]
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [
+        EvidenceResolver(
+            "我一直偏好先验证再发布。",
+            {},
+            error=RuntimeError("catalog unavailable"),
+        ),
+        EvidenceResolver(
+            "我一直偏好先验证再发布。",
+            {
+                "ev_1": {
+                    "evidence_id": "ev_1",
+                    "status": "source_deleted",
+                    "observed_at": "2026-07-01T00:00:00Z",
+                }
+            },
+        ),
+        EvidenceResolver(
+            "我一直偏好先验证再发布。",
+            {
+                "ev_1": {
+                    "evidence_id": "ev_1",
+                    "status": "available",
+                    "observed_at": "corrupt-time",
+                }
+            },
+        ),
+    ],
+)
+def test_resolver_error_or_unavailable_ref_fails_closed(resolver):
+    service = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+    )
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2099-01-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2099-01-02T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+    assert "recurrence_unverified" in result["trust_flags"]
+
+
+def test_duplicate_authoritative_evidence_does_not_create_recurrence():
+    content = "我一直偏好先验证再发布。"
+    resolver = EvidenceResolver(
+        content,
+        available_refs(("ev_1", "2026-07-01T00:00:00Z")),
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2099-01-01T00:00:00Z"},
+                {"evidence_id": "ev_1", "observed_at": "2099-01-02T00:00:00Z"},
+                {"evidence_id": "ev_1", "observed_at": "2099-01-03T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+
+
+def test_resolver_must_bind_evidence_to_current_claim():
+    resolver = EvidenceResolver(
+        "另一条完全无关的偏好。",
+        available_refs(
+            ("ev_1", "2026-07-01T00:00:00Z"),
+            ("ev_2", "2026-07-02T00:00:00Z"),
+            ("ev_3", "2026-07-03T00:00:00Z"),
+        ),
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2099-01-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2099-01-02T00:00:00Z"},
+                {"evidence_id": "ev_3", "observed_at": "2099-01-03T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "我长期反对临时修改生产数据",
+        "我长期坚持在焦虑时先列清单",
+        "我的原则是每次发布前都先验证",
+    ],
+)
+def test_durable_principles_outrank_incidental_transient_words(content):
+    resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-01T00:00:00Z"),
+            ("ev_2", "2026-07-02T00:00:00Z"),
+            ("ev_3", "2026-07-03T00:00:00Z"),
+        ),
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": "ev_1", "observed_at": "2099-01-01T00:00:00Z"},
+                {"evidence_id": "ev_2", "observed_at": "2099-01-02T00:00:00Z"},
+                {"evidence_id": "ev_3", "observed_at": "2099-01-03T00:00:00Z"},
+            ],
+        }
+    )
+
+    assert result["claim_type"] == "preference"
+    assert "transient_content" not in result["trust_flags"]
+    assert "one_off_content" not in result["trust_flags"]
+    assert result["auto_confirm_allowed"] is True
+
+
+def test_real_one_off_action_remains_transient():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "今天先临时修改这一个测试文件",
+            "source": "codex",
+            "claim_type": "preference",
+        }
+    )
+
+    assert result["claim_type"] == "request"
+    assert "transient_content" in result["trust_flags"]
+    assert result["auto_confirm_allowed"] is False
+
+
+def test_emotion_noun_in_project_description_is_not_current_emotion():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "焦虑管理模块需要说明风险",
+            "source": "codex",
+        }
+    )
+
+    assert result["speaker"]["kind"] == "owner"
+    assert result["claim_type"] == "request"
+    assert "third_party_quote" not in result["trust_flags"]
 
 
 def test_scope_and_privacy_inference_are_bounded_enums():
@@ -456,6 +734,21 @@ def test_system_role_with_author_remains_system():
     assert result["subject"] == {"kind": "system", "id": "system"}
     assert result["source_kind"] == "observed"
     assert result["claim_type"] != "external_view"
+
+
+def test_system_actor_without_role_remains_system():
+    service = AttributionService(owner_aliases={"owner"})
+    result = service.classify(
+        {
+            "actor": "system",
+            "content": "系统健康检查通过。",
+            "source": "local",
+        }
+    )
+
+    assert result["speaker"] == {"kind": "system", "id": "system"}
+    assert result["subject"] == {"kind": "system", "id": "system"}
+    assert result["source_kind"] == "observed"
 
 
 def test_latest_report_is_bounded_and_contains_no_raw_body():

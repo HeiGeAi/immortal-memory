@@ -36,16 +36,23 @@ MAX_SAFE_SUMMARY_CHARS = 200
 DEFAULT_MAX_REPORT_SAMPLES = 20
 MAX_REPORT_SAMPLES = 50
 
-THIRD_PARTY_QUOTE_RE = re.compile(
+REPORTING_SPEECH_RE = re.compile(
     r"(?:^|[\s，,。！？!?；;：:“”\"'‘’（）()\[\]])"
     r"(?P<author>[A-Za-z0-9_\u4e00-\u9fff·.-]{1,32})"
-    r"(?:说|表示|认为|指出|反馈|提到|评价)"
+    r"(?:说(?!明|服|法|辞|话)|表示|认为|指出|反馈|提到|评价)"
     r"(?:\s*[,，:：\"'“‘]?\s*)"
 )
 ONE_OFF_RE = re.compile(r"(这一次|这次|本次|今天|现在|临时|先暂时)")
 REQUEST_RE = re.compile(r"(请|帮我|麻烦|需要|先|立刻|马上|尽快|这一次|这次)")
-EMOTION_RE = re.compile(r"(焦虑|开心|高兴|生气|难过|烦躁|沮丧|紧张|疲惫|害怕)")
-DURABLE_RE = re.compile(r"(一直|通常|长期|反复|每次|始终|习惯|偏好|原则)")
+EMOTION_RE = re.compile(
+    r"(?:我|本人).{0,8}"
+    r"(?:焦虑|开心|高兴|生气|难过|烦躁|沮丧|紧张|疲惫|害怕)"
+)
+DURABLE_RE = re.compile(
+    r"(一直|通常|长期|反复|每次|始终|习惯|偏好|"
+    r"(?:我的|我们的|本人)\s*原则|原则(?:是|：|:)|"
+    r"(?:我|我们|本人).{0,12}(?:坚持|反对))"
+)
 PREFERENCE_RE = re.compile(r"(偏好|喜欢|习惯|更愿意|不喜欢|不要)")
 SECRET_RE = re.compile(
     r"(?i)(authorization\s*:|bearer\s+[a-z0-9._-]{12,}|cookie\s*:|"
@@ -88,12 +95,59 @@ def _is_owner_reference(author: str, aliases: Set[str]) -> bool:
         return True
     if normalized.startswith(("我", "我们", "咱们")):
         return True
+    for alias in aliases:
+        if re.fullmatch(
+            re.escape(alias)
+            + r"\s*(?:之前|刚才|曾经|当时|本人|自己|也)?",
+            normalized,
+        ):
+            return True
     return bool(
         re.fullmatch(
             r"(?:这是|这就是|那是|那就是|按|依|对|对于)?我(?:个人)?",
             normalized,
         )
     )
+
+
+def _is_explicit_third_party_author(author: str) -> bool:
+    normalized = _clean_text(author).casefold()
+    if re.fullmatch(r"[a-z][a-z0-9_.-]{0,31}", normalized):
+        return normalized not in {"owner", "system", "tool", "bot"}
+    return bool(
+        re.match(
+            r"^(?:同事|朋友|客户|顾问|老师|医生|家人|父母|伴侣|"
+            r"对方|他|她|他们|她们|外部|第三方|有人|别人|大家)",
+            normalized,
+        )
+        or re.fullmatch(
+            r"[赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕"
+            r"施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛"
+            r"范彭郎鲁韦昌马苗凤花方俞任袁柳唐罗薛雷贺倪"
+            r"汤滕殷郝邬安常乐于时傅皮卞齐康伍余元卜顾孟"
+            r"平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成"
+            r"戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强"
+            r"贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊"
+            r"胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣"
+            r"贲邓郁单杭洪包诸左石崔吉龚程嵇邢滑裴陆荣翁"
+            r"荀羊甄魏家封芮羿储靳汲邴糜松井段富巫乌焦巴"
+            r"弓牧隗山谷车侯宓蓬全郗班仰秋仲伊宫宁仇栾暴"
+            r"甘钭厉戎祖武符刘景詹束龙叶幸司韶郜黎蓟薄印"
+            r"宿白怀蒲邰从鄂索咸籍赖卓蔺屠蒙池乔阴胥能苍"
+            r"双闻莘党翟谭贡劳逄姬申扶堵冉宰郦雍郤璩桑桂"
+            r"濮牛寿通边扈燕冀郏浦尚农温别庄晏柴瞿阎充慕"
+            r"连茹习宦艾鱼容向古易慎戈廖庾终暨居衡步都耿"
+            r"满弘匡国文寇广禄阙东欧殳沃利蔚越夔隆师巩厍"
+            r"聂晁勾敖融冷訾辛阚那简饶空曾毋沙乜养鞠须丰"
+            r"巢关蒯相查后荆红游竺权逯盖益桓公]"
+            r"[\u4e00-\u9fff]{1,3}",
+            normalized,
+        )
+    )
+
+
+def _claim_fingerprint(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _counter_map(counter: Counter) -> Dict[str, int]:
@@ -109,6 +163,7 @@ class AttributionService:
         *,
         auto_confirm_threshold: float = 0.85,
         max_report_samples: int = DEFAULT_MAX_REPORT_SAMPLES,
+        evidence_resolver: Optional[Any] = None,
     ) -> None:
         self.owner_aliases = {
             _clean_text(value).casefold()
@@ -127,6 +182,7 @@ class AttributionService:
         ):
             raise ValueError("max_report_samples must be a non-negative integer")
         self.max_report_samples = min(max_report_samples, MAX_REPORT_SAMPLES)
+        self.evidence_resolver = evidence_resolver
 
     def _source(self, record: Mapping[str, Any]) -> str:
         source = record.get("source")
@@ -153,11 +209,12 @@ class AttributionService:
         explicit = _clean_text(record.get("quoted_author"))
         if explicit and explicit.casefold() not in self.owner_aliases:
             return explicit
-        for match in THIRD_PARTY_QUOTE_RE.finditer(content):
+        for match in REPORTING_SPEECH_RE.finditer(content):
             author = _clean_text(match.group("author"))
             if _is_owner_reference(author, self.owner_aliases):
                 continue
-            return author
+            if _is_explicit_third_party_author(author):
+                return author
         return ""
 
     def _speaker(
@@ -178,7 +235,10 @@ class AttributionService:
             or record.get("speaker")
         )
         role = _clean_text(record.get("role")).casefold()
+        actor = _clean_text(record.get("actor")).casefold()
         if role in {"system", "tool", "bot"}:
+            return {"kind": "system", "id": "system"}, False
+        if not role and actor in {"system", "tool", "bot"}:
             return {"kind": "system", "id": "system"}, False
         if author and author.casefold() in self.owner_aliases:
             return {"kind": "owner", "id": "owner"}, False
@@ -233,13 +293,25 @@ class AttributionService:
     ) -> str:
         if speaker["kind"] == "other":
             return "external_view"
+        explicit = _clean_text(record.get("claim_type")).casefold()
+        durable_content = bool(DURABLE_RE.search(content))
+        if durable_content:
+            if explicit in {
+                "preference",
+                "value",
+                "commitment",
+                "decision",
+                "lesson",
+                "style",
+            }:
+                return explicit
+            return "preference"
         if EMOTION_RE.search(content):
             return "emotion"
         if ONE_OFF_RE.search(content):
             return "request"
         if REQUEST_RE.search(content) and not DURABLE_RE.search(content):
             return "request"
-        explicit = _clean_text(record.get("claim_type")).casefold()
         if explicit in {
             "fact",
             "preference",
@@ -341,35 +413,62 @@ class AttributionService:
             explicit = "context_safe"
         return max((detected, explicit), key=PRIVACY_RANK.__getitem__)
 
-    def _recurrence_score(self, record: Mapping[str, Any]) -> float:
+    def _recurrence_score(
+        self,
+        record: Mapping[str, Any],
+        content: str,
+    ) -> tuple:
         evidence = record.get("recurrence_evidence")
-        if not isinstance(evidence, list):
-            return 0.0
+        resolver_method = getattr(
+            self.evidence_resolver,
+            "resolve_for_claim",
+            None,
+        )
+        if not callable(resolver_method) and callable(self.evidence_resolver):
+            resolver_method = self.evidence_resolver
+        if (
+            not isinstance(evidence, list)
+            or not evidence
+            or not callable(resolver_method)
+        ):
+            return 0.0, False
+        fingerprint = _claim_fingerprint(content)
         evidence_ids: Set[str] = set()
         observed_times: Set[str] = set()
         for item in evidence:
             if not isinstance(item, Mapping):
-                continue
+                return 0.0, False
             evidence_id = _clean_text(item.get("evidence_id"))
-            observed_at = _clean_text(item.get("observed_at"))
-            if not evidence_id or not observed_at:
-                continue
+            if not evidence_id:
+                return 0.0, False
+            try:
+                ref = resolver_method(evidence_id, fingerprint)
+            except Exception:
+                return 0.0, False
+            if (
+                not isinstance(ref, Mapping)
+                or _clean_text(ref.get("evidence_id")) != evidence_id
+                or _clean_text(ref.get("status")).casefold() != "available"
+                or _clean_text(ref.get("claim_fingerprint")) != fingerprint
+            ):
+                return 0.0, False
+            observed_at = _clean_text(ref.get("observed_at"))
             try:
                 parsed = datetime.fromisoformat(
                     observed_at.replace("Z", "+00:00")
                 )
             except ValueError:
-                continue
+                return 0.0, False
             if parsed.tzinfo is None:
-                continue
+                return 0.0, False
             evidence_ids.add(evidence_id)
             observed_times.add(parsed.isoformat())
         distinct = min(len(evidence_ids), len(observed_times))
         if distinct < 2:
-            return 0.0
+            return 0.0, True
         if distinct == 2:
-            return 0.7
-        return 1.0
+            return 0.7, True
+        return 1.0, True
 
     def _source_quality(self, source: str) -> float:
         return {
@@ -418,8 +517,15 @@ class AttributionService:
         ):
             custom_scope_ids = []
         privacy = self._privacy(record, content)
-        recurrence = self._recurrence_score(record)
-        one_off_content = bool(ONE_OFF_RE.search(content))
+        recurrence, recurrence_verified = self._recurrence_score(
+            record,
+            content,
+        )
+        durable_content = bool(DURABLE_RE.search(content))
+        one_off_content = bool(
+            ONE_OFF_RE.search(content)
+            and not durable_content
+        )
         speaker_score = {
             "owner": 1.0,
             "other": 0.35,
@@ -457,6 +563,8 @@ class AttributionService:
             flags.append("one_off_content")
         if custom_scope_missing_id:
             flags.append("custom_scope_missing_id")
+        if not recurrence_verified:
+            flags.append("recurrence_unverified")
         if recurrence < 0.7:
             flags.append("insufficient_recurrence")
         if privacy == "private":
@@ -470,6 +578,7 @@ class AttributionService:
             and not one_off_content
             and privacy != "private"
             and privacy != "restricted"
+            and recurrence_verified
             and recurrence >= 0.7
             and source_quality >= 0.75
             and confidence >= self.auto_confirm_threshold
