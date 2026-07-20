@@ -656,6 +656,23 @@ def test_checkpoint_allows_previously_broken_evidence_to_be_repaired(tmp_path):
     assert checkpoint["committed_claim_ids"] == checkpoint["candidate_ids"]
 
 
+def test_evidence_repair_works_when_initial_batch_has_no_commits(tmp_path):
+    seed_evidence(tmp_path)
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-missing", "ev-missing")],
+    )
+
+    first = migrate_legacy_profile(tmp_path)
+    seed_evidence(tmp_path, "ev-missing")
+    repaired = migrate_legacy_profile(tmp_path)
+
+    assert first["created"] == 0
+    assert first["source_broken"] == 1
+    assert repaired["created"] == 1
+    assert repaired["source_broken"] == 0
+
+
 def test_checkpoint_rejects_unknown_or_uncommitted_claim_ids(tmp_path):
     seed_evidence(tmp_path, "ev-1")
     write_jsonl(
@@ -714,6 +731,45 @@ def test_checkpoint_rejects_unbound_well_formed_index_digest(tmp_path):
     assert captured.value.code == "malformed_checkpoint"
 
 
+def test_checkpoint_rejects_extra_observed_index_digest(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(report["checkpoint"])
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["observed_index_digests"].append("f" * 64)
+    payload["observed_index_digests"].sort()
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "malformed_checkpoint"
+
+
+def test_checkpoint_rejects_synchronized_top_and_observed_poisoning(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(report["checkpoint"])
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["index_digest"] = "f" * 64
+    payload["observed_index_digests"].append("f" * 64)
+    payload["observed_index_digests"].sort()
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "malformed_checkpoint"
+
+
 def test_unrelated_index_growth_preserves_historical_claim_binding(tmp_path):
     seed_evidence(tmp_path, "ev-1")
     write_jsonl(
@@ -733,9 +789,9 @@ def test_unrelated_index_growth_preserves_historical_claim_binding(tmp_path):
     updated = json.loads(checkpoint.read_text(encoding="utf-8"))
 
     assert second["created"] == third["created"] == 0
-    assert updated["index_digest"] != original_claim_digest
-    assert original_claim_digest in updated["observed_index_digests"]
-    assert updated["index_digest"] in updated["observed_index_digests"]
+    assert second["index_digest"] != original_claim_digest
+    assert updated["index_digest"] == original_claim_digest
+    assert updated["observed_index_digests"] == [original_claim_digest]
     assert set(updated["committed_index_digests"].values()) == {
         original_claim_digest
     }

@@ -612,6 +612,7 @@ def _read_checkpoint(
     path: Path,
     *,
     source_digest: str,
+    current_index_digest: str,
 ) -> Optional[Dict[str, Any]]:
     body = _read_optional_regular(path)
     if body is None:
@@ -658,15 +659,21 @@ def _read_checkpoint(
         if isinstance(value, dict)
         else None
     )
+    committed_digest_values = set(
+        committed_index_digests.values()
+        if isinstance(committed_index_digests, dict)
+        else []
+    )
+    expected_observed_digests = (
+        committed_digest_values
+        if committed_digest_values
+        else {current_index_digest}
+    )
     index_bindings_are_consistent = (
         isinstance(observed_index_digests, list)
         and all(_is_sha256(item) for item in observed_index_digests)
-        and value.get("index_digest") in observed_index_digests
-        and set(
-            committed_index_digests.values()
-            if isinstance(committed_index_digests, dict)
-            else []
-        ).issubset(set(observed_index_digests))
+        and set(observed_index_digests) == expected_observed_digests
+        and value.get("index_digest") in expected_observed_digests
     )
     if (
         not isinstance(value, dict)
@@ -717,20 +724,29 @@ def _write_checkpoint(
     complete: bool,
 ) -> None:
     committed = sorted(set(committed_claim_ids))
+    committed_digest_values = set(committed_index_digests.values())
+    bound_index_digest = (
+        index_digest
+        if not committed_digest_values or index_digest in committed_digest_values
+        else sorted(committed_digest_values)[-1]
+    )
+    observed_index_digests = (
+        committed_digest_values
+        if committed_digest_values
+        else {bound_index_digest}
+    )
     payload = {
         "schema_version": CHECKPOINT_VERSION,
         "migration_id": MIGRATION_ID,
         "source_digest": source_digest,
-        "index_digest": index_digest,
+        "index_digest": bound_index_digest,
         "candidate_ids": sorted(set(candidate_ids)),
         "committed_claim_ids": committed,
         "committed_index_digests": {
             claim_id: committed_index_digests[claim_id]
             for claim_id in committed
         },
-        "observed_index_digests": sorted(
-            set(committed_index_digests.values()) | {index_digest}
-        ),
+        "observed_index_digests": sorted(observed_index_digests),
         "complete": complete,
     }
     safe_atomic_write_text(
@@ -1089,7 +1105,11 @@ def _migrate_legacy_profile(
     )
     nuwa = _decode_json(nuwa_body, "profile_nuwa.json")
     digest = _source_digest(reviewed_body, nuwa_body)
-    checkpoint = _read_checkpoint(checkpoint_path, source_digest=digest)
+    checkpoint = _read_checkpoint(
+        checkpoint_path,
+        source_digest=digest,
+        current_index_digest=index_binding["digest"],
+    )
     current = _validate_current_state(vault)
     source_digests = {
         "reviewed/profile_memories.jsonl": reviewed_binding["digest"],
@@ -1167,6 +1187,8 @@ def _migrate_legacy_profile(
         "index_digest": index_binding["digest"],
     }
     if dry_run or not raw_items:
+        return report
+    if not prepared and not committed_claim_ids:
         return report
 
     store: Optional[ClaimStore] = None
