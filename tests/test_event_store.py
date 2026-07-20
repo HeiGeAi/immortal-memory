@@ -225,6 +225,100 @@ def test_append_fsyncs_file_and_new_parent_entry(tmp_path, monkeypatch):
     assert len(calls) >= 2
 
 
+def test_multilevel_parent_creation_fsyncs_every_new_directory_entry(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    root = tmp_path / "root"
+    root.mkdir()
+    calls = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        calls.append(os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(module.os, "fsync", recording_fsync)
+    JsonlEventStore(root / "a" / "b" / "events.jsonl").append(event("evt-1"))
+
+    assert root.stat().st_ino in calls
+    assert (root / "a").stat().st_ino in calls
+    assert (root / "a" / "b").stat().st_ino in calls
+
+
+def test_parent_symlink_cannot_escape_event_read_write_or_lock(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    store = JsonlEventStore(linked_parent / "events.jsonl")
+
+    with pytest.raises(Exception) as append_error:
+        store.append(event("evt-1"))
+    assert getattr(append_error.value, "code", None) == "unsafe_path"
+    assert not (outside / "events.jsonl").exists()
+    assert not (outside / "events.jsonl.lock").exists()
+
+    external_log = outside / "external.jsonl"
+    external_log.write_text(
+        json.dumps({**event("evt-external"), "seq": 1}) + "\n",
+        encoding="utf-8",
+    )
+    direct = tmp_path / "direct.jsonl"
+    direct.symlink_to(external_log)
+    with pytest.raises(Exception) as read_error:
+        JsonlEventStore(direct).read_all()
+    assert getattr(read_error.value, "code", None) == "unsafe_path"
+
+    lock_target = outside / "external.lock"
+    lock_target.write_text("do not replace", encoding="utf-8")
+    safe_path = tmp_path / "safe.jsonl"
+    safe_path.with_name("safe.jsonl.lock").symlink_to(lock_target)
+    with pytest.raises(Exception) as lock_error:
+        JsonlEventStore(safe_path).append(event("evt-lock"))
+    assert getattr(lock_error.value, "code", None) == "unsafe_path"
+    assert lock_target.read_text(encoding="utf-8") == "do not replace"
+
+
+def test_relative_event_path_is_bound_when_store_is_constructed(
+    tmp_path,
+    monkeypatch,
+):
+    original = tmp_path / "original"
+    elsewhere = tmp_path / "elsewhere"
+    original.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(original)
+    store = JsonlEventStore(Path("vault") / "events.jsonl")
+
+    monkeypatch.chdir(elsewhere)
+    store.append(event("evt-bound"))
+
+    assert (original / "vault" / "events.jsonl").is_file()
+    assert not (elsewhere / "vault" / "events.jsonl").exists()
+
+
+def test_lock_replacement_is_not_unlinked_by_previous_owner(tmp_path):
+    import event_store as module
+
+    lock_path = tmp_path / "events.jsonl.lock"
+    moved = tmp_path / "owned.lock"
+
+    with pytest.raises(Exception) as captured:
+        with module._exclusive_lock(
+            lock_path,
+            timeout=0.1,
+            stale_after=60.0,
+        ):
+            lock_path.rename(moved)
+            lock_path.write_text("replacement", encoding="utf-8")
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert lock_path.read_text(encoding="utf-8") == "replacement"
+
+
 def test_partial_tail_is_reported_then_recovered_before_next_append(tmp_path):
     path = tmp_path / "events.jsonl"
     store = JsonlEventStore(path)

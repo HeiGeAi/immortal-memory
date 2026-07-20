@@ -1,10 +1,11 @@
 import json
+import os
 import threading
 
 import pytest
 
 from claim_store import ClaimNotFound, ClaimStore, InvalidTransition
-from model_types import new_claim, validate_claim
+from model_types import new_claim, new_event, validate_claim
 
 
 ACTOR = {"kind": "owner", "id": "owner"}
@@ -62,6 +63,46 @@ def transition(
     )
 
 
+def rewrite_event(path, index, mutate):
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    mutate(rows[index])
+    path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+            for row in rows
+        ),
+        encoding="utf-8",
+    )
+
+
+def pending_correction(store, monkeypatch):
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+    real_append = store.events.append
+    attempts = {"count": 0}
+
+    def fail_replacement(event):
+        attempts["count"] += 1
+        if attempts["count"] == 2:
+            raise OSError("replacement append interrupted")
+        return real_append(event)
+
+    monkeypatch.setattr(store.events, "append", fail_replacement)
+    with pytest.raises(OSError, match="replacement append interrupted"):
+        store.correct(
+            "clm-1",
+            "先给结果，再给必要依据",
+            reason="more precise",
+            expected_revision=2,
+            request_id="req-correct",
+            idempotency_key="idem-correct",
+            actor=ACTOR,
+        )
+
+
 def test_create_get_and_list_write_sorted_current_view_with_watermarks(tmp_path):
     store = ClaimStore(tmp_path)
 
@@ -78,6 +119,63 @@ def test_create_get_and_list_write_sorted_current_view_with_watermarks(tmp_path)
         for line in store.current_path.read_text(encoding="utf-8").splitlines()
     ]
     assert [row["claim_id"] for row in current_rows] == ["clm-a", "clm-b"]
+
+
+def test_empty_store_initialization_has_no_files_or_directories(tmp_path):
+    ClaimStore(tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_claim_parent_symlink_cannot_escape_current_or_event_files(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "model").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(Exception) as captured:
+        ClaimStore(tmp_path)
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert not (outside / "claims" / "current.jsonl").exists()
+    assert not (outside / "claims" / "events.jsonl").exists()
+
+
+def test_relative_claim_vault_is_bound_when_store_is_constructed(
+    tmp_path,
+    monkeypatch,
+):
+    original = tmp_path / "original"
+    elsewhere = tmp_path / "elsewhere"
+    original.mkdir()
+    elsewhere.mkdir()
+    monkeypatch.chdir(original)
+    store = ClaimStore("vault")
+
+    monkeypatch.chdir(elsewhere)
+    create(store, claim())
+
+    assert (original / "vault" / "model" / "claims" / "events.jsonl").is_file()
+    assert (original / "vault" / "model" / "claims" / "current.jsonl").is_file()
+    assert not (elsewhere / "vault").exists()
+
+
+def test_none_claim_and_claim_id_have_stable_errors(tmp_path):
+    store = ClaimStore(tmp_path)
+
+    with pytest.raises(InvalidTransition) as create_error:
+        store.create(
+            None,
+            expected_revision=0,
+            request_id="req-none",
+            idempotency_key="idem-none",
+            actor=ACTOR,
+            reason="invalid input",
+        )
+    assert create_error.value.code == "invalid_claim"
+
+    with pytest.raises(InvalidTransition) as get_error:
+        store.get(None)
+    assert get_error.value.code == "claim_id_required"
 
 
 def test_every_public_write_rejects_missing_or_blank_operation_metadata(tmp_path):
@@ -503,3 +601,135 @@ def test_restart_recovers_pending_correction_without_caller_retry(
     assert active[0]["statement"] == "先给结果，再给必要依据"
     assert active[0]["supersedes"] == "clm-1"
     assert len(repaired.events.read_all()) == 4
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        lambda replacement: replacement.update({"statement": ""}),
+        lambda replacement: replacement.update({"supersedes": "clm-unrelated"}),
+    ],
+)
+def test_pending_correction_poison_fails_before_append_and_preserves_log(
+    tmp_path,
+    monkeypatch,
+    poison,
+):
+    store = ClaimStore(tmp_path)
+    pending_correction(store, monkeypatch)
+    path = store.events.path
+    rewrite_event(path, 2, lambda event: poison(event["payload"]["replacement"]))
+    before = path.read_bytes()
+
+    with pytest.raises(InvalidTransition) as captured:
+        ClaimStore(tmp_path)
+
+    assert captured.value.code == "claim_event_corruption"
+    assert path.read_bytes() == before
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 3
+
+
+@pytest.mark.parametrize(
+    "event_index,mutate",
+    [
+        (
+            0,
+            lambda event: event["payload"]["claim"].update(
+                {"claim_id": "clm-forged"}
+            ),
+        ),
+        (
+            0,
+            lambda event: event["payload"]["claim"].update(
+                {"status": "confirmed"}
+            ),
+        ),
+        (
+            1,
+            lambda event: event.update({"previous_status": "rejected"}),
+        ),
+        (
+            1,
+            lambda event: event["payload"]["operation"].update(
+                {"actor": {"kind": "system", "id": "forged"}}
+            ),
+        ),
+        (
+            1,
+            lambda event: event["payload"].update({"reason": "forged"}),
+        ),
+    ],
+)
+def test_replay_rejects_claim_event_semantic_mismatches(
+    tmp_path,
+    event_index,
+    mutate,
+):
+    store = ClaimStore(tmp_path)
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+    rewrite_event(store.events.path, event_index, mutate)
+    before = store.events.path.read_bytes()
+
+    with pytest.raises(InvalidTransition) as captured:
+        ClaimStore(tmp_path)
+
+    assert captured.value.code == "claim_event_corruption"
+    assert store.events.path.read_bytes() == before
+
+
+def test_replay_rejects_corrected_event_with_wrong_parent(tmp_path):
+    store = ClaimStore(tmp_path)
+    create(store, claim())
+    transition(store, "clm-1", "confirmed", 1, "confirm")
+    store.correct(
+        "clm-1",
+        "修正后的陈述",
+        reason="more precise",
+        expected_revision=2,
+        request_id="req-correct-parent",
+        idempotency_key="idem-correct-parent",
+        actor=ACTOR,
+    )
+    rewrite_event(
+        store.events.path,
+        3,
+        lambda event: event["payload"]["operation"].update(
+            {"parent_event_id": "evt-missing"}
+        ),
+    )
+
+    with pytest.raises(InvalidTransition) as captured:
+        ClaimStore(tmp_path)
+
+    assert captured.value.code == "claim_event_corruption"
+
+
+def test_claim_replay_streams_beyond_one_hundred_thousand_events(tmp_path):
+    events_path = tmp_path / "model" / "claims" / "events.jsonl"
+    events_path.parent.mkdir(parents=True)
+    with events_path.open("w", encoding="utf-8") as handle:
+        for number in range(1, 100_002):
+            row = new_event(
+                event_id=f"evt-bulk-{number}",
+                event_type="audit.observed",
+                stream_id=f"audit-{number}",
+                stream_version=1,
+                expected_version=0,
+                request_id=f"req-bulk-{number}",
+                idempotency_key=f"idem-bulk-{number}",
+                actor={"kind": "system", "id": "bulk-test"},
+                payload={"number": number},
+                now="2026-07-20T00:00:00+00:00",
+            )
+            row["seq"] = number
+            handle.write(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    store = ClaimStore(tmp_path)
+
+    assert store.list() == []
+    assert store.events.watermark() == 100_001

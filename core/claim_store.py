@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from event_store import EventConflict, JsonlEventStore
-from file_utils import atomic_write_text
+from event_store import (
+    EventConflict,
+    JsonlEventStore,
+    safe_atomic_write_text,
+    safe_read_text,
+)
 from model_types import ACTOR_KINDS, ModelValidationError, new_event, validate_claim
 
 
@@ -70,10 +75,12 @@ class ClaimStore:
     """Maintain immutable claim events and a replayable current JSONL view."""
 
     def __init__(self, vault_dir: Path) -> None:
-        self.root = Path(vault_dir) / "model" / "claims"
+        vault = Path(os.path.abspath(str(vault_dir)))
+        self.root = vault / "model" / "claims"
         self.events = JsonlEventStore(self.root / "events.jsonl")
         self.current_path = self.root / "current.jsonl"
-        self._ensure_current()
+        if self.events.exists():
+            self._ensure_current()
 
     @staticmethod
     def _validate_write_metadata(
@@ -130,47 +137,339 @@ class ClaimStore:
         )
 
     @staticmethod
-    def _event_claim(event: Mapping[str, Any]) -> Dict[str, Any]:
-        stored = dict(event["payload"]["claim"])
+    def _claim_corruption(message: str, exc: Optional[BaseException] = None) -> None:
+        error = InvalidTransition("claim_event_corruption", message)
+        if exc is None:
+            raise error
+        raise error from exc
+
+    @classmethod
+    def _event_claim(cls, event: Mapping[str, Any]) -> Dict[str, Any]:
+        try:
+            stored = dict(event["payload"]["claim"])
+        except (KeyError, TypeError, ValueError) as exc:
+            cls._claim_corruption("claim event payload is malformed", exc)
         stored["based_on_event_seq"] = int(event["seq"])
         stored["stream_version"] = int(event["stream_version"])
-        validate_claim(stored)
+        try:
+            validate_claim(stored)
+        except (ModelValidationError, KeyError, TypeError, ValueError) as exc:
+            cls._claim_corruption("claim event contains an invalid claim", exc)
         return stored
 
-    def _replay(self) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    @classmethod
+    def _require(cls, condition: bool, message: str) -> None:
+        if not condition:
+            cls._claim_corruption(message)
+
+    @staticmethod
+    def _without_projection_fields(value: Mapping[str, Any]) -> Dict[str, Any]:
+        result = dict(value)
+        result.pop("stream_version", None)
+        return result
+
+    @classmethod
+    def _unchanged_except(
+        cls,
+        previous: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        allowed: set,
+    ) -> None:
+        old = cls._without_projection_fields(previous)
+        new = cls._without_projection_fields(candidate)
+        for field in allowed:
+            old.pop(field, None)
+            new.pop(field, None)
+        cls._require(
+            _canonical(old) == _canonical(new),
+            "claim event changed fields outside its operation contract",
+        )
+
+    @classmethod
+    def _validated_replacement(
+        cls,
+        started: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            payload = started["payload"]
+            superseded = dict(payload["claim"])
+            replacement = dict(payload["replacement"])
+            operation = payload["operation"]
+        except (KeyError, TypeError, ValueError) as exc:
+            cls._claim_corruption("correction payload is malformed", exc)
+        try:
+            validate_claim(superseded)
+            validate_claim(replacement)
+        except (ModelValidationError, KeyError, TypeError, ValueError) as exc:
+            cls._claim_corruption("correction payload contains an invalid claim", exc)
+        cls._require(
+            operation.get("method") == "correct",
+            "correction operation method is invalid",
+        )
+        original_id = superseded.get("claim_id")
+        cls._require(
+            superseded.get("status") == "superseded",
+            "correction must supersede the original claim",
+        )
+        cls._require(
+            replacement.get("claim_id") != original_id
+            and replacement.get("status") == "confirmed"
+            and replacement.get("revision") == 1
+            and replacement.get("supersedes") == original_id,
+            "correction replacement relation is invalid",
+        )
+        cls._require(
+            operation.get("claim_id") == original_id
+            and operation.get("statement") == replacement.get("statement"),
+            "correction operation does not match its replacement",
+        )
+        cls._unchanged_except(
+            superseded,
+            replacement,
+            {
+                "based_on_event_seq",
+                "claim_id",
+                "created_at",
+                "revision",
+                "statement",
+                "status",
+                "supersedes",
+                "updated_at",
+                "valid_from",
+                "valid_to",
+            },
+        )
+        return replacement
+
+    @classmethod
+    def _project_claim_event(
+        cls,
+        event: Mapping[str, Any],
+        current: Dict[str, Dict[str, Any]],
+        corrections: Dict[str, Mapping[str, Any]],
+        completed: set,
+    ) -> None:
+        event_type = event["event_type"]
+        if event_type not in CLAIM_EVENT_TYPES:
+            return
+        try:
+            payload = event["payload"]
+            operation = payload["operation"]
+            claim = dict(payload["claim"])
+            reason = payload["reason"]
+        except (KeyError, TypeError, ValueError) as exc:
+            cls._claim_corruption("claim event payload is malformed", exc)
+        cls._require(
+            isinstance(operation, Mapping),
+            "claim operation must be an object",
+        )
+        projected = cls._event_claim(event)
+        claim_id = projected["claim_id"]
+        cls._require(
+            event["stream_id"] == claim_id,
+            "claim stream does not match payload claim_id",
+        )
+
+        if event_type == "claim.corrected":
+            parent_id = operation.get("parent_event_id")
+            parent = corrections.get(str(parent_id))
+            cls._require(
+                operation.get("method") == "correct.replacement"
+                and parent is not None,
+                "corrected claim does not reference a prior correction",
+            )
+            replacement = cls._validated_replacement(parent)
+            cls._require(
+                _canonical(claim) == _canonical(replacement),
+                "corrected claim differs from pending replacement",
+            )
+            cls._require(
+                event.get("previous_status") is None
+                and int(event["expected_version"]) == 0
+                and int(event["stream_version"]) == 1,
+                "corrected claim stream state is invalid",
+            )
+            cls._require(
+                event["actor"] == parent["actor"]
+                and reason == parent["payload"]["reason"],
+                "corrected claim actor or reason differs from its parent",
+            )
+            cls._require(
+                claim_id not in current,
+                "corrected claim_id already exists",
+            )
+            current[claim_id] = projected
+            completed.add(str(parent_id))
+            return
+
+        cls._require(
+            operation.get("actor") == event["actor"]
+            and operation.get("reason") == reason,
+            "claim event actor or reason differs from its operation",
+        )
+        previous = current.get(claim_id)
+
+        if event_type == "claim.created":
+            cls._require(
+                operation.get("method") == "create"
+                and previous is None
+                and event.get("previous_status") is None
+                and projected["status"] == "candidate"
+                and projected["revision"] == 1
+                and int(event["expected_version"]) == 0
+                and int(event["stream_version"]) == 1,
+                "claim.created semantics are invalid",
+            )
+            cls._require(
+                _canonical(operation.get("claim"))
+                == _canonical(claim),
+                "claim.created payload differs from its operation",
+            )
+        else:
+            cls._require(
+                previous is not None,
+                "claim mutation has no projected predecessor",
+            )
+            expected_revision = operation.get("expected_revision")
+            cls._require(
+                isinstance(expected_revision, int)
+                and not isinstance(expected_revision, bool)
+                and expected_revision == previous["revision"]
+                and projected["revision"] == previous["revision"] + 1
+                and event.get("previous_status") == previous["status"],
+                "claim mutation revision or previous_status is invalid",
+            )
+            cls._require(
+                operation.get("claim_id") == claim_id,
+                "claim operation claim_id does not match its stream",
+            )
+            if event_type == "claim.transitioned":
+                cls._require(
+                    operation.get("method") == "transition"
+                    and operation.get("status") == projected["status"]
+                    and projected["status"]
+                    in ALLOWED_TRANSITIONS.get(
+                        previous["status"],
+                        frozenset(),
+                    ),
+                    "claim.transitioned semantics are invalid",
+                )
+                cls._unchanged_except(
+                    previous,
+                    projected,
+                    {
+                        "based_on_event_seq",
+                        "revision",
+                        "status",
+                        "updated_at",
+                        "valid_to",
+                    },
+                )
+            elif event_type == "claim.reconsidered":
+                evidence = operation.get("evidence_ids")
+                expected_evidence = list(
+                    dict.fromkeys(
+                        list(previous["evidence_ids"])
+                        + (evidence if isinstance(evidence, list) else [])
+                    )
+                )
+                cls._require(
+                    operation.get("method") == "reconsider"
+                    and previous["status"] == "rejected"
+                    and projected["status"] == "candidate"
+                    and isinstance(evidence, list)
+                    and projected["evidence_ids"] == expected_evidence,
+                    "claim.reconsidered semantics are invalid",
+                )
+                cls._unchanged_except(
+                    previous,
+                    projected,
+                    {
+                        "based_on_event_seq",
+                        "evidence_ids",
+                        "revision",
+                        "status",
+                        "updated_at",
+                    },
+                )
+            elif event_type == "claim.correction_started":
+                cls._require(
+                    operation.get("method") == "correct"
+                    and previous["status"] == "confirmed"
+                    and projected["status"] == "superseded",
+                    "claim.correction_started semantics are invalid",
+                )
+                cls._unchanged_except(
+                    previous,
+                    projected,
+                    {
+                        "based_on_event_seq",
+                        "revision",
+                        "status",
+                        "updated_at",
+                        "valid_to",
+                    },
+                )
+                cls._validated_replacement(event)
+                corrections[str(event["event_id"])] = event
+        current[claim_id] = projected
+
+    def _scan_claim_events(
+        self,
+    ) -> Tuple[
+        Dict[str, Dict[str, Any]],
+        int,
+        List[Mapping[str, Any]],
+    ]:
         current: Dict[str, Dict[str, Any]] = {}
+        corrections: Dict[str, Mapping[str, Any]] = {}
+        completed = set()
         head = 0
-        for event in self.events.read_all():
+        for event in self.events.iter_all():
             head = int(event["seq"])
-            event_type = event["event_type"]
-            if event_type in CLAIM_EVENT_TYPES:
-                projected = self._event_claim(event)
-                current[projected["claim_id"]] = projected
+            self._project_claim_event(
+                event,
+                current,
+                corrections,
+                completed,
+            )
+        pending = [
+            event
+            for event_id, event in corrections.items()
+            if event_id not in completed
+        ]
+        return current, head, pending
+
+    def _replay(self) -> Tuple[Dict[str, Dict[str, Any]], int]:
+        current, head, _pending = self._scan_claim_events()
         return current, head
 
     def _read_current(self) -> Optional[Dict[str, Dict[str, Any]]]:
-        if not self.current_path.is_file():
+        try:
+            content = safe_read_text(self.current_path)
+        except (OSError, UnicodeDecodeError):
+            return None
+        if content is None:
             return None
         current: Dict[str, Dict[str, Any]] = {}
         try:
-            with self.current_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if not line.strip():
-                        continue
-                    row = json.loads(line)
-                    if not isinstance(row, dict):
-                        return None
-                    validate_claim(row)
-                    if (
-                        not isinstance(row.get("stream_version"), int)
-                        or isinstance(row.get("stream_version"), bool)
-                        or int(row["stream_version"]) < 1
-                    ):
-                        return None
-                    claim_id = str(row["claim_id"])
-                    if claim_id in current:
-                        return None
-                    current[claim_id] = row
+            for line in content.splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    return None
+                validate_claim(row)
+                if (
+                    not isinstance(row.get("stream_version"), int)
+                    or isinstance(row.get("stream_version"), bool)
+                    or int(row["stream_version"]) < 1
+                ):
+                    return None
+                claim_id = str(row["claim_id"])
+                if claim_id in current:
+                    return None
+                current[claim_id] = row
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ModelValidationError):
             return None
         return current
@@ -185,7 +484,7 @@ class ClaimStore:
             )
             for claim_id in sorted(claims)
         ]
-        atomic_write_text(
+        safe_atomic_write_text(
             self.current_path,
             ("\n".join(rows) + "\n") if rows else "",
         )
@@ -198,6 +497,8 @@ class ClaimStore:
                 return current
 
     def _ensure_current(self) -> Dict[str, Dict[str, Any]]:
+        if not self.events.exists():
+            return {}
         self._recover_pending_corrections()
         while True:
             projected, replay_head = self._replay()
@@ -213,8 +514,9 @@ class ClaimStore:
         idempotency_keys: List[str],
         operation: Mapping[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        self._scan_claim_events()
         requested_keys = set(idempotency_keys)
-        for event in self.events.read_all():
+        for event in self.events.iter_all():
             if event["idempotency_key"] not in requested_keys:
                 continue
             existing = event["payload"].get("operation")
@@ -294,6 +596,11 @@ class ClaimStore:
             actor=actor,
             reason=reason,
         )
+        if not isinstance(claim, Mapping):
+            raise InvalidTransition(
+                "invalid_claim",
+                "claim must be an object",
+            )
         candidate = dict(claim)
         try:
             validate_claim(candidate)
@@ -342,6 +649,11 @@ class ClaimStore:
         return self._return_projected(event)
 
     def get(self, claim_id: str) -> Dict[str, Any]:
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise InvalidTransition(
+                "claim_id_required",
+                "claim_id must be a non-empty string",
+            )
         current = self._ensure_current()
         try:
             return dict(current[claim_id])
@@ -502,7 +814,7 @@ class ClaimStore:
         self,
         started: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        replacement = dict(started["payload"]["replacement"])
+        replacement = self._validated_replacement(started)
         operation = {
             "method": "correct.replacement",
             "parent_event_id": str(started["event_id"]),
@@ -524,22 +836,9 @@ class ClaimStore:
         return existing
 
     def _recover_pending_corrections(self) -> None:
-        events = self.events.read_all()
-        corrected_claim_ids = {
-            str(event["payload"]["claim"]["claim_id"])
-            for event in events
-            if event["event_type"] == "claim.corrected"
-        }
-        for event in events:
-            if event["event_type"] != "claim.correction_started":
-                continue
-            replacement_id = str(event["payload"]["replacement"]["claim_id"])
-            if replacement_id in corrected_claim_ids:
-                continue
-            completed = self._append_replacement(event)
-            corrected_claim_ids.add(
-                str(completed["payload"]["claim"]["claim_id"])
-            )
+        _current, _head, pending = self._scan_claim_events()
+        for event in pending:
+            self._append_replacement(event)
 
     def _finish_correction(
         self,

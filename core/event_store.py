@@ -44,6 +44,155 @@ class ReplayLimitExceeded(RuntimeError):
         self.limit = limit
 
 
+class EventPathError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _unsafe_path(message: str, exc: Optional[BaseException] = None) -> EventPathError:
+    error = EventPathError("unsafe_path", message)
+    if exc is not None:
+        error.__cause__ = exc
+    return error
+
+
+def _directory_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+@contextmanager
+def _anchored_parent(path: Path, *, create: bool) -> Iterator[tuple]:
+    absolute = Path(os.path.abspath(str(path)))
+    parts = absolute.parent.parts
+    descriptor = os.open(parts[0], _directory_flags())
+    try:
+        for component in parts[1:]:
+            try:
+                child = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    child = os.open(
+                        component,
+                        _directory_flags(),
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise _unsafe_path(
+                        "event store parent cannot be created safely",
+                        exc,
+                    )
+            except OSError as exc:
+                raise _unsafe_path(
+                    "event store parent path is not a safe directory",
+                    exc,
+                )
+            os.close(descriptor)
+            descriptor = child
+        yield descriptor, absolute.name
+    finally:
+        os.close(descriptor)
+
+
+def _regular_stat_at(parent_fd: int, name: str) -> Optional[os.stat_result]:
+    try:
+        metadata = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _unsafe_path("event store path cannot be inspected safely", exc)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise _unsafe_path("event store path must be a regular file")
+    return metadata
+
+
+def safe_regular_exists(path: Path) -> bool:
+    try:
+        with _anchored_parent(path, create=False) as (parent_fd, name):
+            return _regular_stat_at(parent_fd, name) is not None
+    except FileNotFoundError:
+        return False
+
+
+def safe_read_text(path: Path) -> Optional[str]:
+    try:
+        with _anchored_parent(path, create=False) as (parent_fd, name):
+            if _regular_stat_at(parent_fd, name) is None:
+                return None
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+            except OSError as exc:
+                raise _unsafe_path("event store file cannot be opened safely", exc)
+            try:
+                with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+                    return handle.read()
+            finally:
+                os.close(descriptor)
+    except FileNotFoundError:
+        return None
+
+
+def safe_atomic_write_text(path: Path, content: str) -> None:
+    encoded = content.encode("utf-8")
+    with _anchored_parent(path, create=True) as (parent_fd, name):
+        _regular_stat_at(parent_fd, name)
+        temporary = "." + name + "." + str(os.getpid()) + "." + str(time.time_ns())
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+        try:
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("safe file write made no progress")
+                view = view[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
 @contextmanager
 def _exclusive_lock(
     lock_path: Path,
@@ -51,15 +200,31 @@ def _exclusive_lock(
     timeout: float,
     stale_after: float,
 ) -> Iterator[None]:
-    fd = _acquire_event_lock(lock_path, timeout, stale_after)
-    try:
-        yield
-    finally:
-        os.close(fd)
+    with _anchored_parent(lock_path, create=True) as (parent_fd, name):
+        fd = _acquire_event_lock(parent_fd, name, timeout, stale_after)
         try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            yield parent_fd
+        finally:
+            try:
+                owned = os.fstat(fd)
+                current = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or (owned.st_dev, owned.st_ino)
+                    != (current.st_dev, current.st_ino)
+                ):
+                    raise _unsafe_path(
+                        "event lock ownership changed while held",
+                    )
+                os.unlink(name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                raise _unsafe_path("event lock disappeared while held")
+            finally:
+                os.close(fd)
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -74,38 +239,58 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _lock_is_reclaimable(lock_path: Path, stale_after: float) -> bool:
+def _lock_is_reclaimable(
+    parent_fd: int,
+    name: str,
+    stale_after: float,
+) -> bool:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        age = max(0.0, time.time() - lock_path.stat().st_mtime)
-    except OSError:
-        return False
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise _unsafe_path("event lock cannot be opened safely", exc)
     try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _unsafe_path("event lock must be a regular file")
+        age = max(0.0, time.time() - metadata.st_mtime)
+        raw = os.read(descriptor, 4097)
+        if len(raw) > 4096:
+            raise ValueError("lock payload is too large")
+        payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("lock payload must be an object")
         pid = int(payload.get("pid") or 0)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
         return age >= stale_after
+    finally:
+        os.close(descriptor)
     return not _pid_is_alive(pid)
 
 
 def _acquire_event_lock(
-    lock_path: Path,
+    parent_fd: int,
+    name: str,
     timeout: float,
     stale_after: float,
 ) -> int:
     deadline = time.monotonic() + timeout
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
     while True:
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:
-            fd = os.open(str(lock_path), flags, 0o600)
+            fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
         except FileExistsError:
-            if _lock_is_reclaimable(lock_path, stale_after):
+            if _lock_is_reclaimable(parent_fd, name, stale_after):
                 try:
-                    lock_path.unlink()
+                    os.unlink(name, dir_fd=parent_fd)
                 except FileNotFoundError:
                     pass
                 continue
@@ -129,7 +314,7 @@ def _acquire_event_lock(
         except Exception:
             os.close(fd)
             try:
-                lock_path.unlink()
+                os.unlink(name, dir_fd=parent_fd)
             except FileNotFoundError:
                 pass
             raise
@@ -177,7 +362,7 @@ class JsonlEventStore:
         max_replay_events: int = 100_000,
         max_event_bytes: int = 1024 * 1024,
     ) -> None:
-        self.path = Path(path)
+        self.path = Path(os.path.abspath(str(path)))
         self.lock_path = self.path.with_name(self.path.name + ".lock")
         self.lock_timeout = float(lock_timeout)
         self.stale_lock_after = float(stale_lock_after)
@@ -232,120 +417,150 @@ class JsonlEventStore:
             )
         return dict(value)
 
-    def _validated_events(self, *, recover_tail: bool) -> Iterator[Dict[str, Any]]:
-        if not self.path.exists():
-            return
+    def _validated_events(
+        self,
+        *,
+        recover_tail: bool,
+        parent_fd: int,
+    ) -> Iterator[Dict[str, Any]]:
         mode = "r+b" if recover_tail else "rb"
-        with self.path.open(mode) as handle:
-            seen_event_ids = set()
-            seen_idempotency_keys = set()
-            stream_versions: Dict[str, int] = {}
-            expected_seq = 1
-            line_number = 0
-            while True:
-                start = handle.tell()
-                raw = handle.readline(self.max_event_bytes + 2)
-                if not raw:
-                    break
-                line_number += 1
-                if len(raw) > self.max_event_bytes + 1:
-                    raise EventCorruption(
-                        "event_too_large",
-                        "event exceeds maximum encoded size",
-                        line_number=line_number,
-                    )
-                if not raw.strip():
-                    raise EventCorruption(
-                        "blank_event_line",
-                        "event log contains a blank line",
-                        line_number=line_number,
-                    )
-                complete_line = raw.endswith(b"\n")
-                payload = raw[:-1] if complete_line else raw
-                needs_terminator = False
-                if not complete_line:
-                    try:
+        flags = os.O_RDWR if recover_tail else os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self.path.name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise _unsafe_path("event log cannot be opened safely", exc)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            raise _unsafe_path("event log must be a regular file")
+        try:
+            handle_context = os.fdopen(
+                descriptor,
+                mode,
+                closefd=False,
+            )
+            with handle_context as handle:
+                seen_event_ids = set()
+                seen_idempotency_keys = set()
+                stream_versions: Dict[str, int] = {}
+                expected_seq = 1
+                line_number = 0
+                while True:
+                    start = handle.tell()
+                    raw = handle.readline(self.max_event_bytes + 2)
+                    if not raw:
+                        break
+                    line_number += 1
+                    if len(raw) > self.max_event_bytes + 1:
+                        raise EventCorruption(
+                            "event_too_large",
+                            "event exceeds maximum encoded size",
+                            line_number=line_number,
+                        )
+                    if not raw.strip():
+                        raise EventCorruption(
+                            "blank_event_line",
+                            "event log contains a blank line",
+                            line_number=line_number,
+                        )
+                    complete_line = raw.endswith(b"\n")
+                    payload = raw[:-1] if complete_line else raw
+                    needs_terminator = False
+                    if not complete_line:
+                        try:
+                            row = self._decode_row(
+                                payload,
+                                line_number=line_number,
+                                recoverable_tail=True,
+                            )
+                        except EventCorruption as exc:
+                            if not recover_tail or exc.code != "partial_tail":
+                                raise
+                            handle.seek(start)
+                            handle.truncate()
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                            break
+                        if not recover_tail:
+                            raise EventCorruption(
+                                "partial_tail",
+                                "event line is missing its terminator",
+                                line_number=line_number,
+                                recoverable_tail=True,
+                            )
+                        needs_terminator = True
+                    else:
                         row = self._decode_row(
                             payload,
                             line_number=line_number,
-                            recoverable_tail=True,
+                            recoverable_tail=False,
                         )
-                    except EventCorruption as exc:
-                        if not recover_tail or exc.code != "partial_tail":
-                            raise
-                        handle.seek(start)
-                        handle.truncate()
+                    event_id = str(row["event_id"])
+                    if event_id in seen_event_ids:
+                        raise EventCorruption(
+                            "duplicate_event_id",
+                            "duplicate event_id in event log",
+                            line_number=line_number,
+                        )
+                    seen_event_ids.add(event_id)
+                    idempotency_key = str(row["idempotency_key"])
+                    if idempotency_key in seen_idempotency_keys:
+                        raise EventCorruption(
+                            "duplicate_idempotency_key",
+                            "duplicate idempotency key in event log",
+                            line_number=line_number,
+                        )
+                    seen_idempotency_keys.add(idempotency_key)
+                    seq = int(row["seq"])
+                    if seq != expected_seq:
+                        raise EventCorruption(
+                            "non_monotonic_sequence",
+                            "event sequence is not contiguous",
+                            line_number=line_number,
+                        )
+                    expected_seq += 1
+                    stream_id = str(row["stream_id"])
+                    current_version = stream_versions.get(stream_id, 0)
+                    if (
+                        int(row["expected_version"]) != current_version
+                        or int(row["stream_version"]) != current_version + 1
+                    ):
+                        raise EventCorruption(
+                            "non_monotonic_stream_version",
+                            "stream version is not contiguous",
+                            line_number=line_number,
+                        )
+                    stream_versions[stream_id] = int(row["stream_version"])
+                    if needs_terminator:
+                        handle.seek(0, os.SEEK_END)
+                        handle.write(b"\n")
                         handle.flush()
                         os.fsync(handle.fileno())
-                        break
-                    if not recover_tail:
-                        raise EventCorruption(
-                            "partial_tail",
-                            "event line is missing its terminator",
-                            line_number=line_number,
-                            recoverable_tail=True,
-                        )
-                    needs_terminator = True
-                else:
-                    row = self._decode_row(
-                        payload,
-                        line_number=line_number,
-                        recoverable_tail=False,
-                    )
-                event_id = str(row["event_id"])
-                if event_id in seen_event_ids:
-                    raise EventCorruption(
-                        "duplicate_event_id",
-                        "duplicate event_id in event log",
-                        line_number=line_number,
-                    )
-                seen_event_ids.add(event_id)
-                idempotency_key = str(row["idempotency_key"])
-                if idempotency_key in seen_idempotency_keys:
-                    raise EventCorruption(
-                        "duplicate_idempotency_key",
-                        "duplicate idempotency key in event log",
-                        line_number=line_number,
-                    )
-                seen_idempotency_keys.add(idempotency_key)
-                seq = int(row["seq"])
-                if seq != expected_seq:
-                    raise EventCorruption(
-                        "non_monotonic_sequence",
-                        "event sequence is not contiguous",
-                        line_number=line_number,
-                    )
-                expected_seq += 1
-                stream_id = str(row["stream_id"])
-                current_version = stream_versions.get(stream_id, 0)
-                if (
-                    int(row["expected_version"]) != current_version
-                    or int(row["stream_version"]) != current_version + 1
-                ):
-                    raise EventCorruption(
-                        "non_monotonic_stream_version",
-                        "stream version is not contiguous",
-                        line_number=line_number,
-                    )
-                stream_versions[stream_id] = int(row["stream_version"])
-                if needs_terminator:
-                    handle.seek(0, os.SEEK_END)
-                    handle.write(b"\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                yield row
+                    yield row
+        finally:
+            os.close(descriptor)
 
-    def _append_bytes(self, payload: bytes) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        existed = self.path.exists()
+    def _append_bytes(self, payload: bytes, *, parent_fd: int) -> None:
+        existed = _regular_stat_at(parent_fd, self.path.name) is not None
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(str(self.path), flags, 0o600)
+        try:
+            fd = os.open(self.path.name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as exc:
+            raise _unsafe_path("event log cannot be opened safely", exc)
         try:
             metadata = os.fstat(fd)
             if not stat.S_ISREG(metadata.st_mode):
-                raise OSError("event store path is not a regular file")
+                raise _unsafe_path("event store path is not a regular file")
             view = memoryview(payload)
             while view:
                 written = os.write(fd, view)
@@ -356,11 +571,7 @@ class JsonlEventStore:
         finally:
             os.close(fd)
         if not existed:
-            directory_fd = os.open(str(self.path.parent), os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(parent_fd)
 
     def append(self, event: Mapping[str, Any]) -> Dict[str, Any]:
         candidate = dict(event)
@@ -378,12 +589,15 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
+        ) as parent_fd:
             by_event_id: Dict[str, Dict[str, Any]] = {}
             by_idempotency_key: Dict[str, Dict[str, Any]] = {}
             stream_versions: Dict[str, int] = {}
             watermark = 0
-            for existing in self._validated_events(recover_tail=True):
+            for existing in self._validated_events(
+                recover_tail=True,
+                parent_fd=parent_fd,
+            ):
                 by_event_id[str(existing["event_id"])] = existing
                 key = str(existing.get("idempotency_key") or "")
                 if key:
@@ -431,7 +645,7 @@ class JsonlEventStore:
             ).encode("utf-8")
             if len(encoded) > self.max_event_bytes:
                 raise ValueError("event exceeds maximum encoded size")
-            self._append_bytes(encoded)
+            self._append_bytes(encoded, parent_fd=parent_fd)
             return stored
 
     def read_all(
@@ -450,8 +664,11 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
-            for row in self._validated_events(recover_tail=False):
+        ) as parent_fd:
+            for row in self._validated_events(
+                recover_tail=False,
+                parent_fd=parent_fd,
+            ):
                 if int(row["seq"]) <= after_seq:
                     continue
                 if len(rows) >= effective_limit:
@@ -478,8 +695,11 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
-            for row in self._validated_events(recover_tail=False):
+        ) as parent_fd:
+            for row in self._validated_events(
+                recover_tail=False,
+                parent_fd=parent_fd,
+            ):
                 if (
                     row["stream_id"] != stream_id
                     or int(row["stream_version"]) <= after_version
@@ -498,8 +718,11 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
-            for row in self._validated_events(recover_tail=False):
+        ) as parent_fd:
+            for row in self._validated_events(
+                recover_tail=False,
+                parent_fd=parent_fd,
+            ):
                 value = int(row["seq"])
         return value
 
@@ -509,8 +732,11 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
-            for row in self._validated_events(recover_tail=False):
+        ) as parent_fd:
+            for row in self._validated_events(
+                recover_tail=False,
+                parent_fd=parent_fd,
+            ):
                 if row["stream_id"] == stream_id:
                     value = int(row["stream_version"])
         return value
@@ -520,11 +746,29 @@ class JsonlEventStore:
             self.lock_path,
             timeout=self.lock_timeout,
             stale_after=self.stale_lock_after,
-        ):
+        ) as parent_fd:
             value = 0
-            for row in self._validated_events(recover_tail=True):
+            for row in self._validated_events(
+                recover_tail=True,
+                parent_fd=parent_fd,
+            ):
                 value = int(row["seq"])
             return value
+
+    def exists(self) -> bool:
+        return safe_regular_exists(self.path)
+
+    def iter_all(self) -> Iterator[Dict[str, Any]]:
+        with _exclusive_lock(
+            self.lock_path,
+            timeout=self.lock_timeout,
+            stale_after=self.stale_lock_after,
+        ) as parent_fd:
+            for row in self._validated_events(
+                recover_tail=False,
+                parent_fd=parent_fd,
+            ):
+                yield row
 
     def rebuild_view(
         self,
