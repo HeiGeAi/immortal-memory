@@ -271,6 +271,61 @@ def test_kernel_lock_is_reacquired_after_holder_process_crashes(tmp_path):
     assert stored["seq"] == 1
 
 
+def test_diagnostic_lock_retries_transient_open_enoent(tmp_path, monkeypatch):
+    import event_store as module
+
+    path = tmp_path / "events.jsonl"
+    lock_name = path.name + ".lock"
+    real_open = module.os.open
+    failures = []
+
+    def fail_first_lock_open(name, flags, *args, **kwargs):
+        if (
+            name == lock_name
+            and flags & module.os.O_CREAT
+            and not failures
+        ):
+            failures.append(name)
+            raise FileNotFoundError(
+                2,
+                "injected transient openat race",
+                name,
+            )
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", fail_first_lock_open)
+
+    stored = JsonlEventStore(path, lock_timeout=0.2).append(event("evt-1"))
+
+    assert failures == [lock_name]
+    assert stored["seq"] == 1
+
+
+def test_diagnostic_lock_persistent_enoent_fails_within_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    path = tmp_path / "events.jsonl"
+    lock_name = path.name + ".lock"
+    real_open = module.os.open
+
+    def fail_lock_open(name, flags, *args, **kwargs):
+        if name == lock_name and flags & module.os.O_CREAT:
+            raise FileNotFoundError(2, "injected persistent ENOENT", name)
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "open", fail_lock_open)
+    started = time.monotonic()
+    with pytest.raises(Exception) as captured:
+        JsonlEventStore(path, lock_timeout=0.03).append(event("evt-1"))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert time.monotonic() - started < 0.5
+    assert not path.exists()
+
+
 def test_same_stream_concurrency_never_silently_loses_a_write(tmp_path):
     path = tmp_path / "events.jsonl"
     JsonlEventStore(path).append(event("evt-created"))

@@ -265,6 +265,14 @@ def _acquire_event_lock(
             flags |= os.O_NOFOLLOW
         try:
             fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+        except FileNotFoundError as exc:
+            if time.monotonic() >= deadline:
+                raise _unsafe_path(
+                    "event lock cannot be opened safely",
+                    exc,
+                )
+            time.sleep(0.002)
+            continue
         except OSError as exc:
             raise _unsafe_path("event lock cannot be opened safely", exc)
         metadata = os.fstat(fd)
