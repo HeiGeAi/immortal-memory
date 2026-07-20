@@ -53,19 +53,27 @@ def _clear_notes_migration_rebuild_marker() -> None:
     manifest = INDEX_FILE.parent / "notes" / "manifest.json"
     if not manifest.is_file():
         return
-    try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError("notes migration manifest is unreadable") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("notes migration manifest is invalid")
-    if not payload.get("index_rebuild_required"):
-        return
-    payload["index_rebuild_required"] = False
-    payload["index_rebuilt_at"] = datetime.now(timezone.utc).isoformat()
-    from notes_transactions import durable_atomic_json
+    with index_lock_pair(
+        INDEX_FILE,
+        DB_FILE,
+        source_exclusive=True,
+        database_exclusive=False,
+    ):
+        if not _is_ready_unlocked(ignore_notes_rebuild_marker=True):
+            return
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("notes migration manifest is unreadable") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("notes migration manifest is invalid")
+        if not payload.get("index_rebuild_required"):
+            return
+        payload["index_rebuild_required"] = False
+        payload["index_rebuilt_at"] = datetime.now(timezone.utc).isoformat()
+        from notes_transactions import durable_atomic_json
 
-    durable_atomic_json(manifest, payload)
+        durable_atomic_json(manifest, payload)
 
 
 # 时间衰减收敛到 ranking_common（单一真源），与 search.py 共用，避免两通道打分口径漂移。
@@ -128,14 +136,16 @@ def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
     if not INDEX_FILE.exists():
         return 0
     from index_integrity import reconcile_index
+    from maintenance_gate import writer_access
 
-    notes_rebuild_required = _notes_migration_requires_rebuild()
-    result = reconcile_index(
-        INDEX_FILE,
-        DB_FILE,
-        force_rebuild=force_rebuild or notes_rebuild_required,
-    )
-    _clear_notes_migration_rebuild_marker()
+    with writer_access(INDEX_FILE.parent):
+        notes_rebuild_required = _notes_migration_requires_rebuild()
+        result = reconcile_index(
+            INDEX_FILE,
+            DB_FILE,
+            force_rebuild=force_rebuild or notes_rebuild_required,
+        )
+        _clear_notes_migration_rebuild_marker()
     if verbose:
         print(
             f"索引同步模式: {result['mode']}，原因: {result['reason']}，"
@@ -163,12 +173,15 @@ def is_ready() -> bool:
         return False
 
 
-def _is_ready_unlocked() -> bool:
+def _is_ready_unlocked(*, ignore_notes_rebuild_marker: bool = False) -> bool:
     """Return trusted index readiness using only source stat and fixed metadata."""
     if (
         not INDEX_FILE.exists()
         or not DB_FILE.exists()
-        or _notes_migration_requires_rebuild()
+        or (
+            not ignore_notes_rebuild_marker
+            and _notes_migration_requires_rebuild()
+        )
     ):
         return False
     con = None
