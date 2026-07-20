@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 CLAIM_STATUSES = frozenset({"candidate", "confirmed", "rejected", "superseded"})
@@ -22,6 +22,7 @@ CLAIM_TYPES = frozenset(
         "style",
         "emotion",
         "request",
+        "external_view",
     }
 )
 ROLE_SCOPES = frozenset(
@@ -88,7 +89,7 @@ DISTINCTIVENESS_LEVELS = frozenset({"high", "medium", "low"})
 JUDGMENT_STATUSES = frozenset({"candidate", "confirmed", "rejected", "retired"})
 OUTCOME_STATUSES = frozenset({"unknown", "positive", "mixed", "negative"})
 CONTEXT_MODES = frozenset(
-    {"advisor", "writer", "reviewer", "business", "project", "custom"}
+    {"auto", "advisor", "writer", "reviewer", "business", "project", "custom"}
 )
 CONTEXT_LIFECYCLE_STATUSES = frozenset(
     {"preview", "compiled", "consumed", "outcome_recorded"}
@@ -106,9 +107,53 @@ CONTEXT_SECTIONS = frozenset(
 )
 CONTEXT_SECTION_ITEM_LIMIT = 20
 CONTEXT_SUMMARY_CHAR_LIMIT = 500
-CONTEXT_RAW_BODY_KEYS = frozenset(
-    {"raw", "raw_body", "raw_content", "private_body", "full_text"}
+CONTEXT_DEFAULT_MAX_BYTES = 96_000
+CONTEXT_ITEM_FIELDS = frozenset(
+    {
+        "kind",
+        "id",
+        "revision",
+        "status",
+        "source_kind",
+        "summary",
+        "privacy",
+        "evidence_ids",
+    }
 )
+CONTEXT_SECTION_CONTRACTS = {
+    "verified_facts": {
+        "kind": frozenset({"claim"}),
+        "status": frozenset({"confirmed"}),
+        "source_kind": frozenset(
+            {"direct", "quoted", "observed", "user_declared"}
+        ),
+    },
+    "confirmed_self_models": {
+        "kind": frozenset({"self_model"}),
+        "status": frozenset({"confirmed"}),
+        "source_kind": frozenset({"self_model"}),
+    },
+    "judgment_cards": {
+        "kind": frozenset({"judgment"}),
+        "status": frozenset({"confirmed"}),
+        "source_kind": frozenset({"judgment"}),
+    },
+    "counter_evidence": {
+        "kind": frozenset({"evidence"}),
+        "status": frozenset({"available"}),
+        "source_kind": frozenset({"counter_evidence"}),
+    },
+    "inferences": {
+        "kind": frozenset({"inference"}),
+        "status": frozenset({"candidate"}),
+        "source_kind": frozenset({"inferred"}),
+    },
+    "unknowns": {
+        "kind": frozenset({"unknown"}),
+        "status": frozenset({"open"}),
+        "source_kind": frozenset({"unknown"}),
+    },
+}
 ADOPTED_STATUSES = frozenset({"yes", "partial", "no", "unknown"})
 RESULT_STATUSES = frozenset({"positive", "mixed", "negative", "unknown"})
 
@@ -334,7 +379,16 @@ def validate_claim(value: Mapping[str, Any]) -> None:
         _require_enum(identity["kind"], kinds, code, field + ".kind")
         _require_text(identity["id"], field + "_id_required", field + ".id")
     basis = _require_mapping(claim["confidence_basis"])
-    _require_fields(basis, ("speaker", "recurrence", "source_quality", "explanation"))
+    _require_fields(
+        basis,
+        (
+            "speaker",
+            "recurrence",
+            "source_quality",
+            "policy_version",
+            "explanation",
+        ),
+    )
     for field in ("speaker", "recurrence", "source_quality"):
         score = basis[field]
         if (
@@ -354,14 +408,35 @@ def validate_claim(value: Mapping[str, Any]) -> None:
             "confidence_explanation_required",
             "positive confidence requires an explanation",
         )
-    if confidence > max(
-        float(basis["speaker"]),
-        float(basis["recurrence"]),
-        float(basis["source_quality"]),
-    ):
+    _require_positive_int(
+        basis["policy_version"],
+        "invalid_confidence_basis",
+        "policy_version",
+    )
+    if basis["policy_version"] != 1:
+        raise ModelValidationError(
+            "unsupported_confidence_policy",
+            "confidence policy version is not supported",
+        )
+    calculated_confidence = (
+        float(basis["speaker"]) * 0.4
+        + float(basis["recurrence"]) * 0.3
+        + float(basis["source_quality"]) * 0.3
+    )
+    if abs(float(confidence) - calculated_confidence) > 1e-9:
         raise ModelValidationError(
             "confidence_basis_inconsistent",
-            "confidence exceeds every supporting basis score",
+            "confidence does not match confidence policy version 1",
+        )
+    if (
+        claim["speaker"]["kind"] == "other"
+        and claim["subject"]["kind"] == "owner"
+        and claim["source_kind"] != "quoted"
+        and claim["claim_type"] != "external_view"
+    ):
+        raise ModelValidationError(
+            "external_view_required",
+            "other speakers can describe the owner only as a quoted external view",
         )
     _require_text_list(claim["role_scope"], "invalid_scope", "role_scope")
     _require_text_list(claim["domain_scope"], "invalid_scope", "domain_scope")
@@ -415,6 +490,16 @@ def new_claim(
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
     generated = now or _now()
+    if (
+        confidence_basis is None
+        and isinstance(confidence, (int, float))
+        and not isinstance(confidence, bool)
+        and 0.0 < confidence <= 1.0
+    ):
+        raise ModelValidationError(
+            "confidence_basis_required",
+            "positive confidence requires explicit policy inputs",
+        )
     resolved_basis = (
         _copy_mapping(
             confidence_basis,
@@ -425,14 +510,9 @@ def new_claim(
         else {
             "speaker": 0.0,
             "recurrence": 0.0,
-            "source_quality": confidence if isinstance(confidence, (int, float)) else 0.0,
-            "explanation": (
-                "confidence bounded by source quality and supplied evidence"
-                if isinstance(confidence, (int, float))
-                and not isinstance(confidence, bool)
-                and confidence > 0
-                else ""
-            ),
+            "source_quality": 0.0,
+            "policy_version": 1,
+            "explanation": "",
         }
     )
     value = {
@@ -470,7 +550,9 @@ def new_claim(
             if domain_scope is not None
             else ["general"]
         ),
-        "custom_scope_ids": _deduplicate(custom_scope_ids or []),
+        "custom_scope_ids": _deduplicate(
+            [] if custom_scope_ids is None else custom_scope_ids
+        ),
         "privacy": privacy,
         "valid_from": None,
         "valid_to": None,
@@ -537,6 +619,32 @@ def validate_event(value: Mapping[str, Any]) -> None:
         "invalid_migration_source",
         "migration_source",
     )
+    if event["event_type"] in {"claim.created", "claim.corrected"}:
+        if event["previous_status"] is not None:
+            raise ModelValidationError(
+                "previous_status_forbidden",
+                "creation events cannot have previous_status",
+            )
+    if event["event_type"] in {
+        "claim.transitioned",
+        "claim.reconsidered",
+        "claim.correction_started",
+    } and event["previous_status"] is None:
+        raise ModelValidationError(
+            "previous_status_required",
+            "claim state changes require previous_status",
+        )
+    if actor["kind"] == "migration":
+        if event["migration_source"] is None:
+            raise ModelValidationError(
+                "migration_source_required",
+                "migration actor requires migration_source",
+            )
+    elif event["migration_source"] is not None:
+        raise ModelValidationError(
+            "migration_source_forbidden",
+            "only migration actors can set migration_source",
+        )
     _parse_timestamp(event["occurred_at"], field="occurred_at")
 
 
@@ -583,7 +691,6 @@ def validate_evidence_ref(value: Mapping[str, Any]) -> None:
         (
             "evidence_id",
             "source",
-            "source_detail",
             "raw_id",
             "content_hash",
             "status",
@@ -593,9 +700,18 @@ def validate_evidence_ref(value: Mapping[str, Any]) -> None:
     )
     _require_text(ref["evidence_id"], "evidence_id_required", "evidence_id")
     _require_enum(ref["source"], EVIDENCE_SOURCES, "invalid_evidence_source", "source")
-    _require_text(
-        ref["source_detail"], "source_detail_required", "source_detail"
-    )
+    source_detail = ref.get("source_detail")
+    if source_detail is not None:
+        _require_text(
+            source_detail,
+            "source_detail_required",
+            "source_detail",
+        )
+    if ref["source"] == "custom" and source_detail is None:
+        raise ModelValidationError(
+            "source_detail_required",
+            "custom evidence requires source_detail",
+        )
     if ref["raw_id"] is not None and not isinstance(ref["raw_id"], str):
         raise ModelValidationError("invalid_raw_id", "raw_id must be text or null")
     _require_hash(ref["content_hash"])
@@ -607,22 +723,31 @@ def validate_evidence_ref(value: Mapping[str, Any]) -> None:
     _require_enum(ref["privacy"], PRIVACY_LEVELS, "invalid_privacy", "privacy")
 
 
-def _canonical_evidence_source(source: Any) -> str:
+def canonical_evidence_source(source: Any) -> Tuple[str, Optional[str]]:
+    """Return the shared canonical source and optional original source detail."""
     _require_text(source, "invalid_evidence_source", "source")
     normalized = source.strip().casefold()
     if normalized in EVIDENCE_SOURCES:
-        return normalized
+        return normalized, None
     if normalized.startswith("codex-"):
-        return "codex"
+        return "codex", normalized
     if normalized.startswith("claude-"):
-        return "claude"
-    if normalized.startswith("feishu-"):
-        return "feishu"
+        return "claude", normalized
+    if (
+        normalized == "lark"
+        or normalized.startswith("feishu-")
+        or normalized.startswith("lark-")
+    ):
+        return "feishu", normalized
     if normalized.startswith("web-"):
-        return "web"
-    if normalized in {"obsidian-note", "desktop-output", "immortal-smoke"}:
-        return "local"
-    return "custom"
+        return "web", normalized
+    if normalized.startswith("local-") or normalized in {
+        "obsidian-note",
+        "desktop-output",
+        "immortal-smoke",
+    }:
+        return "local", normalized
+    return "custom", normalized
 
 
 def new_evidence_ref(
@@ -636,17 +761,21 @@ def new_evidence_ref(
     observed_at: Optional[str] = None,
     source_detail: Optional[str] = None,
 ) -> Dict[str, Any]:
-    canonical_source = _canonical_evidence_source(source)
+    canonical_source, mapped_detail = canonical_evidence_source(source)
+    resolved_detail = (
+        source_detail if source_detail is not None else mapped_detail
+    )
     value = {
         "evidence_id": evidence_id,
         "source": canonical_source,
-        "source_detail": source_detail or source,
         "raw_id": raw_id,
         "content_hash": content_hash,
         "status": status,
         "observed_at": observed_at or _now(),
         "privacy": privacy,
     }
+    if resolved_detail is not None:
+        value["source_detail"] = resolved_detail
     validate_evidence_ref(value)
     return value
 
@@ -690,6 +819,7 @@ def validate_self_model_item(value: Mapping[str, Any]) -> None:
             "status",
             "last_reviewed_at",
             "based_on_claim_seq",
+            "owner_confirmation_ref",
         ),
     )
     if item["schema_version"] != 1:
@@ -725,6 +855,11 @@ def validate_self_model_item(value: Mapping[str, Any]) -> None:
         raise ModelValidationError(
             "self_model_source_required",
             "self model item requires evidence or a claim",
+        )
+    if set(item["evidence_ids"]) & set(item["counter_evidence_ids"]):
+        raise ModelValidationError(
+            "self_model_evidence_conflict",
+            "evidence cannot also be counter evidence",
         )
     confidence = item["confidence"]
     if (
@@ -764,6 +899,32 @@ def validate_self_model_item(value: Mapping[str, Any]) -> None:
     _require_enum(
         item["status"], CLAIM_STATUSES, "invalid_self_model_status", "status"
     )
+    _require_optional_text(
+        item["owner_confirmation_ref"],
+        "invalid_owner_confirmation_ref",
+        "owner_confirmation_ref",
+    )
+    if (
+        item["owner_confirmation_ref"] is not None
+        and not item["owner_confirmation_ref"].startswith("evt_")
+    ):
+        raise ModelValidationError(
+            "invalid_owner_confirmation_ref",
+            "owner confirmation must reference a stable event ID",
+        )
+    if (
+        item["kind"] == "mental_model"
+        and item["status"] == "confirmed"
+        and item["owner_confirmation_ref"] is None
+        and (
+            validation["cross_domain_recurrence"] < 2
+            or validation["generative_power"] != "tested"
+        )
+    ):
+        raise ModelValidationError(
+            "mental_model_confirmation_required",
+            "confirmed mental models require recurrence and tested generative power or owner confirmation",
+        )
     _require_nonnegative_int(
         item["based_on_claim_seq"],
         "invalid_based_on_claim_seq",
@@ -773,8 +934,12 @@ def validate_self_model_item(value: Mapping[str, Any]) -> None:
         item["valid_from"], field="valid_from", nullable=True
     )
     valid_to = _parse_timestamp(item["valid_to"], field="valid_to", nullable=True)
-    _parse_timestamp(item["last_reviewed_at"], field="last_reviewed_at")
+    last_reviewed_at = _parse_timestamp(
+        item["last_reviewed_at"],
+        field="last_reviewed_at",
+    )
     _require_time_order(valid_from, valid_to)
+    _require_time_order(valid_from, last_reviewed_at)
 
 
 def new_self_model_item(
@@ -796,6 +961,7 @@ def new_self_model_item(
     status: str = "candidate",
     last_reviewed_at: Optional[str] = None,
     based_on_claim_seq: int = 0,
+    owner_confirmation_ref: Optional[str] = None,
     now: Optional[str] = None,
 ) -> Dict[str, Any]:
     generated = now or _now()
@@ -808,7 +974,9 @@ def new_self_model_item(
         "summary": summary.strip() if isinstance(summary, str) else summary,
         "evidence_ids": _deduplicate(evidence_ids),
         "claim_ids": _deduplicate(claim_ids),
-        "counter_evidence_ids": _deduplicate(counter_evidence_ids or []),
+        "counter_evidence_ids": _deduplicate(
+            [] if counter_evidence_ids is None else counter_evidence_ids
+        ),
         "confidence": confidence,
         "validation": _copy_mapping(
             validation
@@ -846,6 +1014,7 @@ def new_self_model_item(
         "status": status,
         "last_reviewed_at": last_reviewed_at or generated,
         "based_on_claim_seq": based_on_claim_seq,
+        "owner_confirmation_ref": owner_confirmation_ref,
     }
     validate_self_model_item(value)
     return value
@@ -915,16 +1084,34 @@ def validate_living_self_version(value: Mapping[str, Any]) -> None:
         raise ModelValidationError(
             "invalid_living_self_sections", "Living Self requires exactly eight sections"
         )
+    maximum_item_claim_seq = 0
     for section, items in sections.items():
         _require_list(items, "invalid_living_self_section", section)
         expected_kind = SELF_MODEL_SECTION_KINDS[section]
         for item in items:
             validate_self_model_item(item)
+            maximum_item_claim_seq = max(
+                maximum_item_claim_seq,
+                int(item["based_on_claim_seq"]),
+            )
             if item["kind"] != expected_kind:
                 raise ModelValidationError(
                     "self_model_section_mismatch",
                     "self model item kind does not match section",
                 )
+            if (
+                version["status"] == "confirmed"
+                and item["status"] in {"rejected", "superseded"}
+            ):
+                raise ModelValidationError(
+                    "inactive_self_model_in_confirmed_version",
+                    "confirmed Living Self cannot contain inactive model items",
+                )
+    if version["based_on_claim_seq"] < maximum_item_claim_seq:
+        raise ModelValidationError(
+            "living_self_watermark_behind_item",
+            "Living Self watermark cannot lag an included item",
+        )
     if version["content_hash"] != _content_hash(sections):
         raise ModelValidationError(
             "content_hash_mismatch",
@@ -1020,12 +1207,20 @@ def validate_judgment_card(value: Mapping[str, Any]) -> None:
                 "unknown outcome cannot have observed_at",
             )
     else:
+        _require_text(
+            outcome["summary"],
+            "outcome_summary_required",
+            "outcome.summary",
+        )
         if outcome["observed_at"] is None:
             raise ModelValidationError(
                 "outcome_observed_at_required",
                 "known outcome requires observed_at",
             )
-        _parse_timestamp(outcome["observed_at"], field="outcome.observed_at")
+        observed_at = _parse_timestamp(
+            outcome["observed_at"],
+            field="outcome.observed_at",
+        )
     _require_enum(card["privacy"], PRIVACY_LEVELS, "invalid_privacy", "privacy")
     _require_enum(
         card["status"], JUDGMENT_STATUSES, "invalid_judgment_status", "status"
@@ -1033,6 +1228,9 @@ def validate_judgment_card(value: Mapping[str, Any]) -> None:
     created_at = _parse_timestamp(card["created_at"], field="created_at")
     updated_at = _parse_timestamp(card["updated_at"], field="updated_at")
     _require_time_order(created_at, updated_at)
+    if outcome["status"] != "unknown":
+        _require_time_order(created_at, observed_at)
+        _require_time_order(observed_at, updated_at)
 
 
 def new_judgment_card(
@@ -1070,7 +1268,9 @@ def new_judgment_card(
         "lesson": lesson,
         "next_trigger": next_trigger,
         "evidence_ids": _deduplicate(evidence_ids),
-        "claim_ids": _deduplicate(claim_ids or []),
+        "claim_ids": _deduplicate(
+            [] if claim_ids is None else claim_ids
+        ),
         "privacy": privacy,
         "status": status,
         "created_at": generated,
@@ -1080,39 +1280,89 @@ def new_judgment_card(
     return value
 
 
-def _context_text_chars(value: Any) -> int:
-    if isinstance(value, str):
-        return len(value)
-    if isinstance(value, Mapping):
-        return sum(_context_text_chars(item) for item in value.values())
-    if isinstance(value, list):
-        return sum(_context_text_chars(item) for item in value)
-    return 0
+def _context_serialized_size(value: Any) -> tuple:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return len(encoded), len(encoded.encode("utf-8"))
 
 
-def _validate_context_item(value: Any) -> None:
+def _validate_context_item(section: str, value: Any) -> None:
     item = _require_mapping(value)
-    if item.get("privacy") == "private":
+    if set(item) != CONTEXT_ITEM_FIELDS:
+        raise ModelValidationError(
+            "invalid_context_item_fields",
+            "context items must use the closed safe projection schema",
+        )
+    _require_text(item["id"], "invalid_context_item_contract", "id")
+    _require_positive_int(
+        item["revision"],
+        "invalid_context_item_contract",
+        "revision",
+    )
+    _require_text(
+        item["summary"],
+        "invalid_context_summary",
+        "summary",
+    )
+    if len(item["summary"]) > CONTEXT_SUMMARY_CHAR_LIMIT:
+        raise ModelValidationError(
+            "context_summary_limit",
+            "context summary exceeds the character limit",
+        )
+    _require_enum(
+        item["privacy"],
+        PRIVACY_LEVELS,
+        "invalid_context_privacy",
+        "privacy",
+    )
+    if item["privacy"] == "private":
         raise ModelValidationError(
             "private_context_item_forbidden",
             "private items cannot enter a Context Pack",
         )
-    if any(key in item for key in CONTEXT_RAW_BODY_KEYS):
-        raise ModelValidationError(
-            "private_context_item_forbidden",
-            "raw bodies cannot enter a Context Pack",
+    _require_text_list(
+        item["evidence_ids"],
+        "invalid_context_item_contract",
+        "evidence_ids",
+    )
+    contract = CONTEXT_SECTION_CONTRACTS[section]
+    for field in ("kind", "status", "source_kind"):
+        _require_enum(
+            item[field],
+            contract[field],
+            "invalid_context_item_contract",
+            field,
         )
-    summary = item.get("summary")
-    if summary is not None:
-        if not isinstance(summary, str):
+    if section != "unknowns" and not item["evidence_ids"]:
+        raise ModelValidationError(
+            "invalid_context_item_contract",
+            "context item requires evidence",
+        )
+
+
+def _validate_context_sections(
+    value: Any,
+) -> Mapping[str, Any]:
+    sections = _require_mapping(value)
+    if set(sections) != CONTEXT_SECTIONS:
+        raise ModelValidationError(
+            "invalid_context_sections",
+            "context requires exactly six sections",
+        )
+    for section, items in sections.items():
+        _require_list(items, "invalid_context_section", section)
+        if len(items) > CONTEXT_SECTION_ITEM_LIMIT:
             raise ModelValidationError(
-                "invalid_context_summary", "context summary must be text"
+                "context_section_item_limit",
+                "context section exceeds its item limit",
             )
-        if len(summary) > CONTEXT_SUMMARY_CHAR_LIMIT:
-            raise ModelValidationError(
-                "context_summary_limit",
-                "context summary exceeds the character limit",
-            )
+        for item in items:
+            _validate_context_item(section, item)
+    return sections
 
 
 def _copy_context_sections(
@@ -1153,6 +1403,11 @@ def validate_context_pack(value: Mapping[str, Any]) -> None:
     _require_text(pack["context_id"], "context_id_required", "context_id")
     _require_text(pack["task"], "task_required", "task")
     _require_enum(pack["mode"], CONTEXT_MODES, "invalid_context_mode", "mode")
+    if pack["mode"] == "auto" and pack["lifecycle_status"] != "preview":
+        raise ModelValidationError(
+            "auto_context_mode_requires_preview",
+            "auto mode must be resolved before Context compilation",
+        )
     _require_enum(
         pack["lifecycle_status"],
         CONTEXT_LIFECYCLE_STATUSES,
@@ -1166,34 +1421,38 @@ def validate_context_pack(value: Mapping[str, Any]) -> None:
         "availability_status",
     )
     budget = _require_mapping(pack["budget"])
-    _require_fields(budget, ("max_chars", "used_chars"))
+    _require_fields(
+        budget,
+        ("max_chars", "used_chars", "max_bytes", "used_bytes"),
+    )
     _require_positive_int(budget["max_chars"], "invalid_context_budget", "max_chars")
+    _require_positive_int(budget["max_bytes"], "invalid_context_budget", "max_bytes")
     _require_nonnegative_int(
         budget["used_chars"], "invalid_context_budget", "used_chars"
+    )
+    _require_nonnegative_int(
+        budget["used_bytes"], "invalid_context_budget", "used_bytes"
     )
     if budget["used_chars"] > budget["max_chars"]:
         raise ModelValidationError(
             "context_budget_exceeded", "used chars exceeds context budget"
         )
-    sections = _require_mapping(pack["sections"])
-    if set(sections) != CONTEXT_SECTIONS:
+    if budget["used_bytes"] > budget["max_bytes"]:
         raise ModelValidationError(
-            "invalid_context_sections", "context requires exactly six sections"
+            "context_byte_budget_exceeded",
+            "structured Context Pack exceeds its byte budget",
         )
-    for section, items in sections.items():
-        _require_list(items, "invalid_context_section", section)
-        if len(items) > CONTEXT_SECTION_ITEM_LIMIT:
-            raise ModelValidationError(
-                "context_section_item_limit",
-                "context section exceeds its item limit",
-            )
-        for item in items:
-            _validate_context_item(item)
-    actual_used_chars = _context_text_chars(sections)
+    sections = _validate_context_sections(pack["sections"])
+    actual_used_chars, actual_used_bytes = _context_serialized_size(sections)
     if budget["used_chars"] != actual_used_chars:
         raise ModelValidationError(
             "context_used_chars_mismatch",
             "used_chars does not match the structured Context Pack content",
+        )
+    if budget["used_bytes"] != actual_used_bytes:
+        raise ModelValidationError(
+            "context_used_bytes_mismatch",
+            "used_bytes does not match the structured Context Pack content",
         )
     provenance = _require_mapping(pack["provenance"])
     provenance_fields = (
@@ -1279,6 +1538,7 @@ def new_context_pack(
     lifecycle_status: str = "preview",
     availability_status: str = "active",
     max_chars: int = 24000,
+    max_bytes: int = CONTEXT_DEFAULT_MAX_BYTES,
     claims_event_seq: int = 0,
     judgments_event_seq: int = 0,
     compiler_version: str = "1.1.0",
@@ -1301,6 +1561,8 @@ def new_context_pack(
         if sections is not None
         else {name: [] for name in sorted(CONTEXT_SECTIONS)}
     )
+    _validate_context_sections(copied_sections)
+    used_chars, used_bytes = _context_serialized_size(copied_sections)
     value = {
         "context_id": _identifier("ctx_"),
         "task": task.strip() if isinstance(task, str) else task,
@@ -1309,7 +1571,9 @@ def new_context_pack(
         "availability_status": availability_status,
         "budget": {
             "max_chars": max_chars,
-            "used_chars": _context_text_chars(copied_sections),
+            "used_chars": used_chars,
+            "max_bytes": max_bytes,
+            "used_bytes": used_bytes,
         },
         "sections": copied_sections,
         "provenance": {
@@ -1375,6 +1639,15 @@ def validate_outcome_event(value: Mapping[str, Any]) -> None:
         _require_list(outcome[field], "invalid_typed_refs", field)
         for ref in outcome[field]:
             validate_typed_ref(ref)
+        identities = [
+            (ref["kind"], ref["id"], ref["revision"])
+            for ref in outcome[field]
+        ]
+        if len(identities) != len(set(identities)):
+            raise ModelValidationError(
+                "duplicate_outcome_ref",
+                field + " cannot contain duplicate refs",
+            )
     confirmed = {
         (ref["kind"], ref["id"], ref["revision"])
         for ref in outcome["confirmed_refs"]
@@ -1387,6 +1660,20 @@ def validate_outcome_event(value: Mapping[str, Any]) -> None:
         raise ModelValidationError(
             "outcome_ref_conflict",
             "the same ref cannot be both confirmed and challenged",
+        )
+    if outcome["adopted"] == "unknown" and outcome["result"] != "unknown":
+        raise ModelValidationError(
+            "invalid_outcome_combination",
+            "a known result requires a known adoption status",
+        )
+    if (
+        outcome["adopted"] != "unknown"
+        or outcome["result"] != "unknown"
+    ):
+        _require_text(
+            outcome["summary"],
+            "outcome_summary_required",
+            "summary",
         )
     _require_text(outcome["created_at"], "created_at_required", "created_at")
     _parse_timestamp(outcome["created_at"], field="created_at")
@@ -1409,12 +1696,12 @@ def new_outcome_event(
         "result": result,
         "summary": summary,
         "confirmed_refs": _copy_mapping_list(
-            confirmed_refs or [],
+            [] if confirmed_refs is None else confirmed_refs,
             "invalid_typed_refs",
             "confirmed_refs",
         ),
         "challenged_refs": _copy_mapping_list(
-            challenged_refs or [],
+            [] if challenged_refs is None else challenged_refs,
             "invalid_typed_refs",
             "challenged_refs",
         ),

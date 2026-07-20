@@ -16,6 +16,13 @@ def claim(claim_id: str = "clm-1", statement: str = "先给结论") -> dict:
         source_kind="direct",
         evidence_ids=["ev-1"],
         confidence=0.8,
+        confidence_basis={
+            "speaker": 0.8,
+            "recurrence": 0.8,
+            "source_quality": 0.8,
+            "policy_version": 1,
+            "explanation": "weighted policy inputs verified by the test fixture",
+        },
         role_scope=["work"],
         domain_scope=["content"],
         privacy="context_safe",
