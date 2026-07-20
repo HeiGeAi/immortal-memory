@@ -46,6 +46,7 @@ from export_restore import (
 )
 from index_writer import append_jsonl_records
 from maintenance_gate import writer_access
+from model_migration import MigrationError, migrate_legacy_profile
 from state_store import mutate_state_atomic, update_state_atomic
 
 
@@ -1852,6 +1853,46 @@ def command_restore_check(args) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_claims_migrate(args) -> int:
+    vault = Path(args.vault_dir).expanduser() if args.vault_dir else IMMORTAL_DIR
+    try:
+        report = migrate_legacy_profile(
+            vault,
+            dry_run=bool(args.dry_run),
+            checkpoint_every=args.checkpoint_every,
+        )
+    except MigrationError as exc:
+        report = {
+            "ok": False,
+            "error_code": exc.code,
+            "message": str(exc),
+            "vault_dir": str(vault),
+            "dry_run": bool(args.dry_run),
+        }
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        else:
+            print("Immortal Claims Migration")
+            print()
+            print("Status: FAIL")
+            print("Error: " + exc.code)
+            print("Detail: " + str(exc))
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    else:
+        print("Immortal Claims Migration")
+        print()
+        print("Status: OK")
+        print("Mode: " + ("dry-run" if report["dry_run"] else "write"))
+        print("Created: " + str(report["created"]))
+        print("Skipped: " + str(report["skipped"]))
+        print("Excluded: " + str(report["excluded"]))
+        print("Source broken: " + str(report["source_broken"]))
+        print("Confirmed: 0")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="immortal", description="Codex entry for the Immortal Skill")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1937,6 +1978,20 @@ def build_parser() -> argparse.ArgumentParser:
     migration_preflight.add_argument("--max-age-hours", type=float, default=168)
     migration_preflight.add_argument("--json", action="store_true")
     migration_preflight.set_defaults(func=command_migration_preflight)
+
+    claims_migrate = sub.add_parser(
+        "claims-migrate",
+        help="Migrate legacy reviewed profile candidates into v1.1 Claims",
+    )
+    claims_migrate.add_argument("--vault-dir", default=None)
+    claims_migrate.add_argument("--dry-run", action="store_true")
+    claims_migrate.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+    )
+    claims_migrate.add_argument("--json", action="store_true")
+    claims_migrate.set_defaults(func=command_claims_migrate)
 
     restore = sub.add_parser("restore-check", help="Verify an exported backup before restore")
     restore.add_argument("export_path")

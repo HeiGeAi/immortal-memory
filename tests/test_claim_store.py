@@ -222,6 +222,93 @@ def test_unsupported_actor_kind_raises_stable_invalid_transition(tmp_path):
     assert captured.value.code == "invalid_actor"
 
 
+def test_migration_create_accepts_deterministic_event_metadata(tmp_path):
+    store = ClaimStore(tmp_path)
+    value = claim("clm-migrate")
+    metadata = {
+        "expected_revision": 0,
+        "request_id": "req-migrate-clm-migrate",
+        "idempotency_key": "idem-migrate-clm-migrate",
+        "actor": {"kind": "migration", "id": "legacy-profile-v1"},
+        "reason": "legacy profile candidate migration",
+        "event_id": "evt_migrate_clm_migrate",
+        "migration_source": "reviewed/profile_memories.jsonl",
+    }
+
+    first = store.create(value, **metadata)
+    second = store.create(value, **metadata)
+
+    assert first == second
+    event = list(store.events.iter_all())[0]
+    assert event["event_id"] == "evt_migrate_clm_migrate"
+    assert event["migration_source"] == "reviewed/profile_memories.jsonl"
+    assert len(list(store.events.iter_all())) == 1
+
+
+@pytest.mark.parametrize(
+    ("event_id", "migration_source"),
+    [
+        ("evt_migrate_changed", "reviewed/profile_memories.jsonl"),
+        ("evt_migrate_clm_migrate", "profile_nuwa.json"),
+    ],
+)
+def test_migration_idempotency_binds_event_id_and_source(
+    tmp_path,
+    event_id,
+    migration_source,
+):
+    store = ClaimStore(tmp_path)
+    value = claim("clm-migrate")
+    metadata = {
+        "expected_revision": 0,
+        "request_id": "req-migrate-clm-migrate",
+        "idempotency_key": "idem-migrate-clm-migrate",
+        "actor": {"kind": "migration", "id": "legacy-profile-v1"},
+        "reason": "legacy profile candidate migration",
+        "event_id": "evt_migrate_clm_migrate",
+        "migration_source": "reviewed/profile_memories.jsonl",
+    }
+    store.create(value, **metadata)
+    metadata["event_id"] = event_id
+    metadata["migration_source"] = migration_source
+
+    with pytest.raises(InvalidTransition) as captured:
+        store.create(value, **metadata)
+
+    assert captured.value.code == "idempotency_conflict"
+    assert len(list(store.events.iter_all())) == 1
+
+
+@pytest.mark.parametrize(
+    ("actor", "migration_source"),
+    [
+        ({"kind": "migration", "id": "legacy-profile-v1"}, None),
+        ({"kind": "owner", "id": "owner"}, "reviewed/profile_memories.jsonl"),
+    ],
+)
+def test_create_rejects_migration_actor_source_mismatch(
+    tmp_path,
+    actor,
+    migration_source,
+):
+    store = ClaimStore(tmp_path)
+
+    with pytest.raises(InvalidTransition) as captured:
+        store.create(
+            claim("clm-invalid-migration"),
+            expected_revision=0,
+            request_id="req-invalid-migration",
+            idempotency_key="idem-invalid-migration",
+            actor=actor,
+            reason="invalid migration metadata",
+            event_id="evt_invalid_migration",
+            migration_source=migration_source,
+        )
+
+    assert captured.value.code == "invalid_migration_source"
+    assert not store.events.exists()
+
+
 def test_explicit_state_machine_accepts_only_declared_transitions(tmp_path):
     store = ClaimStore(tmp_path)
     create(store, claim())

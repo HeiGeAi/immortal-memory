@@ -129,6 +129,36 @@ class ClaimStore:
         return PUBLIC_IDEMPOTENCY_PREFIX + _key_digest(value)
 
     @staticmethod
+    def _validate_migration_metadata(
+        *,
+        actor: Mapping[str, str],
+        event_id: Optional[str],
+        migration_source: Optional[str],
+    ) -> Tuple[Optional[str], Optional[str]]:
+        if event_id is not None and (
+            not isinstance(event_id, str) or not event_id.strip()
+        ):
+            raise InvalidTransition(
+                "invalid_event_id",
+                "event ID must be a non-empty string when provided",
+            )
+        if actor["kind"] == "migration":
+            if (
+                not isinstance(migration_source, str)
+                or not migration_source.strip()
+            ):
+                raise InvalidTransition(
+                    "invalid_migration_source",
+                    "migration actor requires a migration source",
+                )
+        elif migration_source is not None:
+            raise InvalidTransition(
+                "invalid_migration_source",
+                "only migration actors may provide a migration source",
+            )
+        return event_id, migration_source
+
+    @staticmethod
     def _internal_replacement_key(started: Mapping[str, Any]) -> str:
         return (
             INTERNAL_IDEMPOTENCY_PREFIX
@@ -551,6 +581,8 @@ class ClaimStore:
         reason: str,
         previous_status: Optional[str],
         extra_payload: Optional[Mapping[str, Any]] = None,
+        event_id: Optional[str] = None,
+        migration_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         payload = {
             "claim": dict(claim),
@@ -560,6 +592,7 @@ class ClaimStore:
         if extra_payload:
             payload.update(extra_payload)
         event = new_event(
+            event_id=event_id,
             event_type=event_type,
             stream_id=str(claim["claim_id"]),
             stream_version=expected_version + 1,
@@ -569,6 +602,7 @@ class ClaimStore:
             actor=actor,
             payload=payload,
             previous_status=previous_status,
+            migration_source=migration_source,
         )
         try:
             return self.events.append(event)
@@ -588,6 +622,8 @@ class ClaimStore:
         idempotency_key: str,
         actor: Mapping[str, str],
         reason: str,
+        event_id: Optional[str] = None,
+        migration_source: Optional[str] = None,
     ) -> Dict[str, Any]:
         actor_value = self._validate_write_metadata(
             expected_revision=expected_revision,
@@ -595,6 +631,11 @@ class ClaimStore:
             idempotency_key=idempotency_key,
             actor=actor,
             reason=reason,
+        )
+        event_id, migration_source = self._validate_migration_metadata(
+            actor=actor_value,
+            event_id=event_id,
+            migration_source=migration_source,
         )
         if not isinstance(claim, Mapping):
             raise InvalidTransition(
@@ -628,6 +669,10 @@ class ClaimStore:
             "method": "create",
             "reason": reason,
         }
+        if event_id is not None:
+            operation["event_id"] = event_id
+        if migration_source is not None:
+            operation["migration_source"] = migration_source
         previous = self._find_public_idempotent(idempotency_key, operation)
         if previous is not None:
             return self._return_projected(previous)
@@ -645,6 +690,8 @@ class ClaimStore:
             actor=actor_value,
             reason=reason,
             previous_status=None,
+            event_id=event_id,
+            migration_source=migration_source,
         )
         return self._return_projected(event)
 
