@@ -44,6 +44,55 @@ def append_in_process(path: str, event_id: str, stream_id: str) -> None:
     )
 
 
+def enter_event_lock_in_process(
+    path,
+    role,
+    active,
+    maximum,
+    counter_lock,
+    first_owner_entered,
+):
+    import event_store as module
+
+    with module._exclusive_lock(
+        Path(path),
+        timeout=2.0,
+        stale_after=0.0,
+    ):
+        with counter_lock:
+            active.value += 1
+            maximum.value = max(maximum.value, active.value)
+        if role == "a":
+            first_owner_entered.set()
+        time.sleep(0.2)
+        with counter_lock:
+            active.value -= 1
+
+
+def hold_event_lock_in_process(path, ready, release):
+    import event_store as module
+
+    with module._exclusive_lock(
+        Path(path),
+        timeout=2.0,
+        stale_after=0.0,
+    ):
+        ready.set()
+        release.wait(timeout=10)
+
+
+def crash_while_holding_event_lock(path, ready):
+    import event_store as module
+
+    with module._exclusive_lock(
+        Path(path),
+        timeout=2.0,
+        stale_after=0.0,
+    ):
+        ready.set()
+        os._exit(0)
+
+
 def test_append_assigns_sequence_and_tracks_stream_and_global_watermarks(tmp_path):
     store = JsonlEventStore(tmp_path / "events.jsonl")
 
@@ -128,13 +177,18 @@ def test_process_concurrent_appends_do_not_lose_events(tmp_path):
     assert sorted(row["seq"] for row in rows) == list(range(1, 9))
 
 
-def test_live_process_lock_is_never_stolen_only_because_it_is_old(tmp_path):
+def test_live_kernel_lock_is_never_stolen_only_because_file_is_old(tmp_path):
     path = tmp_path / "events.jsonl"
     lock_path = path.with_name(path.name + ".lock")
-    lock_path.write_text(
-        json.dumps({"pid": os.getpid(), "created_at": 0}),
-        encoding="utf-8",
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_event_lock_in_process,
+        args=(str(lock_path), ready, release),
     )
+    holder.start()
+    assert ready.wait(timeout=5)
     old = time.time() - 3600
     os.utime(lock_path, (old, old))
     store = JsonlEventStore(
@@ -146,6 +200,9 @@ def test_live_process_lock_is_never_stolen_only_because_it_is_old(tmp_path):
     with pytest.raises(TimeoutError):
         store.append(event("evt-1"))
 
+    release.set()
+    holder.join(timeout=10)
+    assert holder.exitcode == 0
     assert lock_path.exists()
     assert not path.exists()
 
@@ -155,16 +212,28 @@ def test_replay_waits_for_the_process_lock_instead_of_reading_a_transient_tail(
 ):
     path = tmp_path / "events.jsonl"
     lock_path = path.with_name(path.name + ".lock")
-    lock_path.write_text(
-        json.dumps({"pid": os.getpid(), "created_at": time.time()}),
-        encoding="utf-8",
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=hold_event_lock_in_process,
+        args=(str(lock_path), ready, release),
     )
+    holder.start()
+    assert ready.wait(timeout=5)
 
     with pytest.raises(TimeoutError):
         JsonlEventStore(path, lock_timeout=0.05).read_all()
 
+    release.set()
+    holder.join(timeout=10)
+    assert holder.exitcode == 0
 
-def test_lock_durability_failure_cleans_up_its_lock_file(tmp_path, monkeypatch):
+
+def test_lock_durability_failure_leaves_reusable_persistent_lock(
+    tmp_path,
+    monkeypatch,
+):
     import event_store as module
 
     path = tmp_path / "events.jsonl"
@@ -172,13 +241,33 @@ def test_lock_durability_failure_cleans_up_its_lock_file(tmp_path, monkeypatch):
     def fail_fsync(_fd: int) -> None:
         raise OSError("fsync failed")
 
-    monkeypatch.setattr(module.os, "fsync", fail_fsync)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module.os, "fsync", fail_fsync)
+        with pytest.raises(OSError, match="fsync failed"):
+            JsonlEventStore(path).append(event("evt-1"))
 
-    with pytest.raises(OSError, match="fsync failed"):
-        JsonlEventStore(path).append(event("evt-1"))
-
-    assert not path.with_name(path.name + ".lock").exists()
+    assert path.with_name(path.name + ".lock").is_file()
     assert not path.exists()
+    assert JsonlEventStore(path).append(event("evt-retry"))["seq"] == 1
+
+
+def test_kernel_lock_is_reacquired_after_holder_process_crashes(tmp_path):
+    path = tmp_path / "events.jsonl"
+    lock_path = path.with_name(path.name + ".lock")
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    holder = context.Process(
+        target=crash_while_holding_event_lock,
+        args=(str(lock_path), ready),
+    )
+
+    holder.start()
+    assert ready.wait(timeout=5)
+    holder.join(timeout=10)
+
+    assert holder.exitcode == 0
+    stored = JsonlEventStore(path).append(event("evt-after-crash"))
+    assert stored["seq"] == 1
 
 
 def test_same_stream_concurrency_never_silently_loses_a_write(tmp_path):
@@ -317,6 +406,138 @@ def test_lock_replacement_is_not_unlinked_by_previous_owner(tmp_path):
 
     assert getattr(captured.value, "code", None) == "unsafe_path"
     assert lock_path.read_text(encoding="utf-8") == "replacement"
+
+
+def test_append_rejects_event_file_replaced_after_validation_and_can_retry(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "events.jsonl"
+    moved = tmp_path / "validated.jsonl"
+    store = JsonlEventStore(path)
+    store.append(event("evt-1"))
+    before = path.read_bytes()
+    real_append = store._append_bytes
+
+    def replace_then_append(payload, **kwargs):
+        path.rename(moved)
+        path.write_bytes(b"")
+        return real_append(payload, **kwargs)
+
+    monkeypatch.setattr(store, "_append_bytes", replace_then_append)
+
+    with pytest.raises(Exception) as captured:
+        store.append(event("evt-2", expected_version=1))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert moved.read_bytes() == before
+    assert path.read_bytes() == b""
+
+    monkeypatch.setattr(store, "_append_bytes", real_append)
+    path.unlink()
+    moved.rename(path)
+    retried = store.append(event("evt-2", expected_version=1))
+    assert retried["seq"] == 2
+
+
+def test_append_rejects_public_parent_replaced_after_validation_and_can_retry(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "vault"
+    moved_parent = tmp_path / "validated-vault"
+    path = parent / "events.jsonl"
+    store = JsonlEventStore(path)
+    store.append(event("evt-1"))
+    before = path.read_bytes()
+    real_append = store._append_bytes
+
+    def replace_parent_then_append(payload, **kwargs):
+        parent.rename(moved_parent)
+        parent.mkdir()
+        return real_append(payload, **kwargs)
+
+    monkeypatch.setattr(store, "_append_bytes", replace_parent_then_append)
+
+    with pytest.raises(Exception) as captured:
+        store.append(event("evt-2", expected_version=1))
+
+    assert getattr(captured.value, "code", None) == "unsafe_path"
+    assert (moved_parent / "events.jsonl").read_bytes() == before
+    assert not (parent / "events.jsonl").exists()
+
+    monkeypatch.setattr(store, "_append_bytes", real_append)
+    parent.rmdir()
+    moved_parent.rename(parent)
+    retried = store.append(event("evt-2", expected_version=1))
+    assert retried["seq"] == 2
+
+
+def test_two_processes_cannot_enter_while_reclaiming_the_same_old_lock(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    context = multiprocessing.get_context("fork")
+    lock_path = tmp_path / "events.jsonl.lock"
+    lock_path.write_text(
+        json.dumps({"pid": 99999999, "created_at": 0}),
+        encoding="utf-8",
+    )
+    old_checked = context.Event()
+    first_owner_entered = context.Event()
+    active = context.Value("i", 0)
+    maximum = context.Value("i", 0)
+    counter_lock = context.Lock()
+
+    def controlled_reclaim(_parent_fd, _name, _stale_after):
+        if multiprocessing.current_process().name == "reclaimer-b":
+            old_checked.set()
+            assert first_owner_entered.wait(timeout=5)
+            return True
+        assert old_checked.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(
+        module,
+        "_lock_is_reclaimable",
+        controlled_reclaim,
+        raising=False,
+    )
+    second = context.Process(
+        name="reclaimer-b",
+        target=enter_event_lock_in_process,
+        args=(
+            str(lock_path),
+            "b",
+            active,
+            maximum,
+            counter_lock,
+            first_owner_entered,
+        ),
+    )
+    first = context.Process(
+        name="reclaimer-a",
+        target=enter_event_lock_in_process,
+        args=(
+            str(lock_path),
+            "a",
+            active,
+            maximum,
+            counter_lock,
+            first_owner_entered,
+        ),
+    )
+
+    second.start()
+    first.start()
+    second.join(timeout=10)
+    first.join(timeout=10)
+
+    assert second.exitcode == 0
+    assert first.exitcode == 0
+    assert maximum.value == 1
 
 
 def test_partial_tail_is_reported_then_recovered_before_next_append(tmp_path):
