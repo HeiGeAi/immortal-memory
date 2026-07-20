@@ -2,32 +2,37 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 
 import pytest
 
-from attribution_service import AttributionService
+from attribution_service import (
+    AttributionService,
+    EvidenceCatalogClaimResolver,
+)
+from evidence_catalog import EvidenceCatalog
 from model_types import new_claim
 import profile_attribution_audit
 
 
-def claim_fingerprint(content):
+def content_hash(content):
     normalized = " ".join(content.split())
     return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class EvidenceResolver:
     def __init__(self, content, refs, *, error=None):
-        self.expected_fingerprint = claim_fingerprint(content)
+        self.expected_content = " ".join(content.split())
         self.refs = refs
         self.error = error
 
-    def resolve_for_claim(self, evidence_id, fingerprint):
+    def resolve_for_claim(self, evidence_id, normalized_claim):
         if self.error is not None:
             raise self.error
-        if fingerprint != self.expected_fingerprint:
+        if normalized_claim != self.expected_content:
             raise LookupError("unrelated claim")
         ref = dict(self.refs[evidence_id])
-        ref["claim_fingerprint"] = self.expected_fingerprint
+        ref["content_hash"] = content_hash(self.expected_content)
         return ref
 
 
@@ -205,6 +210,32 @@ def test_common_third_party_restatements_fail_closed_as_quoted(content):
     assert result["source_kind"] == "quoted"
     assert result["auto_confirm_allowed"] is False
     assert "third_party_quote" in result["trust_flags"]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "产品经理说，这个需求不该上线",
+        "老板认为黑哥需要调整方向",
+        "我的同事A说，黑哥做事太激进",
+        "妈妈说，这个决定应该再考虑",
+    ],
+)
+def test_common_chinese_third_party_subjects_are_quoted(content):
+    service = AttributionService(owner_aliases={"owner", "黑哥"})
+    result = service.classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+        }
+    )
+
+    assert result["speaker"]["kind"] == "other"
+    assert result["claim_type"] == "external_view"
+    assert result["source_kind"] == "quoted"
+    assert result["auto_confirm_allowed"] is False
 
 
 @pytest.mark.parametrize(
@@ -425,6 +456,144 @@ def test_recurrence_fails_closed_without_authoritative_resolver():
     assert result["confidence_basis"]["recurrence"] == 0.0
     assert result["auto_confirm_allowed"] is False
     assert "recurrence_unverified" in result["trust_flags"]
+
+
+def test_real_catalog_resolver_binds_authoritative_content_and_time(tmp_path):
+    content = "我一直偏好先验证再发布。"
+    index = tmp_path / "index.jsonl"
+    index.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": f"ev_{number}",
+                    "source": "codex-conversation",
+                    "timestamp": f"2026-07-0{number}T00:00:00Z",
+                    "content": content,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            for number in range(1, 4)
+        ),
+        encoding="utf-8",
+    )
+    resolver = EvidenceCatalogClaimResolver(EvidenceCatalog(index))
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": f"ev_{number}", "observed_at": "1999-01-01T00:00:00Z"}
+                for number in range(1, 4)
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 1.0
+    assert result["auto_confirm_allowed"] is True
+
+
+def test_real_catalog_resolver_rejects_unrelated_authoritative_content(tmp_path):
+    index = tmp_path / "index.jsonl"
+    index.write_text(
+        json.dumps(
+            {
+                "id": "ev_1",
+                "source": "codex-conversation",
+                "timestamp": "2026-07-01T00:00:00Z",
+                "content": "完全无关的原始内容",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=EvidenceCatalogClaimResolver(EvidenceCatalog(index)),
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": "我一直偏好先验证再发布。",
+            "source": "codex",
+            "recurrence_evidence": [{"evidence_id": "ev_1"}],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+    assert "recurrence_unverified" in result["trust_flags"]
+
+
+def test_future_authoritative_evidence_is_rejected():
+    content = "我一直偏好先验证再发布。"
+    resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-21T00:00:00Z"),
+            ("ev_2", "2026-07-22T00:00:00Z"),
+            ("ev_3", "2026-07-23T00:00:00Z"),
+        ),
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": f"ev_{number}"}
+                for number in range(1, 4)
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
+    assert "recurrence_unverified" in result["trust_flags"]
+
+
+def test_same_absolute_instant_with_different_timezones_is_one_occurrence():
+    content = "我一直偏好先验证再发布。"
+    resolver = EvidenceResolver(
+        content,
+        available_refs(
+            ("ev_1", "2026-07-01T08:00:00+08:00"),
+            ("ev_2", "2026-07-01T00:00:00Z"),
+            ("ev_3", "2026-06-30T20:00:00-04:00"),
+        ),
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": f"ev_{number}"}
+                for number in range(1, 4)
+            ],
+        }
+    )
+
+    assert result["confidence_basis"]["recurrence"] == 0.0
+    assert result["auto_confirm_allowed"] is False
 
 
 @pytest.mark.parametrize(
@@ -830,6 +999,8 @@ def test_profile_audit_writes_safe_latest_report_without_raw_examples(tmp_path):
             str(distilled),
             "--records",
             str(records),
+            "--evidence-index",
+            str(tmp_path / "missing-index.jsonl"),
             "--report-dir",
             str(report_dir),
             "--trust-report",
@@ -852,3 +1023,94 @@ def test_profile_audit_writes_safe_latest_report_without_raw_examples(tmp_path):
     assert secret not in encoded
     assert "私密原文" not in encoded
     assert trust_report.stat().st_size < 64_000
+
+
+def test_profile_audit_injects_real_catalog_resolver(tmp_path):
+    content = "我一直偏好先验证再发布。"
+    reviewed = tmp_path / "reviewed.jsonl"
+    reviewed_md = tmp_path / "reviewed.md"
+    distilled = tmp_path / "distilled.jsonl"
+    records = tmp_path / "records.jsonl"
+    evidence_index = tmp_path / "index.jsonl"
+    report_dir = tmp_path / "quality"
+    trust_report = tmp_path / "model" / "attribution" / "latest-report.json"
+    reviewed.write_text(
+        json.dumps(
+            {
+                "memory_id": "mem-1",
+                "statement": content,
+                "focus": "self_profile",
+                "recurrence_evidence": [
+                    {"evidence_id": f"ev_{number}", "observed_at": "2099-01-01T00:00:00Z"}
+                    for number in range(1, 4)
+                ],
+                "source": {
+                    "clean_id": "clean-1",
+                    "source": "feishu-im",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reviewed_md.write_text("", encoding="utf-8")
+    distilled.write_text("", encoding="utf-8")
+    records.write_text(
+        json.dumps(
+            {
+                "clean_id": "clean-1",
+                "actor": "owner",
+                "source": "feishu-im",
+                "text": content,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence_index.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "id": f"ev_{number}",
+                    "source": "feishu-im",
+                    "timestamp": f"2026-07-0{number}T00:00:00Z",
+                    "content": content,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+            for number in range(1, 4)
+        ),
+        encoding="utf-8",
+    )
+
+    code = profile_attribution_audit.main(
+        [
+            "--reviewed",
+            str(reviewed),
+            "--reviewed-md",
+            str(reviewed_md),
+            "--distilled",
+            str(distilled),
+            "--records",
+            str(records),
+            "--evidence-index",
+            str(evidence_index),
+            "--report-dir",
+            str(report_dir),
+            "--trust-report",
+            str(trust_report),
+        ]
+    )
+    report = json.loads(trust_report.read_text(encoding="utf-8"))
+    audit_report = json.loads(
+        (report_dir / "profile_attribution_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert code in {0, 2}
+    assert report["counts"]["auto_confirm"] == {"allowed": 1}
+    assert audit_report["evidence_resolver"] == "available"

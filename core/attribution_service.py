@@ -93,7 +93,10 @@ def _is_owner_reference(author: str, aliases: Set[str]) -> bool:
         "本人",
     }:
         return True
-    if normalized.startswith(("我", "我们", "咱们")):
+    if re.fullmatch(
+        r"(?:我|我们|咱们)(?:之前|刚才|曾经|当时|个人|自己)?",
+        normalized,
+    ):
         return True
     for alias in aliases:
         if re.fullmatch(
@@ -117,6 +120,7 @@ def _is_explicit_third_party_author(author: str) -> bool:
     return bool(
         re.match(
             r"^(?:同事|朋友|客户|顾问|老师|医生|家人|父母|伴侣|"
+            r"产品经理|老板|妈妈|爸爸|我的同事|我的朋友|"
             r"对方|他|她|他们|她们|外部|第三方|有人|别人|大家)",
             normalized,
         )
@@ -146,8 +150,34 @@ def _is_explicit_third_party_author(author: str) -> bool:
     )
 
 
-def _claim_fingerprint(content: str) -> str:
+def _normalized_content_hash(content: str) -> str:
     return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+class EvidenceCatalogClaimResolver:
+    """Bind a normalized claim to an authoritative EvidenceCatalog record."""
+
+    def __init__(self, catalog: Any) -> None:
+        resolve = getattr(catalog, "resolve", None)
+        if not callable(resolve):
+            raise TypeError("catalog must provide resolve(evidence_id)")
+        self.catalog = catalog
+
+    def resolve_for_claim(
+        self,
+        evidence_id: str,
+        normalized_claim: str,
+    ) -> Mapping[str, Any]:
+        ref = self.catalog.resolve(evidence_id)
+        expected_hash = _normalized_content_hash(normalized_claim)
+        if (
+            not isinstance(ref, Mapping)
+            or _clean_text(ref.get("content_hash")) != expected_hash
+        ):
+            raise ValueError(
+                "authoritative evidence does not match normalized claim"
+            )
+        return ref
 
 
 def _counter_map(counter: Counter) -> Dict[str, int]:
@@ -164,6 +194,7 @@ class AttributionService:
         auto_confirm_threshold: float = 0.85,
         max_report_samples: int = DEFAULT_MAX_REPORT_SAMPLES,
         evidence_resolver: Optional[Any] = None,
+        now: Optional[datetime] = None,
     ) -> None:
         self.owner_aliases = {
             _clean_text(value).casefold()
@@ -183,6 +214,13 @@ class AttributionService:
             raise ValueError("max_report_samples must be a non-negative integer")
         self.max_report_samples = min(max_report_samples, MAX_REPORT_SAMPLES)
         self.evidence_resolver = evidence_resolver
+        if now is not None and (
+            not isinstance(now, datetime)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            raise ValueError("now must be a timezone-aware datetime")
+        self.now = now
 
     def _source(self, record: Mapping[str, Any]) -> str:
         source = record.get("source")
@@ -432,7 +470,12 @@ class AttributionService:
             or not callable(resolver_method)
         ):
             return 0.0, False
-        fingerprint = _claim_fingerprint(content)
+        expected_content_hash = _normalized_content_hash(content)
+        reference_now = (
+            self.now.astimezone(timezone.utc)
+            if self.now is not None
+            else datetime.now(timezone.utc)
+        )
         evidence_ids: Set[str] = set()
         observed_times: Set[str] = set()
         for item in evidence:
@@ -442,14 +485,15 @@ class AttributionService:
             if not evidence_id:
                 return 0.0, False
             try:
-                ref = resolver_method(evidence_id, fingerprint)
+                ref = resolver_method(evidence_id, content)
             except Exception:
                 return 0.0, False
             if (
                 not isinstance(ref, Mapping)
                 or _clean_text(ref.get("evidence_id")) != evidence_id
                 or _clean_text(ref.get("status")).casefold() != "available"
-                or _clean_text(ref.get("claim_fingerprint")) != fingerprint
+                or _clean_text(ref.get("content_hash"))
+                != expected_content_hash
             ):
                 return 0.0, False
             observed_at = _clean_text(ref.get("observed_at"))
@@ -461,8 +505,11 @@ class AttributionService:
                 return 0.0, False
             if parsed.tzinfo is None:
                 return 0.0, False
+            instant = parsed.astimezone(timezone.utc)
+            if instant > reference_now:
+                return 0.0, False
             evidence_ids.add(evidence_id)
-            observed_times.add(parsed.isoformat())
+            observed_times.add(instant.isoformat())
         distinct = min(len(evidence_ids), len(observed_times))
         if distinct < 2:
             return 0.0, True

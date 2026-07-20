@@ -24,8 +24,12 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from attribution_service import AttributionService
+from attribution_service import (
+    AttributionService,
+    EvidenceCatalogClaimResolver,
+)
 from config import owner_aliases as configured_owner_aliases
+from evidence_catalog import EvidenceCatalog
 from feishu_distill import infer_attribution, is_profile_review_memory
 from profile_merge import render_reviewed_md, write_jsonl_atomic
 
@@ -37,6 +41,7 @@ DEFAULT_REVIEWED_MD = IMMORTAL_DIR / "reviewed" / "profile_memories.md"
 DEFAULT_DISTILLED = IMMORTAL_DIR / "feishu" / "distilled" / "profile_memories.jsonl"
 DEFAULT_RECORDS = IMMORTAL_DIR / "feishu" / "clean" / "records.jsonl"
 DEFAULT_REPORT_DIR = IMMORTAL_DIR / "quality"
+DEFAULT_EVIDENCE_INDEX = IMMORTAL_DIR / "index.jsonl"
 DEFAULT_TRUST_REPORT = (
     IMMORTAL_DIR / "model" / "attribution" / "latest-report.json"
 )
@@ -295,6 +300,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--records", type=Path, default=DEFAULT_RECORDS)
     parser.add_argument("--report-dir", type=Path, default=DEFAULT_REPORT_DIR)
     parser.add_argument(
+        "--evidence-index",
+        type=Path,
+        default=DEFAULT_EVIDENCE_INDEX,
+    )
+    parser.add_argument(
         "--trust-report",
         type=Path,
         default=DEFAULT_TRUST_REPORT,
@@ -316,12 +326,22 @@ def main(argv: list[str] | None = None) -> int:
     }
     clean_ids.discard("")
     records = load_records_by_clean_id(args.records, clean_ids)
+    evidence_resolver = None
+    try:
+        evidence_catalog = EvidenceCatalog(args.evidence_index)
+        if evidence_catalog.preflight().get("source_state") != "current":
+            raise RuntimeError("evidence catalog source is unavailable")
+        evidence_resolver = EvidenceCatalogClaimResolver(evidence_catalog)
+    except Exception:
+        evidence_resolver = None
     trust_service = AttributionService(
         owner_aliases={
             "owner",
             "用户本人",
             *configured_owner_aliases(),
-        }
+        },
+        evidence_resolver=evidence_resolver,
+        now=datetime.fromisoformat(generated_at),
     )
 
     enriched_reviewed = [enrich_attribution(row, records) for row in reviewed_rows]
@@ -343,6 +363,11 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "generated_at": generated_at,
         "records_loaded": len(records),
+        "evidence_resolver": (
+            "available"
+            if evidence_resolver is not None
+            else "unavailable"
+        ),
         "reviewed": build_summary(
             "reviewed",
             reviewed_rows,
@@ -425,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"reviewed_kept={len(kept)}")
     print(f"reviewed_quarantined={len(quarantined)}")
     print(f"records_loaded={len(records)}")
+    print(f"evidence_resolver={report['evidence_resolver']}")
     print(f"report_json={report_json}")
     print(f"report_md={report_md}")
     print(f"trust_report={args.trust_report}")
