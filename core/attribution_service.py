@@ -70,6 +70,26 @@ PRIVACY_RANK = {
     "restricted": 2,
     "private": 3,
 }
+ORGANIZATION_ROLE_RE = re.compile(
+    r"^(?:我的)?(?:"
+    r"(?:产品|项目|部门|技术|业务|运营|内容)?"
+    r"(?:负责人|主管|经理)"
+    r"|老板|领导|上级|顾问|老师|医生"
+    r")"
+)
+KINSHIP_ROLE_RE = re.compile(
+    r"^(?:我的)?(?:"
+    r"配偶|妻子|丈夫|爱人|伴侣|"
+    r"(?:亲|堂|表)?(?:哥哥|姐姐|弟弟|妹妹)|"
+    r"爸爸|妈妈|父亲|母亲|家人"
+    r")"
+)
+SOCIAL_ROLE_RE = re.compile(
+    r"^(?:我的)?(?:"
+    r"同事|朋友|客户|对方|外部|第三方|"
+    r"有人|别人|大家|他|她|他们|她们"
+    r")"
+)
 
 
 def _clean_text(value: Any) -> str:
@@ -118,12 +138,10 @@ def _is_explicit_third_party_author(author: str) -> bool:
     if re.fullmatch(r"[a-z][a-z0-9_.-]{0,31}", normalized):
         return normalized not in {"owner", "system", "tool", "bot"}
     return bool(
-        re.match(
-            r"^(?:同事|朋友|客户|顾问|老师|医生|家人|父母|伴侣|"
-            r"产品经理|老板|妈妈|爸爸|我的同事|我的朋友|"
-            r"对方|他|她|他们|她们|外部|第三方|有人|别人|大家)",
-            normalized,
-        )
+        ORGANIZATION_ROLE_RE.match(normalized)
+        or KINSHIP_ROLE_RE.match(normalized)
+        or SOCIAL_ROLE_RE.match(normalized)
+        or re.match(r"^(?:父母|兄弟|姐妹)", normalized)
         or re.fullmatch(
             r"[赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕"
             r"施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛"
@@ -162,13 +180,20 @@ class EvidenceCatalogClaimResolver:
         if not callable(resolve):
             raise TypeError("catalog must provide resolve(evidence_id)")
         self.catalog = catalog
+        self.health = "unverified"
 
     def resolve_for_claim(
         self,
         evidence_id: str,
         normalized_claim: str,
     ) -> Mapping[str, Any]:
-        ref = self.catalog.resolve(evidence_id)
+        try:
+            ref = self.catalog.resolve(evidence_id)
+        except Exception:
+            self.health = "unavailable"
+            raise
+        if self.health != "unavailable":
+            self.health = "available"
         expected_hash = _normalized_content_hash(normalized_claim)
         if (
             not isinstance(ref, Mapping)

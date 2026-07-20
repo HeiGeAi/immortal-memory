@@ -216,7 +216,17 @@ def test_common_third_party_restatements_fail_closed_as_quoted(content):
     "content",
     [
         "产品经理说，这个需求不该上线",
+        "负责人认为这个方案风险太高",
+        "主管说，这个版本不能发布",
+        "经理提到黑哥需要调整节奏",
         "老板认为黑哥需要调整方向",
+        "配偶说，这个决定应该再考虑",
+        "妻子说，这个决定应该再考虑",
+        "丈夫认为这个安排不合理",
+        "哥哥提到黑哥最近太疲惫",
+        "姐姐说，应该先休息",
+        "弟弟认为这个选择太冒险",
+        "妹妹说，这个计划需要修改",
         "我的同事A说，黑哥做事太激进",
         "妈妈说，这个决定应该再考虑",
     ],
@@ -1023,6 +1033,128 @@ def test_profile_audit_writes_safe_latest_report_without_raw_examples(tmp_path):
     assert secret not in encoded
     assert "私密原文" not in encoded
     assert trust_report.stat().st_size < 64_000
+    audit_report = json.loads(
+        (report_dir / "profile_attribution_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert audit_report["evidence_resolver"] == "unavailable"
+
+
+@pytest.mark.parametrize("failure", ["catalog_limit_exceeded", "unsafe_path"])
+def test_profile_audit_reports_probe_failures_unavailable(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    class FailedProbeCatalog:
+        def __init__(self, _path):
+            pass
+
+        def preflight(self):
+            raise RuntimeError(failure)
+
+        def list(self):
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        profile_attribution_audit,
+        "EvidenceCatalog",
+        FailedProbeCatalog,
+    )
+    reviewed = tmp_path / "reviewed.jsonl"
+    reviewed_md = tmp_path / "reviewed.md"
+    distilled = tmp_path / "distilled.jsonl"
+    records = tmp_path / "records.jsonl"
+    report_dir = tmp_path / "quality"
+    trust_report = tmp_path / "latest-report.json"
+    for path in (reviewed, reviewed_md, distilled, records):
+        path.write_text("", encoding="utf-8")
+
+    code = profile_attribution_audit.main(
+        [
+            "--reviewed",
+            str(reviewed),
+            "--reviewed-md",
+            str(reviewed_md),
+            "--distilled",
+            str(distilled),
+            "--records",
+            str(records),
+            "--evidence-index",
+            str(tmp_path / "index.jsonl"),
+            "--report-dir",
+            str(report_dir),
+            "--trust-report",
+            str(trust_report),
+        ]
+    )
+    report = json.loads(
+        (report_dir / "profile_attribution_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert code == 0
+    assert report["evidence_resolver"] == "unavailable"
+
+
+def test_large_verified_catalog_is_not_rejected_by_listing_limit(
+    tmp_path,
+    monkeypatch,
+):
+    content = "我一直偏好先验证再发布。"
+
+    class LargeVerifiedCatalog:
+        def __init__(self, _path):
+            pass
+
+        def preflight(self):
+            return {
+                "source_state": "current",
+                "source_size": 2 * 1024 * 1024 * 1024,
+            }
+
+        def list(self):
+            raise AssertionError("production wiring must not list the catalog")
+
+        def resolve(self, evidence_id):
+            number = int(evidence_id.rsplit("_", 1)[1])
+            return {
+                "evidence_id": evidence_id,
+                "status": "available",
+                "observed_at": f"2026-07-0{number}T00:00:00Z",
+                "content_hash": content_hash(content),
+            }
+
+    monkeypatch.setattr(
+        profile_attribution_audit,
+        "EvidenceCatalog",
+        LargeVerifiedCatalog,
+    )
+    resolver = profile_attribution_audit.build_evidence_resolver(
+        tmp_path / "large-index.jsonl"
+    )
+    result = AttributionService(
+        owner_aliases={"owner"},
+        evidence_resolver=resolver,
+        now=datetime(2026, 7, 20, tzinfo=timezone.utc),
+    ).classify(
+        {
+            "role": "user",
+            "author": "owner",
+            "content": content,
+            "source": "codex",
+            "recurrence_evidence": [
+                {"evidence_id": f"ev_{number}"}
+                for number in range(1, 4)
+            ],
+        }
+    )
+
+    assert resolver is not None
+    assert resolver.health == "available"
+    assert result["auto_confirm_allowed"] is True
 
 
 def test_profile_audit_injects_real_catalog_resolver(tmp_path):
@@ -1114,3 +1246,80 @@ def test_profile_audit_injects_real_catalog_resolver(tmp_path):
     assert code in {0, 2}
     assert report["counts"]["auto_confirm"] == {"allowed": 1}
     assert audit_report["evidence_resolver"] == "available"
+
+
+def test_profile_audit_marks_malformed_catalog_unavailable_and_blocks(tmp_path):
+    content = "我一直偏好先验证再发布。"
+    reviewed = tmp_path / "reviewed.jsonl"
+    reviewed_md = tmp_path / "reviewed.md"
+    distilled = tmp_path / "distilled.jsonl"
+    records = tmp_path / "records.jsonl"
+    evidence_index = tmp_path / "index.jsonl"
+    report_dir = tmp_path / "quality"
+    trust_report = tmp_path / "model" / "attribution" / "latest-report.json"
+    reviewed.write_text(
+        json.dumps(
+            {
+                "memory_id": "mem-1",
+                "statement": content,
+                "focus": "self_profile",
+                "recurrence_evidence": [
+                    {"evidence_id": f"ev_{number}"}
+                    for number in range(1, 4)
+                ],
+                "source": {
+                    "clean_id": "clean-1",
+                    "source": "feishu-im",
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    reviewed_md.write_text("", encoding="utf-8")
+    distilled.write_text("", encoding="utf-8")
+    records.write_text(
+        json.dumps(
+            {
+                "clean_id": "clean-1",
+                "actor": "owner",
+                "source": "feishu-im",
+                "text": content,
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence_index.write_text("{not-json}\n", encoding="utf-8")
+
+    code = profile_attribution_audit.main(
+        [
+            "--reviewed",
+            str(reviewed),
+            "--reviewed-md",
+            str(reviewed_md),
+            "--distilled",
+            str(distilled),
+            "--records",
+            str(records),
+            "--evidence-index",
+            str(evidence_index),
+            "--report-dir",
+            str(report_dir),
+            "--trust-report",
+            str(trust_report),
+        ]
+    )
+    report = json.loads(trust_report.read_text(encoding="utf-8"))
+    audit_report = json.loads(
+        (report_dir / "profile_attribution_audit.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert code in {0, 2}
+    assert audit_report["evidence_resolver"] == "unavailable"
+    assert report["counts"]["auto_confirm"] == {"blocked": 1}
+    assert report["counts"]["trust_flags"]["recurrence_unverified"] == 1

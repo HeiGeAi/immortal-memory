@@ -313,6 +313,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_evidence_resolver(path: Path) -> Optional[EvidenceCatalogClaimResolver]:
+    try:
+        evidence_catalog = EvidenceCatalog(path)
+        if evidence_catalog.preflight().get("source_state") != "current":
+            return None
+        return EvidenceCatalogClaimResolver(evidence_catalog)
+    except Exception:
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     generated_at = now_iso()
@@ -326,14 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     clean_ids.discard("")
     records = load_records_by_clean_id(args.records, clean_ids)
-    evidence_resolver = None
-    try:
-        evidence_catalog = EvidenceCatalog(args.evidence_index)
-        if evidence_catalog.preflight().get("source_state") != "current":
-            raise RuntimeError("evidence catalog source is unavailable")
-        evidence_resolver = EvidenceCatalogClaimResolver(evidence_catalog)
-    except Exception:
-        evidence_resolver = None
+    evidence_resolver = build_evidence_resolver(args.evidence_index)
     trust_service = AttributionService(
         owner_aliases={
             "owner",
@@ -363,11 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     report = {
         "generated_at": generated_at,
         "records_loaded": len(records),
-        "evidence_resolver": (
-            "available"
-            if evidence_resolver is not None
-            else "unavailable"
-        ),
+        "evidence_resolver": "unavailable",
         "reviewed": build_summary(
             "reviewed",
             reviewed_rows,
@@ -391,6 +390,11 @@ def main(argv: list[str] | None = None) -> int:
             for row in [*enriched_reviewed, *enriched_distilled]
         ],
         generated_at=generated_at,
+    )
+    report["evidence_resolver"] = (
+        evidence_resolver.health
+        if evidence_resolver is not None
+        else "unavailable"
     )
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
