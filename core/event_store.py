@@ -107,8 +107,9 @@ def _anchored_parent(path: Path, *, create: bool) -> Iterator[tuple]:
                     "event store parent path is not a safe directory",
                     exc,
                 )
-            os.close(descriptor)
+            previous = descriptor
             descriptor = child
+            os.close(previous)
         yield descriptor, absolute.name
     finally:
         os.close(descriptor)
@@ -208,8 +209,9 @@ def safe_atomic_write_text(path: Path, content: str) -> None:
                     raise OSError("safe file write made no progress")
                 view = view[written:]
             os.fsync(descriptor)
-            os.close(descriptor)
+            owned_descriptor = descriptor
             descriptor = -1
+            os.close(owned_descriptor)
             os.replace(
                 temporary,
                 name,
@@ -289,11 +291,12 @@ def _acquire_event_lock(
                 or (owned.st_dev, owned.st_ino)
                 != (current.st_dev, current.st_ino)
             ):
+                owned_fd = fd
+                fd = -1
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    fcntl.flock(owned_fd, fcntl.LOCK_UN)
                 finally:
-                    os.close(fd)
-                    fd = -1
+                    os.close(owned_fd)
                 if time.monotonic() >= deadline:
                     raise _unsafe_path(
                         "event lock identity changed during acquisition",
@@ -315,10 +318,12 @@ def _acquire_event_lock(
             return fd
         except Exception:
             if fd >= 0:
+                owned_fd = fd
+                fd = -1
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    fcntl.flock(owned_fd, fcntl.LOCK_UN)
                 finally:
-                    os.close(fd)
+                    os.close(owned_fd)
             raise
 
 

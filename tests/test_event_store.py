@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -558,6 +559,131 @@ def test_reader_unlock_failure_still_closes_every_owned_descriptor(
     for descriptor in set(unlocked):
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def test_lock_identity_close_interruption_does_not_close_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    lock_path = tmp_path / "events.jsonl.lock"
+    moved = tmp_path / "moved.lock"
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep open", encoding="utf-8")
+    parent_fd = os.open(tmp_path, os.O_RDONLY)
+    real_stat = module.os.stat
+    real_close = module.os.close
+    reused = []
+    replaced = [False]
+
+    def replace_before_stat(name, *args, **kwargs):
+        if name == lock_path.name and not replaced[0]:
+            lock_path.rename(moved)
+            lock_path.write_text("replacement", encoding="utf-8")
+            replaced[0] = True
+        return real_stat(name, *args, **kwargs)
+
+    def interrupt_regular_close(fd):
+        if not reused and stat.S_ISREG(os.fstat(fd).st_mode):
+            real_close(fd)
+            sentinel_fd = os.open(sentinel, os.O_RDONLY)
+            assert sentinel_fd == fd
+            reused.append(sentinel_fd)
+            raise InterruptedError("injected close interruption")
+        return real_close(fd)
+
+    monkeypatch.setattr(module.os, "stat", replace_before_stat)
+    monkeypatch.setattr(module.os, "close", interrupt_regular_close)
+    try:
+        with pytest.raises(InterruptedError, match="injected close"):
+            module._acquire_event_lock(
+                parent_fd,
+                lock_path.name,
+                timeout=0.1,
+                stale_after=60.0,
+            )
+        assert os.fstat(reused[0]).st_size == len("keep open")
+    finally:
+        for descriptor in reused:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
+        real_close(parent_fd)
+
+
+def test_parent_close_interruption_keeps_reused_fd_and_closes_child(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep open", encoding="utf-8")
+    real_close = module.os.close
+    reused = []
+
+    def interrupt_first_close(fd):
+        if not reused:
+            real_close(fd)
+            sentinel_fd = os.open(sentinel, os.O_RDONLY)
+            assert sentinel_fd == fd
+            reused.append(sentinel_fd)
+            raise InterruptedError("injected parent close interruption")
+        return real_close(fd)
+
+    monkeypatch.setattr(module.os, "close", interrupt_first_close)
+    try:
+        with pytest.raises(InterruptedError, match="injected parent close"):
+            with module._anchored_parent(
+                tmp_path / "nested" / "events.jsonl",
+                create=True,
+            ):
+                pass
+        assert os.fstat(reused[0]).st_size == len("keep open")
+    finally:
+        for descriptor in reused:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
+
+
+def test_atomic_close_interruption_does_not_close_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep open", encoding="utf-8")
+    real_close = module.os.close
+    reused = []
+
+    def interrupt_regular_close(fd):
+        if not reused and stat.S_ISREG(os.fstat(fd).st_mode):
+            real_close(fd)
+            sentinel_fd = os.open(sentinel, os.O_RDONLY)
+            assert sentinel_fd == fd
+            reused.append(sentinel_fd)
+            raise InterruptedError("injected atomic close interruption")
+        return real_close(fd)
+
+    monkeypatch.setattr(module.os, "close", interrupt_regular_close)
+    try:
+        with pytest.raises(InterruptedError, match="injected atomic close"):
+            module.safe_atomic_write_text(
+                tmp_path / "current.jsonl",
+                "{}\n",
+            )
+        assert os.fstat(reused[0]).st_size == len("keep open")
+    finally:
+        for descriptor in reused:
+            try:
+                real_close(descriptor)
+            except OSError:
+                pass
 
 
 def test_append_rejects_event_file_replaced_after_validation_and_can_retry(
