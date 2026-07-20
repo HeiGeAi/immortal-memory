@@ -645,10 +645,28 @@ def test_confirm_rejects_tampering_stale_watermark_parent_and_empty_reason(
     with pytest.raises(ValueError, match="candidate"):
         service.confirm(forged_time, reason="reviewed")
 
+    forged_old_time = copy.deepcopy(candidate)
+    forged_old_time["generated_at"] = "2000-01-01T00:00:00+00:00"
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(forged_old_time, reason="reviewed")
+
     forged_generation = copy.deepcopy(candidate)
     forged_generation["generation_reason"] = "scheduled_rebuild"
     with pytest.raises(ValueError, match="candidate"):
         service.confirm(forged_generation, reason="reviewed")
+
+
+def test_confirm_requires_exact_fresh_generated_at_with_fixed_clock(tmp_path):
+    service = service_for(tmp_path)
+    candidate = service.build_candidate()
+    forged = copy.deepcopy(candidate)
+    forged["generated_at"] = "2000-01-01T00:00:00+00:00"
+
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(forged, reason="reviewed")
+
+    confirmed = service.confirm(candidate, reason="reviewed")
+    assert confirmed["generated_at"] == candidate["generated_at"]
 
 
 def test_confirm_never_overwrites_existing_version(tmp_path):
@@ -766,16 +784,20 @@ def test_interrupted_version_markdown_write_recovers_from_json(
         "safe_atomic_write_text",
         fail_version_markdown,
     )
-    with pytest.raises(OSError, match="interrupted version markdown"):
-        service.confirm(service.build_candidate(), reason="first")
+    candidate = service.build_candidate()
+    confirmed = service.confirm(candidate, reason="first")
 
     versions = service.versions()
 
-    assert len(versions) == 1
-    version = versions[0]
+    assert versions == [confirmed]
+    assert service.current()["version_id"] == confirmed["version_id"]
     assert (
-        service.versions_dir / (version["version_id"] + ".md")
+        service.versions_dir / (confirmed["version_id"] + ".md")
     ).is_file()
+    with pytest.raises(living_module.LivingSelfConflict) as stale:
+        service.confirm(candidate, reason="retry")
+    assert stale.value.code == "stale_candidate"
+    assert service.versions() == [confirmed]
 
 
 def test_interrupted_current_markdown_write_recovers_from_json(
@@ -797,12 +819,11 @@ def test_interrupted_current_markdown_write_recovers_from_json(
         "safe_atomic_write_text",
         fail_current_markdown,
     )
-    with pytest.raises(OSError, match="interrupted current markdown"):
-        service.confirm(service.build_candidate(), reason="first")
+    confirmed = service.confirm(service.build_candidate(), reason="first")
 
     current = service.current()
 
-    assert current["status"] == "confirmed"
+    assert current == confirmed
     assert service.current_md_path.read_text(
         encoding="utf-8"
     ) == service._render_markdown(current)

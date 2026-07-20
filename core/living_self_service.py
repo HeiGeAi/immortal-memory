@@ -825,14 +825,23 @@ class LivingSelfService:
         if safe_regular_exists(json_path) or safe_regular_exists(markdown_path):
             raise FileExistsError(str(json_path))
         safe_atomic_write_text(json_path, _json_text(version))
-        safe_atomic_write_text(markdown_path, self._render_markdown(version))
+        try:
+            safe_atomic_write_text(
+                markdown_path,
+                self._render_markdown(version),
+            )
+        except OSError:
+            pass
 
     def _publish_current_pair(self, version: Mapping[str, Any]) -> None:
         safe_atomic_write_text(self.current_path, _json_text(version))
-        safe_atomic_write_text(
-            self.current_md_path,
-            self._render_markdown(version),
-        )
+        try:
+            safe_atomic_write_text(
+                self.current_md_path,
+                self._render_markdown(version),
+            )
+        except OSError:
+            pass
 
     def _validate_candidate_unlocked(
         self,
@@ -866,8 +875,7 @@ class LivingSelfService:
                 raise ValueError("candidate does not match current Claim authority")
         if (
             value["generation_reason"] != fresh["generation_reason"]
-            or _parsed_time(str(value["generated_at"]))
-            > _parsed_time(str(fresh["generated_at"]))
+            or value["generated_at"] != fresh["generated_at"]
         ):
             raise ValueError("candidate generation metadata is invalid")
         parent = value["parent_version_id"]
