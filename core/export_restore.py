@@ -382,7 +382,7 @@ def _parse_utc_timestamp(value: Any) -> datetime | None:
 
 
 def migration_backup_gate(
-    evidence: dict[str, Any],
+    evidence: dict[str, Any] | None,
     require_external: bool = True,
     *,
     max_age_hours: float = 168,
@@ -434,12 +434,20 @@ def migration_backup_gate(
     warning_codes = [str(item) for item in warnings] if isinstance(warnings, list) else []
     secret_scan = payload.get("secret_scan")
     secret_count = 0
-    if isinstance(secret_scan, dict):
+    secret_scan_valid = isinstance(secret_scan, dict) and "unique_candidates" in secret_scan
+    if secret_scan_valid:
         try:
-            secret_count = int(secret_scan.get("unique_candidates") or 0)
+            raw_secret_count = secret_scan.get("unique_candidates")
+            if isinstance(raw_secret_count, bool):
+                raise ValueError("boolean is not a candidate count")
+            secret_count = int(raw_secret_count)
+            if secret_count < 0:
+                raise ValueError("negative candidate count")
         except (TypeError, ValueError):
-            secret_count = 1
-    if secret_count > 0 or any("secret_shapes_present" in item for item in warning_codes):
+            secret_scan_valid = False
+    if not secret_scan_valid:
+        blockers.append("secret_scan_invalid")
+    elif secret_count > 0 or any("secret_shapes_present" in item for item in warning_codes):
         blockers.append("secret_shapes_present")
 
     current = now or datetime.now(timezone.utc)
@@ -537,6 +545,16 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
         seen.add(relative)
 
         path = export_dir / relative
+        component = export_dir
+        has_symlink = False
+        for part in Path(relative).parts:
+            component = component / part
+            if component.is_symlink():
+                has_symlink = True
+                break
+        if has_symlink:
+            mismatched.append({"relpath": relative, "reason": "symlink_not_allowed"})
+            continue
         if not path.exists() or not path.is_file():
             missing.append({"relpath": relative, "reason": "missing"})
             continue
@@ -578,6 +596,107 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
         "missing": missing,
         "mismatched": mismatched,
         "warnings": warnings,
+    }
+
+
+def get_migration_backup_status(
+    vault_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Strictly verify the exact export recorded by runtime state."""
+    vault = vault_path(vault_dir)
+    state = read_manifest(vault / "orchestrator_state.json")
+    raw_export_dir = state.get("last_portable_export_dir") if state else None
+
+    def failed(reason: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "trust_level": "failed",
+            "generated_at": "",
+            "storage_location": "unknown",
+            "secret_scan": None,
+            "warnings": [reason],
+            "mode": "strict-sha256",
+            "check": {
+                "ok": False,
+                "mode": "strict-sha256",
+                "checked_files": 0,
+                "warnings": [reason],
+            },
+        }
+
+    if not isinstance(raw_export_dir, str) or not raw_export_dir.strip():
+        return failed("state_export_missing")
+    requested = Path(raw_export_dir).expanduser()
+    if (
+        not requested.is_absolute()
+        or requested.is_symlink()
+        or not requested.name.startswith(EXPORT_PREFIX)
+    ):
+        return failed("state_export_path_invalid")
+    try:
+        export_dir = requested.resolve(strict=True)
+    except OSError:
+        return failed("state_export_path_missing")
+    if not export_dir.is_dir():
+        return failed("state_export_path_invalid")
+
+    manifest = read_manifest(export_dir / MANIFEST_NAME)
+    if not manifest:
+        return failed("state_export_manifest_missing_or_invalid")
+    manifest_export = manifest.get("export_dir")
+    manifest_vault = manifest.get("vault_dir")
+    try:
+        manifest_export_ok = (
+            isinstance(manifest_export, str)
+            and Path(manifest_export).expanduser().resolve(strict=True) == export_dir
+        )
+        manifest_vault_ok = (
+            isinstance(manifest_vault, str)
+            and Path(manifest_vault).expanduser().resolve(strict=True)
+            == vault.resolve(strict=True)
+        )
+    except OSError:
+        manifest_export_ok = False
+        manifest_vault_ok = False
+
+    check = restore_check(export_dir, strict=True)
+    check["mode"] = "strict-sha256"
+    validation_warnings: list[str] = []
+    if not manifest_export_ok:
+        validation_warnings.append("manifest_export_dir_mismatch")
+    if not manifest_vault_ok:
+        validation_warnings.append("manifest_vault_dir_mismatch")
+    manifest_items = manifest.get("items")
+    manifest_totals = manifest.get("totals")
+    if (
+        not isinstance(manifest_items, list)
+        or not manifest_items
+        or not isinstance(manifest_totals, dict)
+        or manifest_totals.get("files") != len(manifest_items)
+    ):
+        validation_warnings.append("manifest_empty_or_inconsistent")
+    state_generated = state.get("last_portable_export")
+    manifest_generated = manifest.get("generated_at")
+    if state_generated != manifest_generated:
+        validation_warnings.append("state_manifest_timestamp_mismatch")
+    if validation_warnings:
+        check["ok"] = False
+        check["warnings"] = [*(check.get("warnings") or []), *validation_warnings]
+
+    return {
+        "ok": bool(check.get("ok")),
+        "trust_level": "verified" if check.get("ok") else "failed",
+        "generated_at": manifest_generated or "",
+        "storage_location": classify_storage_location(export_dir, vault),
+        "secret_scan": manifest.get("secret_scan"),
+        "warnings": check.get("warnings", []),
+        "mode": "verified",
+        "check": check,
+        "latest_export": {
+            "export_dir": str(export_dir),
+            "generated_at": manifest_generated or "",
+            "totals": manifest.get("totals", {}),
+        },
     }
 
 

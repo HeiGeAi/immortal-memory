@@ -40,6 +40,7 @@ from command_hints import cli_command
 from export_restore import (
     create_export,
     get_backup_status,
+    get_migration_backup_status,
     migration_backup_gate,
     restore_check,
 )
@@ -1735,7 +1736,7 @@ def command_migration_preflight(args) -> int:
     import index_db
     import preflight
 
-    status = get_backup_status(IMMORTAL_DIR, verify=True)
+    status = get_migration_backup_status(IMMORTAL_DIR)
     health_report = preflight.gather_preflight(
         max_age_hours=float(args.max_age_hours),
         vault_dir=IMMORTAL_DIR,
@@ -1750,10 +1751,11 @@ def command_migration_preflight(args) -> int:
     parity_ok = bool(index_db.is_ready())
     status["health"] = {"ok": health_ok}
     status["index_parity"] = {"ok": parity_ok}
+    secret_scan = status.get("secret_scan")
     try:
-        secret_candidates = int(
-            ((status.get("secret_scan") or {}).get("unique_candidates") or 0)
-        )
+        if not isinstance(secret_scan, dict):
+            raise TypeError("secret scan evidence is not a mapping")
+        secret_candidates = int(secret_scan.get("unique_candidates"))
     except (TypeError, ValueError):
         secret_candidates = 1
 
