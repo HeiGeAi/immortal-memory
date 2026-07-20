@@ -1,8 +1,14 @@
 import copy
+import hashlib
 import json
+import os
+import threading
 
 import profile_nuwa
+import pytest
+import living_self_service as living_module
 from claim_store import ClaimStore
+from event_store import EventPathError
 from model_types import (
     LIVING_SELF_SECTIONS,
     new_claim,
@@ -562,3 +568,367 @@ def test_profile_nuwa_labels_legacy_output_and_does_not_confirm_accepted(
         model.get("status") != "confirmed"
         for model in report["mental_models"]
     )
+
+
+def seeded_version_service(tmp_path):
+    service = service_for(tmp_path)
+    add_claim(
+        service.claims,
+        "clm_version_value",
+        "长期选择可恢复性",
+        claim_type="value",
+        evidence_ids=["ev_version_value"],
+    )
+    return service
+
+
+def section_hash(sections):
+    encoded = json.dumps(
+        sections,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def test_confirm_creates_immutable_version_and_current_pair(tmp_path):
+    service = seeded_version_service(tmp_path)
+
+    confirmed = service.confirm(service.build_candidate(), reason="owner reviewed")
+    version_json = (
+        tmp_path
+        / "model"
+        / "living-self"
+        / "versions"
+        / (confirmed["version_id"] + ".json")
+    )
+    version_md = version_json.with_suffix(".md")
+
+    assert version_json.is_file()
+    assert version_md.is_file()
+    assert service.current()["version_id"] == confirmed["version_id"]
+    assert service.current_path.with_suffix(".md").is_file()
+    assert service.versions() == [confirmed]
+    assert service.load_version(confirmed["version_id"]) == confirmed
+    assert "ev_version_value" in version_md.read_text(encoding="utf-8")
+    assert "raw evidence body" not in version_md.read_text(encoding="utf-8")
+
+
+def test_confirm_rejects_tampering_stale_watermark_parent_and_empty_reason(
+    tmp_path,
+):
+    service = seeded_version_service(tmp_path)
+    candidate = service.build_candidate()
+
+    with pytest.raises(ValueError, match="reason"):
+        service.confirm(candidate, reason=" ")
+
+    tampered = copy.deepcopy(candidate)
+    tampered["sections"]["values"][0]["summary"] = "caller tampered"
+    tampered["content_hash"] = section_hash(tampered["sections"])
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(tampered, reason="reviewed")
+
+    stale = copy.deepcopy(candidate)
+    stale["based_on_claim_seq"] -= 1
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(stale, reason="reviewed")
+
+    forged_parent = copy.deepcopy(candidate)
+    forged_parent["parent_version_id"] = "lsv_" + "f" * 32
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(forged_parent, reason="reviewed")
+
+    forged_time = copy.deepcopy(candidate)
+    forged_time["generated_at"] = "2027-07-20T12:00:00+00:00"
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(forged_time, reason="reviewed")
+
+    forged_generation = copy.deepcopy(candidate)
+    forged_generation["generation_reason"] = "scheduled_rebuild"
+    with pytest.raises(ValueError, match="candidate"):
+        service.confirm(forged_generation, reason="reviewed")
+
+
+def test_confirm_never_overwrites_existing_version(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="first")
+    first_path = service.versions_dir / (first["version_id"] + ".json")
+    original = first_path.read_bytes()
+
+    service._new_version_id = lambda: first["version_id"]
+    with pytest.raises(FileExistsError):
+        service.confirm(service.build_candidate(), reason="collision")
+
+    assert first_path.read_bytes() == original
+    assert service.current()["version_id"] == first["version_id"]
+
+
+def test_restore_creates_new_version_and_preserves_history_bytes(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="first")
+    first_json = service.versions_dir / (first["version_id"] + ".json")
+    first_md = first_json.with_suffix(".md")
+    original_json = first_json.read_bytes()
+    original_md = first_md.read_bytes()
+    add_claim(
+        service.claims,
+        "clm_second_value",
+        "优先可验证交付",
+        claim_type="value",
+    )
+    second = service.confirm(service.build_candidate(), reason="second")
+
+    restored = service.restore(first["version_id"], reason="rollback")
+
+    assert restored["version_id"] not in {
+        first["version_id"],
+        second["version_id"],
+    }
+    assert restored["generation_reason"] == "manual_restore"
+    assert restored["restored_from"] == first["version_id"]
+    assert restored["parent_version_id"] == second["version_id"]
+    assert first_json.read_bytes() == original_json
+    assert first_md.read_bytes() == original_md
+    assert len(service.versions()) == 3
+    assert service.current()["version_id"] == restored["version_id"]
+
+
+def test_restore_rejects_candidate_corrupt_and_missing_history(tmp_path):
+    service = seeded_version_service(tmp_path)
+    confirmed = service.confirm(service.build_candidate(), reason="first")
+
+    with pytest.raises(ValueError, match="reason"):
+        service.restore(confirmed["version_id"], reason="")
+
+    with pytest.raises(FileNotFoundError):
+        service.restore("lsv_" + "a" * 32, reason="missing")
+
+    path = service.versions_dir / (confirmed["version_id"] + ".json")
+    corrupted = json.loads(path.read_text(encoding="utf-8"))
+    corrupted["content_hash"] = "sha256:" + "0" * 64
+    path.write_text(json.dumps(corrupted), encoding="utf-8")
+    with pytest.raises(ValueError):
+        service.restore(confirmed["version_id"], reason="corrupt")
+
+
+def test_missing_version_markdown_is_rebuilt_from_valid_json(tmp_path):
+    service = seeded_version_service(tmp_path)
+    confirmed = service.confirm(service.build_candidate(), reason="first")
+    markdown_path = service.versions_dir / (confirmed["version_id"] + ".md")
+    markdown_path.unlink()
+
+    loaded = service.load_version(confirmed["version_id"])
+
+    assert loaded == confirmed
+    assert markdown_path.read_text(encoding="utf-8") == service._render_markdown(
+        confirmed
+    )
+
+
+def test_stale_current_markdown_is_rebuilt_from_authoritative_json(tmp_path):
+    service = seeded_version_service(tmp_path)
+    confirmed = service.confirm(service.build_candidate(), reason="first")
+    service.current_md_path.write_text(
+        "stale cache containing raw evidence body",
+        encoding="utf-8",
+    )
+
+    loaded = service.current()
+
+    assert loaded == confirmed
+    repaired = service.current_md_path.read_text(encoding="utf-8")
+    assert repaired == service._render_markdown(confirmed)
+    assert "raw evidence body" not in repaired
+
+
+def test_interrupted_version_markdown_write_recovers_from_json(
+    tmp_path,
+    monkeypatch,
+):
+    service = seeded_version_service(tmp_path)
+    real_write = living_module.safe_atomic_write_text
+    failed = {"value": False}
+
+    def fail_version_markdown(path, content):
+        if (
+            path.parent == service.versions_dir
+            and path.suffix == ".md"
+            and not failed["value"]
+        ):
+            failed["value"] = True
+            raise OSError("interrupted version markdown")
+        return real_write(path, content)
+
+    monkeypatch.setattr(
+        living_module,
+        "safe_atomic_write_text",
+        fail_version_markdown,
+    )
+    with pytest.raises(OSError, match="interrupted version markdown"):
+        service.confirm(service.build_candidate(), reason="first")
+
+    versions = service.versions()
+
+    assert len(versions) == 1
+    version = versions[0]
+    assert (
+        service.versions_dir / (version["version_id"] + ".md")
+    ).is_file()
+
+
+def test_interrupted_current_markdown_write_recovers_from_json(
+    tmp_path,
+    monkeypatch,
+):
+    service = seeded_version_service(tmp_path)
+    real_write = living_module.safe_atomic_write_text
+    failed = {"value": False}
+
+    def fail_current_markdown(path, content):
+        if path == service.current_md_path and not failed["value"]:
+            failed["value"] = True
+            raise OSError("interrupted current markdown")
+        return real_write(path, content)
+
+    monkeypatch.setattr(
+        living_module,
+        "safe_atomic_write_text",
+        fail_current_markdown,
+    )
+    with pytest.raises(OSError, match="interrupted current markdown"):
+        service.confirm(service.build_candidate(), reason="first")
+
+    current = service.current()
+
+    assert current["status"] == "confirmed"
+    assert service.current_md_path.read_text(
+        encoding="utf-8"
+    ) == service._render_markdown(current)
+
+
+def test_diff_lists_added_and_removed_items(tmp_path):
+    current_time = {"value": "2026-07-20T12:00:00+00:00"}
+    from living_self_service import LivingSelfService
+
+    service = LivingSelfService(
+        tmp_path,
+        clock=lambda: current_time["value"],
+    )
+    add_claim(
+        service.claims,
+        "clm_expiring",
+        "阶段性优先可恢复性",
+        claim_type="value",
+        valid_to="2026-07-21T00:00:00+00:00",
+    )
+    first = service.confirm(service.build_candidate(), reason="first")
+    add_claim(
+        service.claims,
+        "clm_added",
+        "长期优先可验证交付",
+        claim_type="value",
+    )
+    current_time["value"] = "2026-07-21T00:00:00+00:00"
+    second = service.confirm(service.build_candidate(), reason="second")
+
+    result = service.diff(first["version_id"], second["version_id"])
+
+    assert [item["item"]["claim_ids"] for item in result["added"]] == [
+        ["clm_added"]
+    ]
+    assert [item["item"]["claim_ids"] for item in result["removed"]] == [
+        ["clm_expiring"]
+    ]
+    assert result["changed"] == []
+
+
+def test_diff_lists_added_changed_removed_and_section_moves(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="first")
+    second = copy.deepcopy(first)
+    second["version_id"] = "lsv_" + "b" * 32
+    second["parent_version_id"] = first["version_id"]
+    moved = second["sections"]["values"].pop()
+    moved["kind"] = "identity_commitment"
+    moved["summary"] = "same item moved to a new section"
+    second["sections"]["identity_commitments"].append(moved)
+    second["content_hash"] = section_hash(second["sections"])
+    second["reason"] = "fixture for structural diff"
+    second_path = service.versions_dir / (second["version_id"] + ".json")
+    second_path.write_text(
+        json.dumps(second, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    second_path.with_suffix(".md").write_text("fixture", encoding="utf-8")
+
+    result = service.diff(first["version_id"], second["version_id"])
+
+    assert set(result) == {"added", "changed", "removed"}
+    assert result["added"] == []
+    assert result["removed"] == []
+    assert result["changed"][0]["item_id"] == moved["item_id"]
+    assert result["changed"][0]["from_section"] == "values"
+    assert result["changed"][0]["to_section"] == "identity_commitments"
+
+
+def test_concurrent_confirms_allow_one_linear_winner_without_partial_pairs(
+    tmp_path,
+):
+    service = seeded_version_service(tmp_path)
+    candidate = service.build_candidate()
+    results = []
+    failures = []
+
+    def worker(index):
+        try:
+            results.append(
+                service.confirm(candidate, reason="worker " + str(index))
+            )
+        except Exception as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(index,)) for index in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 1
+    assert len(failures) == 3
+    assert {failure.code for failure in failures} == {"stale_candidate"}
+    assert len(service.versions()) == 1
+    for item in results:
+        base = service.versions_dir / item["version_id"]
+        assert base.with_suffix(".json").is_file()
+        assert base.with_suffix(".md").is_file()
+    assert service.current()["version_id"] == results[0]["version_id"]
+    assert sorted(path.suffix for path in service.versions_dir.iterdir()) == [
+        ".json",
+        ".md",
+    ]
+
+
+def test_version_paths_reject_symlinks_and_nonregular_files(tmp_path):
+    service = seeded_version_service(tmp_path)
+    candidate = service.build_candidate()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    service.root.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside, service.root)
+
+    with pytest.raises(EventPathError):
+        service.confirm(candidate, reason="unsafe root")
+
+
+def test_version_id_rejects_traversal_and_nonregular_history(tmp_path):
+    service = seeded_version_service(tmp_path)
+    with pytest.raises(ValueError, match="version ID"):
+        service.load_version("../outside")
+
+    service.versions_dir.mkdir(parents=True)
+    version_id = "lsv_" + "d" * 32
+    (service.versions_dir / (version_id + ".json")).mkdir()
+    with pytest.raises(EventPathError):
+        service.load_version(version_id)

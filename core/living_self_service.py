@@ -9,11 +9,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import stat
+import threading
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from claim_store import ClaimStore
+from event_store import (
+    EventPathError,
+    _anchored_parent,
+    _exclusive_lock,
+    _regular_stat_at,
+    safe_atomic_write_text,
+    safe_read_text,
+    safe_regular_exists,
+)
 from model_types import (
     LIVING_SELF_SECTIONS,
     ModelValidationError,
@@ -76,6 +91,28 @@ SECTION_BUILDERS = {
     "tensions": "build_tensions",
     "honest_boundaries": "build_honest_boundaries",
 }
+
+VERSION_BASE_FIELDS = frozenset(
+    {
+        "version_id",
+        "parent_version_id",
+        "status",
+        "generation_reason",
+        "content_hash",
+        "based_on_claim_seq",
+        "generated_at",
+        "confirmed_at",
+        "sections",
+    }
+)
+VERSION_ID_PATTERN = re.compile(r"\Alsv_[0-9a-f]{32}\Z")
+MAX_VERSION_BYTES = 8 * 1024 * 1024
+
+
+class LivingSelfConflict(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _utc_now() -> str:
@@ -160,6 +197,56 @@ def _claim_sort_key(claim: Mapping[str, Any]) -> Any:
     )
 
 
+def _json_text(value: Mapping[str, Any]) -> str:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def _require_reason(reason: str) -> str:
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("reason must be non-empty")
+    return reason.strip()
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        with _anchored_parent(path, create=False) as (parent_fd, name):
+            metadata = _regular_stat_at(parent_fd, name)
+            if metadata is None:
+                return
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    except FileNotFoundError:
+        return
+
+
+def _safe_regular_names(directory: Path) -> List[str]:
+    probe = directory / ".probe"
+    try:
+        with _anchored_parent(probe, create=False) as (directory_fd, _name):
+            names = []
+            for name in os.listdir(directory_fd):
+                if not name.endswith(".json"):
+                    continue
+                metadata = _regular_stat_at(directory_fd, name)
+                if metadata is None or not stat.S_ISREG(metadata.st_mode):
+                    raise EventPathError(
+                        "unsafe_path",
+                        "Living Self version must be a regular file",
+                    )
+                names.append(name)
+            return sorted(names)
+    except FileNotFoundError:
+        return []
+
+
 class LivingSelfService:
     """Build a candidate without mutating the current confirmed version."""
 
@@ -173,8 +260,32 @@ class LivingSelfService:
         self.claims = ClaimStore(self.vault_dir)
         self.root = self.vault_dir / "model" / "living-self"
         self.current_path = self.root / "current.json"
+        self.current_md_path = self.root / "current.md"
+        self.versions_dir = self.root / "versions"
+        self.lock_path = self.root / ".versions.lock"
         self._clock = clock or _utc_now
         self._generated_at = ""
+        self._local_lock = threading.RLock()
+
+    def _ensure_lock_parent(self) -> None:
+        for attempt in range(4):
+            try:
+                with _anchored_parent(self.lock_path, create=True):
+                    return
+            except EventPathError as exc:
+                if not isinstance(exc.__cause__, FileExistsError) or attempt == 3:
+                    raise
+
+    @contextmanager
+    def _locked(self) -> Any:
+        with self._local_lock:
+            self._ensure_lock_parent()
+            with _exclusive_lock(
+                self.lock_path,
+                timeout=10.0,
+                stale_after=60.0,
+            ):
+                yield
 
     def _eligible_claims(
         self,
@@ -196,16 +307,15 @@ class LivingSelfService:
         return sorted(eligible, key=_claim_sort_key)
 
     def _parent_version_id(self) -> Optional[str]:
-        if not self.current_path.is_file():
+        text = safe_read_text(self.current_path)
+        if text is None:
             return None
         try:
-            value = json.loads(self.current_path.read_text(encoding="utf-8"))
+            value = json.loads(text)
             if not isinstance(value, Mapping):
                 return None
             validate_living_self_version(value)
         except (
-            OSError,
-            UnicodeError,
             json.JSONDecodeError,
             ModelValidationError,
         ):
@@ -568,3 +678,357 @@ class LivingSelfService:
         }
         validate_living_self_version(candidate)
         return candidate
+
+    def _new_version_id(self) -> str:
+        return "lsv_" + uuid.uuid4().hex
+
+    def _version_paths(self, version_id: str) -> Any:
+        if not isinstance(version_id, str) or not VERSION_ID_PATTERN.fullmatch(
+            version_id
+        ):
+            raise ValueError("invalid Living Self version ID")
+        base = self.versions_dir / version_id
+        return base.with_suffix(".json"), base.with_suffix(".md")
+
+    def _validate_persisted_version(
+        self,
+        value: Mapping[str, Any],
+        *,
+        expected_version_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise ValueError("Living Self version must be an object")
+        version = json.loads(json.dumps(value, ensure_ascii=False))
+        expected_fields = set(VERSION_BASE_FIELDS) | {"reason"}
+        if version.get("generation_reason") == "manual_restore":
+            expected_fields.add("restored_from")
+        if set(version) != expected_fields:
+            raise ValueError("Living Self version fields do not match contract")
+        if version.get("status") != "confirmed":
+            raise ValueError("Living Self history must contain confirmed versions")
+        _require_reason(version.get("reason"))
+        if version.get("generation_reason") == "manual_restore":
+            restored_from = version.get("restored_from")
+            if (
+                not isinstance(restored_from, str)
+                or not VERSION_ID_PATTERN.fullmatch(restored_from)
+                or restored_from == version.get("version_id")
+            ):
+                raise ValueError("restored_from must reference another version")
+        if (
+            expected_version_id is not None
+            and version.get("version_id") != expected_version_id
+        ):
+            raise ValueError("Living Self filename and version ID differ")
+        if not VERSION_ID_PATTERN.fullmatch(str(version.get("version_id") or "")):
+            raise ValueError("invalid Living Self version ID")
+        try:
+            validate_living_self_version(version)
+        except ModelValidationError as exc:
+            raise ValueError("invalid Living Self version: " + exc.code) from exc
+        if version["content_hash"] != _hash(version["sections"]):
+            raise ValueError("Living Self content hash mismatch")
+        return version
+
+    def _read_json_object(self, path: Path) -> Dict[str, Any]:
+        text = safe_read_text(path)
+        if text is None:
+            raise FileNotFoundError(str(path))
+        if len(text.encode("utf-8")) > MAX_VERSION_BYTES:
+            raise ValueError("Living Self version exceeds size limit")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Living Self version is not valid JSON") from exc
+        if not isinstance(value, dict):
+            raise ValueError("Living Self version must be an object")
+        return value
+
+    def _load_version_unlocked(self, version_id: str) -> Dict[str, Any]:
+        json_path, markdown_path = self._version_paths(version_id)
+        if not safe_regular_exists(json_path):
+            raise FileNotFoundError(str(json_path))
+        version = self._validate_persisted_version(
+            self._read_json_object(json_path),
+            expected_version_id=version_id,
+        )
+        expected_markdown = self._render_markdown(version)
+        markdown = safe_read_text(markdown_path)
+        if markdown != expected_markdown:
+            safe_atomic_write_text(markdown_path, expected_markdown)
+        return version
+
+    def _read_current_unlocked(
+        self,
+        *,
+        required: bool,
+    ) -> Optional[Dict[str, Any]]:
+        text = safe_read_text(self.current_path)
+        if text is None:
+            if required:
+                raise FileNotFoundError(str(self.current_path))
+            return None
+        current = self._validate_persisted_version(
+            self._read_json_object(self.current_path)
+        )
+        historical = self._load_version_unlocked(current["version_id"])
+        if _canonical(current) != _canonical(historical):
+            raise ValueError("Living Self current differs from immutable history")
+        expected_markdown = self._render_markdown(current)
+        if safe_read_text(self.current_md_path) != expected_markdown:
+            safe_atomic_write_text(self.current_md_path, expected_markdown)
+        return current
+
+    def _render_markdown(self, version: Mapping[str, Any]) -> str:
+        lines = [
+            "# Living Self",
+            "",
+            "Version: " + str(version["version_id"]),
+            "Status: " + str(version["status"]),
+            "Reason: " + str(version["reason"]),
+            "Generated: " + str(version["generated_at"]),
+            "Confirmed: " + str(version["confirmed_at"]),
+            "Claim watermark: " + str(version["based_on_claim_seq"]),
+            "",
+        ]
+        if version.get("restored_from"):
+            lines.extend(
+                ["Restored from: " + str(version["restored_from"]), ""]
+            )
+        for section in sorted(LIVING_SELF_SECTIONS):
+            lines.extend(["## " + section, ""])
+            items = version["sections"][section]
+            if not items:
+                lines.extend(["No evidence-backed items.", ""])
+                continue
+            for item in sorted(items, key=lambda row: str(row["item_id"])):
+                lines.extend(
+                    [
+                        "### " + str(item["title"]),
+                        "",
+                        str(item["summary"]),
+                        "",
+                        "Item ID: " + str(item["item_id"]),
+                        "Status: " + str(item["status"]),
+                        "Evidence IDs: "
+                        + ", ".join(item.get("evidence_ids") or []),
+                        "Counter evidence IDs: "
+                        + ", ".join(item.get("counter_evidence_ids") or []),
+                        "Claim IDs: " + ", ".join(item.get("claim_ids") or []),
+                        "",
+                    ]
+                )
+        return "\n".join(lines)
+
+    def _persist_version_pair(self, version: Mapping[str, Any]) -> None:
+        json_path, markdown_path = self._version_paths(str(version["version_id"]))
+        if safe_regular_exists(json_path) or safe_regular_exists(markdown_path):
+            raise FileExistsError(str(json_path))
+        safe_atomic_write_text(json_path, _json_text(version))
+        safe_atomic_write_text(markdown_path, self._render_markdown(version))
+
+    def _publish_current_pair(self, version: Mapping[str, Any]) -> None:
+        safe_atomic_write_text(self.current_path, _json_text(version))
+        safe_atomic_write_text(
+            self.current_md_path,
+            self._render_markdown(version),
+        )
+
+    def _validate_candidate_unlocked(
+        self,
+        candidate: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(candidate, Mapping):
+            raise ValueError("candidate must be an object")
+        value = json.loads(json.dumps(candidate, ensure_ascii=False))
+        if set(value) != set(VERSION_BASE_FIELDS):
+            raise ValueError("candidate fields do not match contract")
+        try:
+            validate_living_self_version(value)
+        except ModelValidationError as exc:
+            raise ValueError("candidate is invalid: " + exc.code) from exc
+        if (
+            value["status"] != "candidate"
+            or value["confirmed_at"] is not None
+            or value["generation_reason"] not in {
+                "claim_change",
+                "scheduled_rebuild",
+            }
+            or value["content_hash"] != _hash(value["sections"])
+            or value["version_id"]
+            != "lsv_" + value["content_hash"][7:39]
+        ):
+            raise ValueError("candidate state is invalid")
+        current = self._read_current_unlocked(required=False)
+        fresh = self.build_candidate()
+        for field in ("sections", "content_hash", "based_on_claim_seq"):
+            if value[field] != fresh[field]:
+                raise ValueError("candidate does not match current Claim authority")
+        if (
+            value["generation_reason"] != fresh["generation_reason"]
+            or _parsed_time(str(value["generated_at"]))
+            > _parsed_time(str(fresh["generated_at"]))
+        ):
+            raise ValueError("candidate generation metadata is invalid")
+        parent = value["parent_version_id"]
+        if current is None:
+            if parent is not None:
+                raise ValueError("candidate parent does not exist")
+        elif parent != current["version_id"]:
+            raise LivingSelfConflict(
+                "stale_candidate",
+                "candidate parent is not the current Living Self version",
+            )
+        return value
+
+    def _confirmed_from_candidate(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        reason: str,
+        current: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        confirmed_at = _latest(
+            (str(candidate["generated_at"]), str(self._clock()))
+        )
+        confirmed = dict(candidate)
+        confirmed.update(
+            {
+                "version_id": self._new_version_id(),
+                "parent_version_id": (
+                    current["version_id"] if current is not None else None
+                ),
+                "status": "confirmed",
+                "confirmed_at": confirmed_at,
+                "reason": reason,
+            }
+        )
+        return self._validate_persisted_version(confirmed)
+
+    def confirm(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        reason: str,
+    ) -> Dict[str, Any]:
+        resolved_reason = _require_reason(reason)
+        with self._locked():
+            validated = self._validate_candidate_unlocked(candidate)
+            current = self._read_current_unlocked(required=False)
+            confirmed = self._confirmed_from_candidate(
+                validated,
+                reason=resolved_reason,
+                current=current,
+            )
+            self._persist_version_pair(confirmed)
+            self._publish_current_pair(confirmed)
+            return confirmed
+
+    def current(self) -> Dict[str, Any]:
+        with self._locked():
+            current = self._read_current_unlocked(required=True)
+            assert current is not None
+            return current
+
+    def versions(self) -> List[Dict[str, Any]]:
+        with self._locked():
+            versions = [
+                self._load_version_unlocked(name[:-5])
+                for name in _safe_regular_names(self.versions_dir)
+            ]
+            return sorted(
+                versions,
+                key=lambda item: (
+                    str(item["confirmed_at"]),
+                    str(item["version_id"]),
+                ),
+            )
+
+    def load_version(self, version_id: str) -> Dict[str, Any]:
+        with self._locked():
+            return self._load_version_unlocked(version_id)
+
+    @staticmethod
+    def _items_by_id(version: Mapping[str, Any]) -> Dict[str, Any]:
+        result = {}
+        for section, items in version["sections"].items():
+            for item in items:
+                item_id = str(item["item_id"])
+                if item_id in result:
+                    raise ValueError("duplicate Living Self item ID")
+                result[item_id] = {
+                    "section": section,
+                    "item": item,
+                }
+        return result
+
+    def diff(self, from_version_id: str, to_version_id: str) -> Dict[str, Any]:
+        with self._locked():
+            before = self._items_by_id(
+                self._load_version_unlocked(from_version_id)
+            )
+            after = self._items_by_id(
+                self._load_version_unlocked(to_version_id)
+            )
+            added = [
+                {
+                    "item_id": item_id,
+                    "section": after[item_id]["section"],
+                    "item": after[item_id]["item"],
+                }
+                for item_id in sorted(set(after) - set(before))
+            ]
+            removed = [
+                {
+                    "item_id": item_id,
+                    "section": before[item_id]["section"],
+                    "item": before[item_id]["item"],
+                }
+                for item_id in sorted(set(before) - set(after))
+            ]
+            changed = []
+            for item_id in sorted(set(before) & set(after)):
+                old = before[item_id]
+                new = after[item_id]
+                if _canonical(old) == _canonical(new):
+                    continue
+                changed.append(
+                    {
+                        "item_id": item_id,
+                        "from_section": old["section"],
+                        "to_section": new["section"],
+                        "before": old["item"],
+                        "after": new["item"],
+                    }
+                )
+            return {
+                "added": added,
+                "changed": changed,
+                "removed": removed,
+            }
+
+    def restore(self, version_id: str, *, reason: str) -> Dict[str, Any]:
+        resolved_reason = _require_reason(reason)
+        with self._locked():
+            source = self._load_version_unlocked(version_id)
+            current = self._read_current_unlocked(required=False)
+            now = _latest((str(source["generated_at"]), str(self._clock())))
+            restored = {
+                "version_id": self._new_version_id(),
+                "parent_version_id": (
+                    current["version_id"] if current is not None else None
+                ),
+                "status": "confirmed",
+                "generation_reason": "manual_restore",
+                "content_hash": source["content_hash"],
+                "based_on_claim_seq": source["based_on_claim_seq"],
+                "generated_at": now,
+                "confirmed_at": now,
+                "sections": source["sections"],
+                "reason": resolved_reason,
+                "restored_from": source["version_id"],
+            }
+            validated = self._validate_persisted_version(restored)
+            self._persist_version_pair(validated)
+            self._publish_current_pair(validated)
+            return validated
