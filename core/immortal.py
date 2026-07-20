@@ -45,6 +45,7 @@ from export_restore import (
     restore_check,
 )
 from index_writer import append_jsonl_records
+from judgment_store import InvalidJudgmentOperation, JudgmentStore
 from maintenance_gate import writer_access
 from model_migration import MigrationError, migrate_legacy_profile
 from state_store import mutate_state_atomic, update_state_atomic
@@ -222,8 +223,42 @@ def command_run(_args=None) -> int:
     return run_script("orchestrator.py")
 
 
+def command_cards(args) -> int:
+    try:
+        store = JudgmentStore(configured_vault_dir())
+        if args.action == "build":
+            return store.cli_build()
+        if args.action == "list":
+            return store.cli_list(limit=int(args.extra or 20))
+        return store.cli_stats()
+    except Exception as exc:
+        is_input_error = isinstance(exc, (InvalidJudgmentOperation, ValueError))
+        print(
+            json.dumps(
+                {
+                    "error": getattr(
+                        exc,
+                        "code",
+                        "invalid_argument" if is_input_error else "cards_failed",
+                    ),
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2 if is_input_error else 1
+
+
+def command_cards_build(args) -> int:
+    """Pipeline capability alias for the legacy cards-build stage name."""
+    return command_cards(args)
+
+
 PIPELINE_CAPABILITIES = {
     "run": command_run,
+    "cards-build": command_cards_build,
 }
 
 
@@ -2221,8 +2256,7 @@ def build_parser() -> argparse.ArgumentParser:
     cards_p = sub.add_parser("cards", help="判断力卡片盒（纠正即记忆）：build / list [n] / stats")
     cards_p.add_argument("action", nargs="?", default="build", choices=["build", "list", "stats"])
     cards_p.add_argument("extra", nargs="?", default=None)
-    cards_p.set_defaults(func=lambda args: run_script(
-        "cards.py", [args.action] + ([args.extra] if args.extra else [])))
+    cards_p.set_defaults(func=command_cards)
 
     brief = sub.add_parser("brief", help="Generate a local daily brief from recent records")
     brief.add_argument("--days", type=int, default=2)

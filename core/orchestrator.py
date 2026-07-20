@@ -56,6 +56,7 @@ REQUIRED_FAILURE_PREFIXES = (
 )
 
 REQUIRED_CORE_SCRIPTS = (
+    "immortal.py",
     "collect.py",
     "summary.py",
     "distill.py",
@@ -66,7 +67,6 @@ REQUIRED_CORE_SCRIPTS = (
     "index_db.py",
     "relationship_index.py",
     "quality_report.py",
-    "cards.py",
     "export_restore.py",
     "agent_bridge.py",
     "cleanup.py",
@@ -628,7 +628,7 @@ def quality_report():
 
 def cards_build():
     log("=== 阶段 5H: 构建判断力卡片盒（纠正即记忆）===")
-    ok, out = run_script("cards.py", "build", timeout=180)
+    ok, out = run_script("immortal.py", "cards", "build", timeout=180)
     if ok:
         line = out.strip().splitlines()[-1] if out.strip() else "done"
         log(f"判断力卡片盒已更新: {line[:240]}")
