@@ -238,6 +238,7 @@ class JsonlEventStore:
         mode = "r+b" if recover_tail else "rb"
         with self.path.open(mode) as handle:
             seen_event_ids = set()
+            seen_idempotency_keys = set()
             stream_versions: Dict[str, int] = {}
             expected_seq = 1
             line_number = 0
@@ -254,7 +255,11 @@ class JsonlEventStore:
                         line_number=line_number,
                     )
                 if not raw.strip():
-                    continue
+                    raise EventCorruption(
+                        "blank_event_line",
+                        "event log contains a blank line",
+                        line_number=line_number,
+                    )
                 complete_line = raw.endswith(b"\n")
                 payload = raw[:-1] if complete_line else raw
                 needs_terminator = False
@@ -295,6 +300,14 @@ class JsonlEventStore:
                         line_number=line_number,
                     )
                 seen_event_ids.add(event_id)
+                idempotency_key = str(row["idempotency_key"])
+                if idempotency_key in seen_idempotency_keys:
+                    raise EventCorruption(
+                        "duplicate_idempotency_key",
+                        "duplicate idempotency key in event log",
+                        line_number=line_number,
+                    )
+                seen_idempotency_keys.add(idempotency_key)
                 seq = int(row["seq"])
                 if seq != expected_seq:
                     raise EventCorruption(

@@ -285,6 +285,25 @@ def test_middle_corruption_fails_closed_without_modifying_file(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_middle_blank_line_is_corruption_not_silently_skipped(tmp_path):
+    path = tmp_path / "events.jsonl"
+    first = {**event("evt-1"), "seq": 1}
+    second = {**event("evt-2", expected_version=1), "seq": 2}
+    path.write_text(
+        json.dumps(first, sort_keys=True)
+        + "\n\n"
+        + json.dumps(second, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EventCorruption) as captured:
+        JsonlEventStore(path).read_all()
+
+    assert captured.value.code == "blank_event_line"
+    assert captured.value.line_number == 2
+
+
 def test_complete_but_invalid_tail_fails_closed_without_truncation(tmp_path):
     path = tmp_path / "events.jsonl"
     first = {**event("evt-1"), "seq": 1}
@@ -325,6 +344,33 @@ def test_replay_rejects_duplicate_ids_and_non_monotonic_versions(tmp_path):
     with pytest.raises(EventCorruption) as version_error:
         JsonlEventStore(version_path).read_all()
     assert version_error.value.code == "non_monotonic_stream_version"
+
+
+def test_replay_rejects_duplicate_idempotency_keys_in_existing_log(tmp_path):
+    path = tmp_path / "events.jsonl"
+    first = {**event("evt-1", key="idem-shared", value=1), "seq": 1}
+    second = {
+        **event(
+            "evt-2",
+            expected_version=1,
+            key="idem-shared",
+            value=2,
+        ),
+        "seq": 2,
+    }
+    path.write_text(
+        json.dumps(first, sort_keys=True)
+        + "\n"
+        + json.dumps(second, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EventCorruption) as captured:
+        JsonlEventStore(path).read_all()
+
+    assert captured.value.code == "duplicate_idempotency_key"
+    assert captured.value.line_number == 2
 
 
 def test_replay_is_bounded_and_supports_paging_and_projection(tmp_path):
