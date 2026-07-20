@@ -98,7 +98,9 @@ def test_migration_is_idempotent_deterministic_and_keeps_legacy_file(tmp_path):
     assert event["event_id"].startswith("evt_migrate_")
     assert event["idempotency_key"].startswith("claim:public:v1:")
     assert event["actor"] == {"kind": "migration", "id": "legacy-profile-v1"}
-    assert event["migration_source"] == "reviewed/profile_memories.jsonl"
+    assert event["migration_source"].startswith(
+        "reviewed/profile_memories.jsonl#sha256:"
+    )
 
     clone = tmp_path / "clone"
     seed_evidence(clone, "ev-1")
@@ -392,15 +394,15 @@ def test_checkpoint_progress_must_match_prepared_and_committed_claims(tmp_path):
     report = migrate_legacy_profile(tmp_path, checkpoint_every=1)
     checkpoint = Path(report["checkpoint"])
     payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    payload["next_index"] = 99
+    original = dict(payload)
+    payload["candidate_ids"] = payload["candidate_ids"] + ["clm_unknown"]
     checkpoint.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(MigrationError) as ahead:
         migrate_legacy_profile(tmp_path, checkpoint_every=1)
     assert ahead.value.code == "malformed_checkpoint"
 
-    payload["next_index"] = 1
-    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+    checkpoint.write_text(json.dumps(original), encoding="utf-8")
     shutil.rmtree(tmp_path / "model" / "claims")
     with pytest.raises(MigrationError) as missing:
         migrate_legacy_profile(tmp_path, checkpoint_every=1)
@@ -439,7 +441,7 @@ def test_existing_deterministic_claim_id_requires_exact_migration_provenance(
     assert len(event_rows(tmp_path)) == 1
 
 
-def test_completed_migration_rejects_later_stream_transition_as_same_state(
+def test_tampered_first_migration_digest_conflicts_after_legal_transition(
     tmp_path,
 ):
     seed_evidence(tmp_path, "ev-1")
@@ -453,18 +455,321 @@ def test_completed_migration_rejects_later_stream_transition_as_same_state(
     store.transition(
         claim_id,
         "confirmed",
-        reason="owner confirmed later",
+        reason="owner confirmed",
         expected_revision=1,
-        request_id="req-confirm-later",
-        idempotency_key="idem-confirm-later",
+        request_id="req-confirm-before-tamper",
+        idempotency_key="idem-confirm-before-tamper",
         actor={"kind": "owner", "id": "owner"},
     )
+    events_path = tmp_path / "model" / "claims" / "events.jsonl"
+    rows = event_rows(tmp_path)
+    rows[0]["migration_source"] = (
+        "reviewed/profile_memories.jsonl#sha256:"
+        + ("0" * 64)
+        + ";index_sha256:"
+        + ("1" * 64)
+    )
+    write_jsonl(events_path, rows)
 
     with pytest.raises(MigrationError) as captured:
         migrate_legacy_profile(tmp_path)
 
     assert captured.value.code == "migration_state_conflict"
+
+
+@pytest.mark.parametrize("status", ["confirmed", "rejected"])
+def test_rerun_accepts_legal_post_migration_transition(tmp_path, status):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    migrate_legacy_profile(tmp_path)
+    store = ClaimStore(tmp_path)
+    claim_id = current_rows(tmp_path)[0]["claim_id"]
+    store.transition(
+        claim_id,
+        status,
+        reason="owner reviewed migrated candidate",
+        expected_revision=1,
+        request_id="req-review-" + status,
+        idempotency_key="idem-review-" + status,
+        actor={"kind": "owner", "id": "owner"},
+    )
+
+    rerun = migrate_legacy_profile(tmp_path)
+
+    assert rerun["created"] == 0
+    assert rerun["skipped"] == 1
+    assert ClaimStore(tmp_path).get(claim_id)["status"] == status
+
+
+def test_rerun_accepts_legal_correction_after_migration(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    migrate_legacy_profile(tmp_path)
+    store = ClaimStore(tmp_path)
+    claim_id = current_rows(tmp_path)[0]["claim_id"]
+    store.transition(
+        claim_id,
+        "confirmed",
+        reason="owner confirmed",
+        expected_revision=1,
+        request_id="req-confirm-before-correct",
+        idempotency_key="idem-confirm-before-correct",
+        actor={"kind": "owner", "id": "owner"},
+    )
+    replacement = store.correct(
+        claim_id,
+        "偏好短句和短段落",
+        reason="owner corrected precision",
+        expected_revision=2,
+        request_id="req-correct-migrated",
+        idempotency_key="idem-correct-migrated",
+        actor={"kind": "owner", "id": "owner"},
+    )
+
+    rerun = migrate_legacy_profile(tmp_path)
+
+    assert rerun["created"] == 0
+    assert rerun["skipped"] == 1
+    assert ClaimStore(tmp_path).get(claim_id)["status"] == "superseded"
+    assert ClaimStore(tmp_path).get(replacement["claim_id"])["status"] == "confirmed"
+
+
+def test_rerun_accepts_reconsidered_migrated_claim(tmp_path):
+    seed_evidence(tmp_path, "ev-1", "ev-new")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    migrate_legacy_profile(tmp_path)
+    store = ClaimStore(tmp_path)
+    claim_id = current_rows(tmp_path)[0]["claim_id"]
+    store.transition(
+        claim_id,
+        "rejected",
+        reason="owner rejected",
+        expected_revision=1,
+        request_id="req-reject-before-reconsider",
+        idempotency_key="idem-reject-before-reconsider",
+        actor={"kind": "owner", "id": "owner"},
+    )
+    store.reconsider(
+        claim_id,
+        evidence_ids=["ev-new"],
+        reason="new evidence",
+        expected_revision=2,
+        request_id="req-reconsider-migrated",
+        idempotency_key="idem-reconsider-migrated",
+        actor={"kind": "owner", "id": "owner"},
+    )
+
+    rerun = migrate_legacy_profile(tmp_path)
+
+    assert rerun["created"] == 0
+    assert rerun["skipped"] == 1
+    assert ClaimStore(tmp_path).get(claim_id)["status"] == "candidate"
+    assert ClaimStore(tmp_path).get(claim_id)["revision"] == 3
+
+
+def test_bad_sqlite_catalog_becomes_stable_migration_and_cli_json_error(
+    tmp_path,
+    capsys,
+):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    (tmp_path / "search_index.db").write_bytes(b"not sqlite")
+
+    with pytest.raises(MigrationError) as direct:
+        migrate_legacy_profile(tmp_path)
+    assert direct.value.code == "database_untrusted"
+
+    code = immortal.main(
+        ["claims-migrate", "--vault-dir", str(tmp_path), "--json"]
+    )
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code != 0
+    assert captured.err == ""
+    assert payload["ok"] is False
+    assert payload["error_code"] == "database_untrusted"
+
+
+def test_checkpoint_allows_previously_broken_evidence_to_be_repaired(tmp_path):
+    seed_evidence(tmp_path, "ev-present")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [
+            legacy_row("mem-missing", "ev-repaired"),
+            legacy_row("mem-present", "ev-present"),
+        ],
+    )
+
+    first = migrate_legacy_profile(tmp_path, checkpoint_every=1)
+    assert first["created"] == 1
+    assert first["source_broken"] == 1
+
+    seed_evidence(tmp_path, "ev-present", "ev-repaired")
+    repaired = migrate_legacy_profile(tmp_path, checkpoint_every=1)
+
+    assert repaired["created"] == 1
+    assert repaired["source_broken"] == 0
     assert len(event_rows(tmp_path)) == 2
+    checkpoint = json.loads(
+        Path(repaired["checkpoint"]).read_text(encoding="utf-8")
+    )
+    assert checkpoint["candidate_ids"] == sorted(
+        [
+            legacy_claim_id("reviewed", "mem-missing"),
+            legacy_claim_id("reviewed", "mem-present"),
+        ]
+    )
+    assert checkpoint["committed_claim_ids"] == checkpoint["candidate_ids"]
+
+
+def test_checkpoint_rejects_unknown_or_uncommitted_claim_ids(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(report["checkpoint"])
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload["committed_claim_ids"].append("clm_poisoned")
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code == "malformed_checkpoint"
+
+
+@pytest.mark.parametrize("digest_field", ["source_digest", "index_digest"])
+def test_checkpoint_rejects_malformed_digest_contract(tmp_path, digest_field):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+    report = migrate_legacy_profile(tmp_path)
+    checkpoint = Path(report["checkpoint"])
+    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+    payload[digest_field] = "not-a-sha256"
+    checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path)
+
+    assert captured.value.code in {
+        "malformed_checkpoint",
+        "migration_source_changed",
+    }
+
+
+@pytest.mark.parametrize("changed_source", ["reviewed", "nuwa", "index"])
+def test_source_replacement_after_snapshot_fails_before_first_write(
+    tmp_path,
+    monkeypatch,
+    changed_source,
+):
+    seed_evidence(tmp_path, "ev-reviewed", "ev-nuwa")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-reviewed")],
+    )
+    (tmp_path / "profile_nuwa.json").write_text(
+        json.dumps(
+            {
+                "mental_models": [
+                    {
+                        "id": "model-1",
+                        "summary": "证据优先",
+                        "status": "accepted",
+                        "evidence_ids": ["ev-nuwa"],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    import model_migration
+
+    def replace_source():
+        target = {
+            "reviewed": tmp_path / "reviewed" / "profile_memories.jsonl",
+            "nuwa": tmp_path / "profile_nuwa.json",
+            "index": tmp_path / "index.jsonl",
+        }[changed_source]
+        replacement = target.with_name(target.name + ".replacement")
+        replacement.write_bytes(target.read_bytes() + b" ")
+        replacement.replace(target)
+
+    monkeypatch.setattr(
+        model_migration,
+        "after_snapshot_prepared",
+        replace_source,
+        raising=False,
+    )
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path, checkpoint_every=1)
+
+    assert captured.value.code == "source_changed"
+    assert not (tmp_path / "model" / "claims" / "events.jsonl").exists()
+
+
+def test_source_replacement_during_batch_stops_before_next_claim(
+    tmp_path,
+    monkeypatch,
+):
+    seed_evidence(tmp_path, "ev-1", "ev-2")
+    source = tmp_path / "reviewed" / "profile_memories.jsonl"
+    write_jsonl(
+        source,
+        [legacy_row("mem-1", "ev-1"), legacy_row("mem-2", "ev-2")],
+    )
+    import model_migration
+
+    def replace_after_first(created):
+        if created != 1:
+            return
+        replacement = source.with_name(source.name + ".replacement")
+        replacement.write_bytes(source.read_bytes() + b" ")
+        replacement.replace(source)
+
+    monkeypatch.setattr(model_migration, "after_claim_commit", replace_after_first)
+    with pytest.raises(MigrationError) as captured:
+        migrate_legacy_profile(tmp_path, checkpoint_every=1)
+
+    assert captured.value.code == "source_changed"
+    assert len(event_rows(tmp_path)) == 1
+
+
+def test_event_and_report_retain_bound_source_digests(tmp_path):
+    seed_evidence(tmp_path, "ev-1")
+    write_jsonl(
+        tmp_path / "reviewed" / "profile_memories.jsonl",
+        [legacy_row("mem-1", "ev-1")],
+    )
+
+    report = migrate_legacy_profile(tmp_path)
+
+    assert len(report["source_digest"]) == 64
+    assert len(report["index_digest"]) == 64
+    event = event_rows(tmp_path)[0]
+    reviewed_digest = report["source_digests"][
+        "reviewed/profile_memories.jsonl"
+    ]
+    assert "sha256:" + reviewed_digest in event["migration_source"]
+    assert "index_sha256:" + report["index_digest"] in event["migration_source"]
 
 
 def test_cli_reports_json_and_nonzero_failure_truthfully(tmp_path, capsys):

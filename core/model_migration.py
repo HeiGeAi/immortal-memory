@@ -8,19 +8,25 @@ import json
 import os
 import stat
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from claim_store import ClaimStore, InvalidTransition
-from event_store import JsonlEventStore, safe_atomic_write_text
+from event_store import (
+    EventCorruption,
+    EventPathError,
+    JsonlEventStore,
+    safe_atomic_write_text,
+)
 from evidence_catalog import EvidenceCatalog, EvidenceCatalogError
 from model_types import ModelValidationError, new_claim, validate_claim
 
 
 MIGRATION_ID = "legacy-profile-v1"
 MIGRATION_ACTOR = {"kind": "migration", "id": MIGRATION_ID}
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 DEFAULT_CHECKPOINT_EVERY = 100
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
+MAX_EVIDENCE_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_SOURCE_LINE_BYTES = 1024 * 1024
 MAX_SOURCE_RECORDS = 100_000
 DETERMINISTIC_TIME = "1970-01-01T00:00:00+00:00"
@@ -36,6 +42,10 @@ class MigrationError(RuntimeError):
 
 def after_claim_commit(created: int) -> None:
     """Fault-injection boundary for crash-resume tests."""
+
+
+def after_snapshot_prepared() -> None:
+    """Fault-injection boundary before the first authoritative write."""
 
 
 def _absolute(path: Path) -> Path:
@@ -141,6 +151,122 @@ def _read_optional_regular(path: Path) -> Optional[bytes]:
         os.close(descriptor)
 
 
+def _signature(metadata: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _capture_binding(path: Path, *, max_bytes: int) -> Dict[str, Any]:
+    candidate = _assert_safe_chain(path)
+    try:
+        before = os.lstat(str(candidate))
+    except FileNotFoundError:
+        return {
+            "path": str(candidate),
+            "exists": False,
+            "signature": None,
+            "digest": hashlib.sha256(b"<missing>").hexdigest(),
+        }
+    except OSError as exc:
+        raise MigrationError(
+            "source_unreadable",
+            "bound migration source cannot be inspected",
+        ) from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise MigrationError(
+            "unsafe_path",
+            "bound migration sources must be regular files",
+        )
+    if before.st_size > max_bytes:
+        raise MigrationError(
+            "migration_source_too_large",
+            "bound migration source exceeds the size limit",
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(candidate), flags)
+    except OSError as exc:
+        raise MigrationError(
+            "source_unreadable",
+            "bound migration source cannot be opened safely",
+        ) from exc
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _signature(opened) != _signature(before):
+            raise MigrationError(
+                "source_changed",
+                "bound migration source changed during open",
+            )
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise MigrationError(
+                    "migration_source_too_large",
+                    "bound migration source exceeds the size limit",
+                )
+            digest.update(chunk)
+        after = os.lstat(str(candidate))
+        if _signature(after) != _signature(before):
+            raise MigrationError(
+                "source_changed",
+                "bound migration source changed while hashing",
+            )
+        return {
+            "path": str(candidate),
+            "exists": True,
+            "signature": _signature(before),
+            "digest": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _verify_binding(binding: Mapping[str, Any]) -> None:
+    path = _assert_safe_chain(Path(str(binding["path"])))
+    try:
+        metadata = os.lstat(str(path))
+    except FileNotFoundError:
+        if binding["exists"]:
+            raise MigrationError(
+                "source_changed",
+                "bound migration source disappeared",
+            )
+        return
+    except OSError as exc:
+        raise MigrationError(
+            "source_changed",
+            "bound migration source cannot be revalidated",
+        ) from exc
+    if (
+        not binding["exists"]
+        or not stat.S_ISREG(metadata.st_mode)
+        or _signature(metadata) != tuple(binding["signature"])
+    ):
+        raise MigrationError(
+            "source_changed",
+            "bound migration source identity changed",
+        )
+
+
+def _verify_bindings(bindings: Iterable[Mapping[str, Any]]) -> None:
+    for binding in bindings:
+        _verify_binding(binding)
+
+
 def _decode_jsonl(body: Optional[bytes], source_name: str) -> List[Dict[str, Any]]:
     if body is None:
         return []
@@ -212,6 +338,56 @@ def _source_digest(reviewed: Optional[bytes], nuwa: Optional[bytes]) -> str:
         digest.update(b"<missing>" if body is None else body)
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _body_digest(body: Optional[bytes]) -> str:
+    return hashlib.sha256(
+        b"<missing>" if body is None else body
+    ).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _migration_provenance(
+    source_name: str,
+    *,
+    source_digest: str,
+    index_digest: str,
+) -> str:
+    return (
+        source_name
+        + "#sha256:"
+        + source_digest
+        + ";index_sha256:"
+        + index_digest
+    )
+
+
+def _valid_migration_provenance(
+    value: Any,
+    *,
+    source_name: str,
+    source_digest: str,
+) -> bool:
+    prefix = (
+        source_name
+        + "#sha256:"
+        + source_digest
+        + ";index_sha256:"
+    )
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return False
+    index_digest = value[len(prefix) :]
+    return (
+        len(index_digest) == 64
+        and all(character in "0123456789abcdef" for character in index_digest)
+    )
 
 
 def _stable_digest(kind: str, legacy_id: str) -> str:
@@ -454,15 +630,36 @@ def _read_checkpoint(
             "malformed_checkpoint",
             "migration checkpoint is malformed",
         ) from exc
+    valid_lists = True
+    for field in ("candidate_ids", "committed_claim_ids"):
+        items = value.get(field) if isinstance(value, dict) else None
+        if (
+            not isinstance(items, list)
+            or any(not isinstance(item, str) or not item for item in items)
+            or items != sorted(set(items))
+        ):
+            valid_lists = False
     if (
         not isinstance(value, dict)
+        or set(value)
+        != {
+            "candidate_ids",
+            "committed_claim_ids",
+            "complete",
+            "index_digest",
+            "migration_id",
+            "schema_version",
+            "source_digest",
+        }
         or value.get("schema_version") != CHECKPOINT_VERSION
         or value.get("migration_id") != MIGRATION_ID
-        or not isinstance(value.get("next_index"), int)
-        or isinstance(value.get("next_index"), bool)
-        or int(value["next_index"]) < 0
         or not isinstance(value.get("complete"), bool)
-        or not isinstance(value.get("source_digest"), str)
+        or not _is_sha256(value.get("source_digest"))
+        or not _is_sha256(value.get("index_digest"))
+        or not valid_lists
+        or not set(value.get("committed_claim_ids") or []).issubset(
+            set(value.get("candidate_ids") or [])
+        )
     ):
         raise MigrationError(
             "malformed_checkpoint",
@@ -480,14 +677,18 @@ def _write_checkpoint(
     path: Path,
     *,
     source_digest: str,
-    next_index: int,
+    index_digest: str,
+    candidate_ids: List[str],
+    committed_claim_ids: List[str],
     complete: bool,
 ) -> None:
     payload = {
         "schema_version": CHECKPOINT_VERSION,
         "migration_id": MIGRATION_ID,
         "source_digest": source_digest,
-        "next_index": next_index,
+        "index_digest": index_digest,
+        "candidate_ids": sorted(set(candidate_ids)),
+        "committed_claim_ids": sorted(set(committed_claim_ids)),
         "complete": complete,
     }
     safe_atomic_write_text(
@@ -545,13 +746,13 @@ def _claim_intent(value: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _verify_existing_migration_state(
     vault: Path,
-    prepared: List[Dict[str, Any]],
+    raw_items: List[Dict[str, Any]],
     current: Mapping[str, Mapping[str, Any]],
 ) -> None:
     expected = {
-        item["claim"]["claim_id"]: item
-        for item in prepared
-        if item["claim"]["claim_id"] in current
+        item["claim_id"]: item
+        for item in raw_items
+        if item["claim_id"] in current
     }
     if not expected:
         return
@@ -573,17 +774,28 @@ def _verify_existing_migration_state(
     for claim_id, item in expected.items():
         events = events_by_stream[claim_id]
         first = events[0] if events else {}
+        initial = item.get("initial")
+        payload = first.get("payload")
+        first_claim = payload.get("claim") if isinstance(payload, Mapping) else None
         valid = (
-            len(events) == 1
+            initial is not None
+            and len(events) >= 1
             and first.get("event_type") == "claim.created"
-            and first.get("event_id") == item["event_id"]
-            and first.get("request_id") == item["request_id"]
+            and first.get("stream_version") == 1
+            and first.get("expected_version") == 0
+            and first.get("event_id") == initial["event_id"]
+            and first.get("request_id") == initial["request_id"]
             and first.get("idempotency_key")
-            == ClaimStore._public_idempotency_key(item["idempotency_key"])
+            == ClaimStore._public_idempotency_key(initial["idempotency_key"])
             and first.get("actor") == MIGRATION_ACTOR
-            and first.get("migration_source") == item["migration_source"]
-            and _canonical(_claim_intent(current[claim_id]))
-            == _canonical(_claim_intent(item["claim"]))
+            and _valid_migration_provenance(
+                first.get("migration_source"),
+                source_name=item["source_name"],
+                source_digest=item["source_digest"],
+            )
+            and isinstance(first_claim, Mapping)
+            and _canonical(_claim_intent(first_claim))
+            == _canonical(_claim_intent(initial["claim"]))
         )
         if not valid:
             raise MigrationError(
@@ -597,8 +809,15 @@ def _prepare_candidates(
     vault: Path,
     reviewed_rows: List[Dict[str, Any]],
     nuwa: Mapping[str, Any],
-) -> Tuple[List[Dict[str, Any]], int, int, List[str]]:
-    catalog = EvidenceCatalog(vault / "index.jsonl")
+    source_digests: Mapping[str, str],
+    index_digest: str,
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    int,
+    int,
+    List[str],
+]:
     reviewed_evidence: Dict[str, List[str]] = {}
     raw_candidates: List[Tuple[Dict[str, Any], str, str, str, bool]] = []
     excluded = 0
@@ -671,24 +890,73 @@ def _prepare_candidates(
             (row, "nuwa", legacy_id, "profile_nuwa.json", True)
         )
 
-    prepared: List[Dict[str, Any]] = []
-    source_broken = 0
-    broken_ids: List[str] = []
-    resolved_cache: Dict[str, bool] = {}
+    raw_items: List[Dict[str, Any]] = []
     for row, kind, legacy_id, source_name, nuwa_row in raw_candidates:
         ids = _evidence_ids(
             row,
             reviewed_evidence=reviewed_evidence if nuwa_row else None,
         )
+        provenance = _migration_provenance(
+            source_name,
+            source_digest=source_digests[source_name],
+            index_digest=index_digest,
+        )
+        initial: Optional[Dict[str, Any]] = None
+        if ids:
+            try:
+                initial = _candidate(
+                    row=row,
+                    kind=kind,
+                    legacy_id=legacy_id,
+                    evidence_ids=ids,
+                    migration_source=provenance,
+                    nuwa=nuwa_row,
+                )
+            except (ModelValidationError, ValueError) as exc:
+                raise MigrationError(
+                    "malformed_legacy_source",
+                    "legacy row cannot form a valid candidate Claim",
+                ) from exc
+        raw_items.append(
+            {
+                "claim_id": legacy_claim_id(kind, legacy_id),
+                "evidence_ids": ids,
+                "initial": initial,
+                "kind": kind,
+                "legacy_id": legacy_id,
+                "source_name": source_name,
+                "source_digest": source_digests[source_name],
+            }
+        )
+
+    catalog: Optional[EvidenceCatalog] = None
+    if any(item["evidence_ids"] for item in raw_items):
+        try:
+            catalog = EvidenceCatalog(vault / "index.jsonl")
+        except EvidenceCatalogError as exc:
+            raise MigrationError(exc.code, str(exc)) from exc
+
+    prepared: List[Dict[str, Any]] = []
+    source_broken = 0
+    broken_ids: List[str] = []
+    resolved_cache: Dict[str, bool] = {}
+    for item in raw_items:
+        ids = item["evidence_ids"]
         if not ids:
             source_broken += 1
-            broken_ids.append(kind + ":" + legacy_id + ":missing_evidence")
+            broken_ids.append(
+                item["kind"]
+                + ":"
+                + item["legacy_id"]
+                + ":missing_evidence"
+            )
             continue
         available: List[str] = []
         row_broken = False
         for evidence_id in ids:
             if evidence_id not in resolved_cache:
                 try:
+                    assert catalog is not None
                     ref = catalog.resolve(evidence_id)
                 except EvidenceCatalogError as exc:
                     if exc.code == "evidence_not_found":
@@ -705,26 +973,19 @@ def _prepare_candidates(
         if row_broken or not available:
             source_broken += 1
             continue
-        try:
-            prepared.append(
-                _candidate(
-                    row=row,
-                    kind=kind,
-                    legacy_id=legacy_id,
-                    evidence_ids=available,
-                    migration_source=source_name,
-                    nuwa=nuwa_row,
-                )
-            )
-        except (ModelValidationError, ValueError) as exc:
-            raise MigrationError(
-                "malformed_legacy_source",
-                "legacy row cannot form a valid candidate Claim",
-            ) from exc
-    return prepared, excluded, source_broken, sorted(set(broken_ids))
+        assert available == ids
+        assert item["initial"] is not None
+        prepared.append(item["initial"])
+    return (
+        raw_items,
+        prepared,
+        excluded,
+        source_broken,
+        sorted(set(broken_ids)),
+    )
 
 
-def migrate_legacy_profile(
+def _migrate_legacy_profile(
     vault_dir: Path,
     *,
     dry_run: bool = False,
@@ -745,9 +1006,31 @@ def migrate_legacy_profile(
     checkpoint_path = (
         vault / "model" / "migrations" / MIGRATION_ID / "checkpoint.json"
     )
+    index_path = vault / "index.jsonl"
 
     reviewed_body = _read_optional_regular(reviewed_path)
     nuwa_body = _read_optional_regular(nuwa_path)
+    reviewed_binding = _capture_binding(
+        reviewed_path,
+        max_bytes=MAX_SOURCE_BYTES,
+    )
+    nuwa_binding = _capture_binding(
+        nuwa_path,
+        max_bytes=MAX_SOURCE_BYTES,
+    )
+    index_binding = _capture_binding(
+        index_path,
+        max_bytes=MAX_EVIDENCE_SOURCE_BYTES,
+    )
+    if (
+        reviewed_binding["digest"] != _body_digest(reviewed_body)
+        or nuwa_binding["digest"] != _body_digest(nuwa_body)
+    ):
+        raise MigrationError(
+            "source_changed",
+            "legacy source changed while its snapshot was bound",
+        )
+    bindings = [reviewed_binding, nuwa_binding, index_binding]
     reviewed_rows = _decode_jsonl(
         reviewed_body,
         "reviewed/profile_memories.jsonl",
@@ -756,27 +1039,41 @@ def migrate_legacy_profile(
     digest = _source_digest(reviewed_body, nuwa_body)
     checkpoint = _read_checkpoint(checkpoint_path, source_digest=digest)
     current = _validate_current_state(vault)
-    prepared, excluded, source_broken, broken_ids = _prepare_candidates(
+    source_digests = {
+        "reviewed/profile_memories.jsonl": reviewed_binding["digest"],
+        "profile_nuwa.json": nuwa_binding["digest"],
+    }
+    (
+        raw_items,
+        prepared,
+        excluded,
+        source_broken,
+        broken_ids,
+    ) = _prepare_candidates(
         vault=vault,
         reviewed_rows=reviewed_rows,
         nuwa=nuwa,
+        source_digests=source_digests,
+        index_digest=index_binding["digest"],
     )
 
+    after_snapshot_prepared()
+    _verify_bindings(bindings)
     existing_ids = set(current)
-    _verify_existing_migration_state(vault, prepared, current)
-    checkpoint_index = int(checkpoint["next_index"]) if checkpoint else 0
-    if checkpoint_index > len(prepared):
+    candidate_ids = sorted(item["claim_id"] for item in raw_items)
+    _verify_existing_migration_state(vault, raw_items, current)
+    committed_claim_ids = sorted(set(candidate_ids) & existing_ids)
+    if checkpoint and checkpoint["candidate_ids"] != candidate_ids:
         raise MigrationError(
             "malformed_checkpoint",
-            "migration checkpoint is ahead of the prepared source",
+            "migration checkpoint candidate identities do not match source",
         )
-    if checkpoint and any(
-        item["claim"]["claim_id"] not in existing_ids
-        for item in prepared[:checkpoint_index]
+    if checkpoint and not set(checkpoint["committed_claim_ids"]).issubset(
+        set(committed_claim_ids)
     ):
         raise MigrationError(
             "checkpoint_state_mismatch",
-            "migration checkpoint is ahead of committed Claim state",
+            "migration checkpoint references an uncommitted Claim",
         )
     planned = [
         item for item in prepared if item["claim"]["claim_id"] not in existing_ids
@@ -793,25 +1090,30 @@ def migrate_legacy_profile(
         "dry_run": bool(dry_run),
         "checkpoint_resumed": bool(
             checkpoint
-            and int(checkpoint["next_index"]) > 0
+            and bool(checkpoint["committed_claim_ids"])
             and not checkpoint["complete"]
         ),
         "source": str(reviewed_path),
         "nuwa_source": str(nuwa_path),
         "checkpoint": str(checkpoint_path),
+        "source_digest": digest,
+        "source_digests": dict(source_digests),
+        "index_digest": index_binding["digest"],
     }
-    if dry_run or not prepared:
+    if dry_run or not raw_items:
         return report
 
-    store = ClaimStore(vault)
+    store: Optional[ClaimStore] = None
+    if planned:
+        store = ClaimStore(vault)
     created = 0
-    processed = 0
     for item in prepared:
         claim_id = item["claim"]["claim_id"]
         if claim_id in existing_ids:
-            processed += 1
             continue
+        _verify_bindings(bindings)
         try:
+            assert store is not None
             store.create(
                 item["claim"],
                 expected_revision=0,
@@ -826,21 +1128,57 @@ def migrate_legacy_profile(
             raise MigrationError(exc.code, str(exc)) from exc
         existing_ids.add(claim_id)
         created += 1
-        processed += 1
         after_claim_commit(created)
-        if processed % checkpoint_every == 0:
+        _verify_bindings(bindings)
+        committed_claim_ids = sorted(set(candidate_ids) & existing_ids)
+        if created % checkpoint_every == 0:
             _write_checkpoint(
                 checkpoint_path,
                 source_digest=digest,
-                next_index=processed,
+                index_digest=index_binding["digest"],
+                candidate_ids=candidate_ids,
+                committed_claim_ids=committed_claim_ids,
                 complete=False,
             )
+            _verify_bindings(bindings)
+    _verify_bindings(bindings)
+    committed_claim_ids = sorted(set(candidate_ids) & existing_ids)
     _write_checkpoint(
         checkpoint_path,
         source_digest=digest,
-        next_index=len(prepared),
+        index_digest=index_binding["digest"],
+        candidate_ids=candidate_ids,
+        committed_claim_ids=committed_claim_ids,
         complete=True,
     )
+    _verify_bindings(bindings)
     report["created"] = created
     report["skipped"] = len(prepared) - created
     return report
+
+
+def migrate_legacy_profile(
+    vault_dir: Path,
+    *,
+    dry_run: bool = False,
+    checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY,
+) -> Dict[str, Any]:
+    try:
+        return _migrate_legacy_profile(
+            vault_dir,
+            dry_run=dry_run,
+            checkpoint_every=checkpoint_every,
+        )
+    except MigrationError:
+        raise
+    except EvidenceCatalogError as exc:
+        raise MigrationError(exc.code, str(exc)) from exc
+    except EventPathError as exc:
+        raise MigrationError(exc.code, str(exc)) from exc
+    except EventCorruption as exc:
+        raise MigrationError(exc.code, str(exc)) from exc
+    except OSError as exc:
+        raise MigrationError(
+            "migration_io_error",
+            "migration storage operation failed",
+        ) from exc
