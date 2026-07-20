@@ -503,6 +503,63 @@ def test_event_file_lock_keeps_reader_from_observing_inflight_append(
     assert [row["event_id"] for row in reader_rows] == ["evt-1", "evt-2"]
 
 
+def test_diagnostic_unlock_failure_still_closes_lock_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    lock_path = tmp_path / "events.jsonl.lock"
+    real_flock = module.fcntl.flock
+    unlocked = []
+
+    def fail_unlock(fd, operation):
+        if operation == module.fcntl.LOCK_UN:
+            unlocked.append(fd)
+            raise OSError("injected unlock failure")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(module.fcntl, "flock", fail_unlock)
+    with pytest.raises(OSError, match="injected unlock failure"):
+        with module._exclusive_lock(
+            lock_path,
+            timeout=0.1,
+            stale_after=60.0,
+        ):
+            pass
+
+    assert len(unlocked) == 1
+    with pytest.raises(OSError):
+        os.fstat(unlocked[0])
+
+
+def test_reader_unlock_failure_still_closes_every_owned_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    import event_store as module
+
+    path = tmp_path / "events.jsonl"
+    JsonlEventStore(path).append(event("evt-1"))
+    real_flock = module.fcntl.flock
+    unlocked = []
+
+    def fail_unlock(fd, operation):
+        if operation == module.fcntl.LOCK_UN:
+            unlocked.append(fd)
+            raise OSError("injected unlock failure")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(module.fcntl, "flock", fail_unlock)
+    with pytest.raises(OSError, match="injected unlock failure"):
+        JsonlEventStore(path).read_all()
+
+    assert len(set(unlocked)) == 2
+    for descriptor in set(unlocked):
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_append_rejects_event_file_replaced_after_validation_and_can_retry(
     tmp_path,
     monkeypatch,

@@ -238,9 +238,11 @@ def _exclusive_lock(
         try:
             yield parent_fd
         finally:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _acquire_event_lock(
@@ -287,8 +289,11 @@ def _acquire_event_lock(
                 or (owned.st_dev, owned.st_ino)
                 != (current.st_dev, current.st_ino)
             ):
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+                    fd = -1
                 if time.monotonic() >= deadline:
                     raise _unsafe_path(
                         "event lock identity changed during acquisition",
@@ -309,8 +314,11 @@ def _acquire_event_lock(
             os.fsync(fd)
             return fd
         except Exception:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            if fd >= 0:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
             raise
 
 
@@ -477,9 +485,11 @@ class JsonlEventStore:
                 _verify_public_file(parent_fd, self.path.name, descriptor)
                 _verify_public_parent(self.path, parent_fd)
             except Exception:
-                if lock_entered:
-                    descriptor_lock.__exit__(None, None, None)
-                os.close(descriptor)
+                try:
+                    if lock_entered:
+                        descriptor_lock.__exit__(None, None, None)
+                finally:
+                    os.close(descriptor)
                 raise
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -587,10 +597,12 @@ class JsonlEventStore:
                         os.fsync(handle.fileno())
                     yield row
         finally:
-            if descriptor_lock is not None:
-                descriptor_lock.__exit__(None, None, None)
-            if owns_descriptor:
-                os.close(descriptor)
+            try:
+                if descriptor_lock is not None:
+                    descriptor_lock.__exit__(None, None, None)
+            finally:
+                if owns_descriptor:
+                    os.close(descriptor)
 
     def _append_bytes(
         self,
