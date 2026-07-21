@@ -2938,7 +2938,7 @@ git commit -m "feat: secure product mutations"
 - Modify: `pyproject.toml`
 - Modify: `tests/test_control_center_ui.py`
 
-- [ ] **Step 1: Write failing UI structure tests**
+- [x] **Step 1: Write failing UI structure tests**
 
 ```python
 from product_ui import product_page_html
@@ -2981,7 +2981,7 @@ def test_assets_are_packaged_and_csp_has_no_inline_escape_hatch():
     assert "'unsafe-inline'" not in SECURITY_HEADERS["Content-Security-Policy"]
 ```
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ```bash
 PYTHONPATH=core python3 -m pytest tests/test_product_ui_v2.py -q
@@ -2989,7 +2989,7 @@ PYTHONPATH=core python3 -m pytest tests/test_product_ui_v2.py -q
 
 Expected: missing module.
 
-- [ ] **Step 3: Implement semantic shell and real Home/Memories renderers**
+- [x] **Step 3: Implement semantic shell and real Home/Memories renderers**
 
 Create the semantic shell:
 
@@ -3037,7 +3037,7 @@ Static paths are allowlisted and reject traversal. Set correct MIME types and `C
 
 Add `product_assets/**/*.css` and `product_assets/**/*.js` to package data, then verify them in a built wheel. Preserve the old Control Center implementation for one release cycle.
 
-- [ ] **Step 4: Run UI tests**
+- [x] **Step 4: Run UI tests**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -3047,7 +3047,7 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: all pass after updating legacy assertions to the new seven-module contract.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add \
