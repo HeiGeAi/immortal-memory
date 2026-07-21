@@ -689,6 +689,13 @@ core/product_assets/
 - 请求体硬上限
 - 精确 scheme、host、port 同源
 
+HTTP 协调层使用一个不记录正文的幂等意图账本。账本只保存幂等键摘要、
+规范化请求摘要、路由、动作、目标、预分配结果 ID、状态、安全结果 ID、
+错误码和时间。相同键与不同请求摘要返回 `idempotency_conflict`。协调锁必须
+覆盖 prepare、领域提交、崩溃恢复和 complete 全流程；领域存储自己的事件幂等
+仍是最终权威，账本不能替代事件流。账本文件和锁必须是受锚定路径保护的
+`0600` 普通文件，符号链接、宽权限、损坏或锁超时均失败关闭。
+
 ### 9.1 首页
 
 `GET /api/v2/home`
@@ -748,6 +755,20 @@ core/product_assets/
 
 `correct` 必须包含新正文和原因。
 
+SelfModelItem 是 Claim 的派生聚合。所有 item 动作必须显式提交
+`claim_id`、当前 `expected_self_version` 和该 Claim 的整数
+`expected_version`。服务端确认 item 来自当前 Living Self 版本，并确认
+`claim_id` 属于该 item 的 `claim_ids`。禁止默认选择第一个 Claim，也禁止把
+多个 Claim 伪装成一次原子批量修改。`confirm`、`reject`、`correct` 和
+`reconsider` 分别调用 Claim 状态机；提交 Claim 后生成新的不可变 Living Self
+版本，失败时明确标记派生版本落后，不能声称 item 已原地修改。
+
+版本恢复的 `expected_version` 是请求开始时的当前 Living Self
+`version_id`，不是 Claim revision。协调层预分配结果 `version_id`；恢复实现必须
+使用该固定 ID 和 expected parent，在崩溃后重放时补齐 current 发布或返回同一
+结果。不得通过 `restored_from`、reason 或内容相似度猜测某个历史版本属于当前
+幂等请求。
+
 ### 9.4 判断
 
 - `GET /api/v2/judgments`
@@ -756,6 +777,10 @@ core/product_assets/
 - `POST /api/v2/judgments`
 
 支持候选确认、纠正、结果补录和退役。
+
+判断卡创建要求整数 `expected_version=0`；判断动作的 `expected_version` 是
+当前 card revision。动作集合固定为 `confirm`、`reject`、`correct`、
+`record_outcome` 和 `retire`，未知动作失败关闭。
 
 ### 9.5 使用
 
@@ -769,6 +794,12 @@ core/product_assets/
 预览不写入正式 Context Pack。正式编译返回可读 Markdown、结构化清单和排除说明。
 
 预览响应必须包含 `preview_id`、`source_revision`、`preview_hash`、`expires_at`、入选项和排除原因。
+
+Context 预览创建要求 `expected_version=0`。正式编译要求预览
+`expected_version=1`，并提交 `preview_id`、`preview_hash`、排除项和已解析模式。
+consume 与 outcome 的 `expected_version` 都是 Context stream version。所有
+Context 路由调用 ContextCompiler 或 OutcomeStore 的原生幂等协议，不复制一套
+较弱的 HTTP 状态机。
 
 ### 9.6 信任
 

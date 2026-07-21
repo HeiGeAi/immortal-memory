@@ -2708,8 +2708,12 @@ git commit -m "feat: expose Living Self read APIs"
 ### Task 14: `/api/v2` mutation safety and idempotency
 
 **Files:**
+- Create: `core/product_mutations.py`
 - Modify: `core/product_http.py`
 - Modify: `core/profile_review.py` at `ReviewHandler.do_POST`
+- Modify: `core/living_self_service.py`
+- Create: `tests/test_product_mutations.py`
+- Modify: `tests/test_living_self_service.py`
 - Modify: `tests/test_product_http_v2.py`
 
 - [ ] **Step 1: Add failing write-contract tests**
@@ -2851,7 +2855,32 @@ Before parsing:
 - map internal exceptions to stable, redacted errors;
 - never return filesystem paths, commands, stderr, or raw exception text.
 
-Persist idempotency results under `~/.immortal/runtime/idempotency.json` with `mutate_state_atomic`. Audit writes record IDs, action, target, timestamp, status, and error code, never request bodies or private statements.
+Persist idempotency results under `~/.immortal/runtime/idempotency.json` with
+`mutate_state_atomic` or a stricter anchored equivalent. Audit writes record
+IDs, action, target, timestamp, status, and error code, never request bodies or
+private statements.
+
+The mutation coordinator must be stricter than the legacy state helper where
+needed: the ledger and lock are anchored `0600` regular files and fail closed
+on symlinks, unsafe permissions, corruption, or lock timeout. Store only a
+canonical request digest and safe IDs, never a raw idempotency key or body.
+Hold one coordinator lock across prepare, domain commit or recovery, and
+completion. Native Claim, Judgment, Context, and Outcome event idempotency
+remains authoritative.
+
+Self item actions require explicit `claim_id`, `expected_self_version`, and the
+Claim revision in integer `expected_version`. Verify that the item belongs to
+the current Living Self snapshot and that the Claim belongs to the item; never
+choose the first Claim or batch multiple Claim streams implicitly. After the
+Claim event, materialize exactly one new Living Self version or return an
+explicit stale-derived result.
+
+Living Self restore uses the current Living Self `version_id` as
+`expected_version`. Preallocate the result version ID in the pending ledger and
+pass it with the expected parent into a recoverable Living Self materialization
+method. Test crashes after intent prepare, immutable version publication,
+current publication, and before ledger completion. Retrying must converge on
+the same result ID; a third-party current version causes `version_conflict`.
 
 - [ ] **Step 4: Run all HTTP tests**
 
