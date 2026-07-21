@@ -952,3 +952,87 @@ def test_version_id_rejects_traversal_and_nonregular_history(tmp_path):
     (service.versions_dir / (version_id + ".json")).mkdir()
     with pytest.raises(EventPathError):
         service.load_version(version_id)
+
+
+def test_recoverable_restore_reuses_preallocated_version_after_history_publish(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="initial")
+    result_id = "lsv_" + "a" * 32
+
+    original_publish = service._publish_current_pair
+    service._publish_current_pair = lambda _version: (_ for _ in ()).throw(
+        RuntimeError("crash after immutable history")
+    )
+    with pytest.raises(RuntimeError, match="crash after immutable"):
+        service.restore(
+            first["version_id"],
+            reason="recoverable restore",
+            result_version_id=result_id,
+            expected_parent_version_id=first["version_id"],
+        )
+
+    service._publish_current_pair = original_publish
+    recovered = service.restore(
+        first["version_id"],
+        reason="recoverable restore",
+        result_version_id=result_id,
+        expected_parent_version_id=first["version_id"],
+    )
+
+    assert recovered["version_id"] == result_id
+    assert service.current()["version_id"] == result_id
+    assert [v["version_id"] for v in service.versions()].count(result_id) == 1
+
+
+def test_recoverable_restore_rejects_third_party_current(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="initial")
+    service.restore(first["version_id"], reason="other writer")
+
+    with pytest.raises(living_module.LivingSelfConflict) as caught:
+        service.restore(
+            first["version_id"],
+            reason="stale request",
+            result_version_id="lsv_" + "b" * 32,
+            expected_parent_version_id=first["version_id"],
+        )
+
+    assert caught.value.code == "version_conflict"
+
+
+def test_recoverable_restore_completed_retry_returns_same_version(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="initial")
+    result_id = "lsv_" + "c" * 32
+    first_result = service.restore(
+        first["version_id"],
+        reason="fixed restore",
+        result_version_id=result_id,
+        expected_parent_version_id=first["version_id"],
+    )
+    retry = service.restore(
+        first["version_id"],
+        reason="fixed restore",
+        result_version_id=result_id,
+        expected_parent_version_id=first["version_id"],
+    )
+    assert retry == first_result
+    assert service.current()["version_id"] == result_id
+
+
+def test_recoverable_claim_materialization_completed_retry_returns_same_version(tmp_path):
+    service = seeded_version_service(tmp_path)
+    first = service.confirm(service.build_candidate(), reason="initial")
+    result_id = "lsv_" + "e" * 32
+    first_result = service.materialize_claim_change(
+        reason="claim mutation confirm",
+        result_version_id=result_id,
+        expected_parent_version_id=first["version_id"],
+    )
+    retry = service.materialize_claim_change(
+        reason="claim mutation confirm",
+        result_version_id=result_id,
+        expected_parent_version_id=first["version_id"],
+    )
+    assert retry == first_result
+    assert service.current()["version_id"] == result_id

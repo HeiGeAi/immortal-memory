@@ -908,24 +908,162 @@ class LivingSelfService:
         )
         return self._validate_persisted_version(confirmed)
 
+    @staticmethod
+    def _require_expected_parent(
+        current: Optional[Mapping[str, Any]],
+        expected_parent_version_id: Optional[str],
+        result_version_id: Optional[str],
+    ) -> None:
+        if result_version_id is None:
+            return
+        if not VERSION_ID_PATTERN.fullmatch(result_version_id):
+            raise ValueError("invalid Living Self version ID")
+        if (
+            expected_parent_version_id is not None
+            and not VERSION_ID_PATTERN.fullmatch(expected_parent_version_id)
+        ):
+            raise ValueError("invalid expected parent version ID")
+        current_id = None if current is None else str(current["version_id"])
+        if current_id not in {expected_parent_version_id, result_version_id}:
+            raise LivingSelfConflict(
+                "version_conflict",
+                "current Living Self version differs from the expected parent",
+            )
+
+    def _recover_or_publish_unlocked(
+        self,
+        expected: Mapping[str, Any],
+        *,
+        expected_parent_version_id: Optional[str],
+    ) -> Dict[str, Any]:
+        result_id = str(expected["version_id"])
+        current = self._read_current_unlocked(required=False)
+        self._require_expected_parent(
+            current, expected_parent_version_id, result_id
+        )
+        json_path, _markdown_path = self._version_paths(result_id)
+        if safe_regular_exists(json_path):
+            stored = self._load_version_unlocked(result_id)
+            if _canonical(stored) != _canonical(expected):
+                raise LivingSelfConflict(
+                    "version_conflict",
+                    "preallocated Living Self version has different content",
+                )
+        else:
+            self._persist_version_pair(expected)
+            stored = dict(expected)
+        if current is None or current["version_id"] != result_id:
+            self._publish_current_pair(stored)
+        return stored
+
+    def _recover_preallocated_unlocked(
+        self,
+        result_version_id: str,
+        *,
+        expected_parent_version_id: Optional[str],
+        reason: str,
+        generation_reason: str,
+        sections: Mapping[str, Any],
+        content_hash: str,
+        based_on_claim_seq: int,
+        restored_from: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        current = self._read_current_unlocked(required=False)
+        self._require_expected_parent(
+            current, expected_parent_version_id, result_version_id
+        )
+        json_path, _markdown_path = self._version_paths(result_version_id)
+        if not safe_regular_exists(json_path):
+            return None
+        stored = self._load_version_unlocked(result_version_id)
+        expected_fields = {
+            "version_id": result_version_id,
+            "parent_version_id": expected_parent_version_id,
+            "generation_reason": generation_reason,
+            "reason": reason,
+            "sections": sections,
+            "content_hash": content_hash,
+            "based_on_claim_seq": based_on_claim_seq,
+        }
+        if restored_from is not None:
+            expected_fields["restored_from"] = restored_from
+        if any(
+            _canonical(stored.get(field)) != _canonical(value)
+            for field, value in expected_fields.items()
+        ):
+            raise LivingSelfConflict(
+                "version_conflict",
+                "preallocated Living Self version has different content",
+            )
+        if current is None or current["version_id"] == expected_parent_version_id:
+            self._publish_current_pair(stored)
+        elif current["version_id"] != result_version_id:
+            raise LivingSelfConflict(
+                "version_conflict",
+                "current Living Self version differs from the expected parent",
+            )
+        return stored
+
     def confirm(
         self,
         candidate: Mapping[str, Any],
         *,
         reason: str,
+        result_version_id: Optional[str] = None,
+        expected_parent_version_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         resolved_reason = _require_reason(reason)
         with self._locked():
+            if result_version_id is not None:
+                if not isinstance(candidate, Mapping):
+                    raise ValueError("candidate must be an object")
+                recovered = self._recover_preallocated_unlocked(
+                    result_version_id,
+                    expected_parent_version_id=expected_parent_version_id,
+                    reason=resolved_reason,
+                    generation_reason="claim_change",
+                    sections=candidate.get("sections", {}),
+                    content_hash=str(candidate.get("content_hash") or ""),
+                    based_on_claim_seq=int(candidate.get("based_on_claim_seq") or 0),
+                )
+                if recovered is not None:
+                    return recovered
             validated = self._validate_candidate_unlocked(candidate)
             current = self._read_current_unlocked(required=False)
+            self._require_expected_parent(
+                current, expected_parent_version_id, result_version_id
+            )
             confirmed = self._confirmed_from_candidate(
                 validated,
                 reason=resolved_reason,
                 current=current,
             )
+            if result_version_id is not None:
+                confirmed["version_id"] = result_version_id
+                confirmed = self._validate_persisted_version(confirmed)
+                return self._recover_or_publish_unlocked(
+                    confirmed,
+                    expected_parent_version_id=expected_parent_version_id,
+                )
             self._persist_version_pair(confirmed)
             self._publish_current_pair(confirmed)
             return confirmed
+
+    def materialize_claim_change(
+        self,
+        *,
+        reason: str,
+        result_version_id: str,
+        expected_parent_version_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Publish one recoverable derived version after a committed Claim write."""
+        candidate = self.build_candidate()
+        return self.confirm(
+            candidate,
+            reason=reason,
+            result_version_id=result_version_id,
+            expected_parent_version_id=expected_parent_version_id,
+        )
 
     def current(self) -> Dict[str, Any]:
         with self._locked():
@@ -1010,14 +1148,37 @@ class LivingSelfService:
                 "removed": removed,
             }
 
-    def restore(self, version_id: str, *, reason: str) -> Dict[str, Any]:
+    def restore(
+        self,
+        version_id: str,
+        *,
+        reason: str,
+        result_version_id: Optional[str] = None,
+        expected_parent_version_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         resolved_reason = _require_reason(reason)
         with self._locked():
             source = self._load_version_unlocked(version_id)
             current = self._read_current_unlocked(required=False)
+            if result_version_id is not None:
+                recovered = self._recover_preallocated_unlocked(
+                    result_version_id,
+                    expected_parent_version_id=expected_parent_version_id,
+                    reason=resolved_reason,
+                    generation_reason="manual_restore",
+                    sections=source["sections"],
+                    content_hash=str(source["content_hash"]),
+                    based_on_claim_seq=int(source["based_on_claim_seq"]),
+                    restored_from=str(source["version_id"]),
+                )
+                if recovered is not None:
+                    return recovered
+            self._require_expected_parent(
+                current, expected_parent_version_id, result_version_id
+            )
             now = _latest((str(source["generated_at"]), str(self._clock())))
             restored = {
-                "version_id": self._new_version_id(),
+                "version_id": result_version_id or self._new_version_id(),
                 "parent_version_id": (
                     current["version_id"] if current is not None else None
                 ),
@@ -1032,6 +1193,23 @@ class LivingSelfService:
                 "restored_from": source["version_id"],
             }
             validated = self._validate_persisted_version(restored)
+            if result_version_id is not None:
+                json_path, _markdown_path = self._version_paths(result_version_id)
+                if safe_regular_exists(json_path):
+                    stored = self._load_version_unlocked(result_version_id)
+                    comparable = dict(validated)
+                    comparable["generated_at"] = stored["generated_at"]
+                    comparable["confirmed_at"] = stored["confirmed_at"]
+                    if _canonical(stored) != _canonical(comparable):
+                        raise LivingSelfConflict(
+                            "version_conflict",
+                            "preallocated Living Self restore has different content",
+                        )
+                    validated = stored
+                return self._recover_or_publish_unlocked(
+                    validated,
+                    expected_parent_version_id=expected_parent_version_id,
+                )
             self._persist_version_pair(validated)
             self._publish_current_pair(validated)
             return validated

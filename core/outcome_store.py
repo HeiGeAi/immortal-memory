@@ -409,7 +409,9 @@ class OutcomeStore:
         reason: str,
     ) -> Dict[str, Any]:
         try:
-            self.compiler.load_compiled(context_id)
+            current = self.contexts.get(context_id)
+            if current["lifecycle_status"] == "compiled":
+                self.compiler.load_compiled(context_id)
             return self.contexts.consume(
                 context_id,
                 expected_version=expected_version,

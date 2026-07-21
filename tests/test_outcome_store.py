@@ -177,6 +177,17 @@ def test_context_must_be_consumed_before_outcome(tmp_path):
     assert not store.events.exists()
 
 
+def test_consume_same_key_replays_after_context_is_already_consumed(tmp_path):
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+
+    first = _consume(store, compiled, key="consume-retry")
+    retried = _consume(store, compiled, key="consume-retry")
+
+    assert retried == first
+    assert retried["lifecycle_status"] == "consumed"
+
+
 def test_consume_verifies_pack_and_outcome_commits_exact_snapshot_refs(tmp_path):
     from outcome_store import OutcomeStore
 

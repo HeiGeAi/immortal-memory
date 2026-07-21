@@ -37,7 +37,17 @@ from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, saniti
 from process_utils import run_process
 from pipeline_capabilities import missing_pipeline_stages
 from product_data import ProductData
-from product_http import is_v2_get_target, route_product_get
+from product_http import (
+    ProductHttpError,
+    error_body,
+    is_v2_get_target,
+    is_v2_post_target,
+    read_product_json,
+    require_write_metadata,
+    route_product_get,
+    route_product_post,
+)
+from product_mutations import ProductMutationCoordinator
 
 
 HOME = Path.home()
@@ -1907,6 +1917,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.server.product_data = value  # type: ignore[attr-defined]
         return value
 
+    @property
+    def product_mutations(self) -> ProductMutationCoordinator:
+        value = getattr(self.server, "product_mutations", None)
+        if value is None:
+            value = ProductMutationCoordinator(self.control_center.immortal_dir)
+            self.server.product_mutations = value  # type: ignore[attr-defined]
+        return value
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
@@ -2181,6 +2199,19 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         try:
+            if is_v2_post_target(self.path):
+                metadata = require_write_metadata(
+                    self.headers, int(self.server.server_address[1])
+                )
+                body = read_product_json(self.headers, self.rfile.read)
+                status, payload = route_product_post(
+                    self.path,
+                    body,
+                    metadata,
+                    lambda: self.product_mutations,
+                )
+                self.send_json(payload, status=status)
+                return
             if not is_allowed_local_origin(self.headers.get("Origin") or ""):
                 self.send_json(error_payload("origin_not_allowed", "请求来源不被允许。"), status=403)
                 return
@@ -2261,6 +2292,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.send_json(self.factory.start_job(action, {}), status=202)
                 return
             self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
+        except ProductHttpError as exc:
+            self.send_json(
+                error_body(exc.code, exc.message, retryable=exc.retryable),
+                status=exc.status,
+            )
         except JobConflict as exc:
             self.send_json(error_payload("job_conflict", str(exc), retryable=True), status=409)
         except Exception as exc:

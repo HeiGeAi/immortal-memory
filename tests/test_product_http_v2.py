@@ -64,6 +64,18 @@ class FakeProductData:
         return self._result("system")
 
 
+class FakeProductMutations:
+    def __init__(self):
+        self.calls = []
+        self.failure = None
+
+    def mutate(self, route, body, *, request_id, idempotency_key):
+        if self.failure is not None:
+            raise self.failure
+        self.calls.append((route, body, request_id, idempotency_key))
+        return {"route": route, "request_id": request_id, "ok": True}
+
+
 def start_v2_server(tmp_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), ReviewHandler)
     server.store = ReviewStore(
@@ -86,6 +98,7 @@ def start_v2_server(tmp_path):
         service_reachable=True,
     )
     server.product_data = FakeProductData()
+    server.product_mutations = FakeProductMutations()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, "http://127.0.0.1:%d" % server.server_port
@@ -117,6 +130,27 @@ def raw_get(server, target, *, host=None):
     result = response.status, response.headers, json.loads(body)
     connection.close()
     return result
+
+
+def post_json(base, target, body, *, headers=None):
+    merged = {
+        "Content-Type": "application/json; charset=UTF-8",
+        "Origin": base,
+        "X-Immortal-Request-Id": "req_write_1",
+        "Idempotency-Key": "idem_write_1",
+    }
+    merged.update(headers or {})
+    request = urllib.request.Request(
+        base + target,
+        data=json.dumps(body).encode("utf-8"),
+        headers=merged,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.headers, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, json.loads(exc.read())
 
 
 def test_all_thirteen_v2_get_routes_delegate_to_product_data(tmp_path):
@@ -183,6 +217,168 @@ def test_real_product_data_rejects_repeated_query_before_index_access(tmp_path):
         stop(server)
     assert status == 400
     assert payload["error"]["code"] == "invalid_query"
+
+
+def test_v2_post_uses_strict_metadata_and_real_mutation_router(tmp_path):
+    server, base = start_v2_server(tmp_path)
+    try:
+        status, headers, payload = post_json(
+            base,
+            "/api/v2/self/items/self_1/actions",
+            {"action": "confirm", "expected_version": 1},
+        )
+    finally:
+        stop(server)
+    assert status == 200
+    assert headers.get_content_type() == "application/json"
+    assert payload["route"] == "/api/v2/self/items/self_1/actions"
+    assert server.product_mutations.calls == [
+        (
+            "/api/v2/self/items/self_1/actions",
+            {"action": "confirm", "expected_version": 1},
+            "req_write_1",
+            "idem_write_1",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "headers, expected_status, expected_code",
+    (
+        ({"Origin": "http://127.0.0.1:1"}, 403, "origin_not_allowed"),
+        ({"Origin": "HTTP://127.0.0.1:1"}, 403, "origin_not_allowed"),
+        ({"Origin": "http://user@127.0.0.1:1"}, 403, "origin_not_allowed"),
+        ({"Content-Type": "text/plain"}, 415, "unsupported_media_type"),
+        ({"Content-Type": "application/json; charset=latin1"}, 415, "unsupported_media_type"),
+        ({"X-Immortal-Request-Id": "bad request id"}, 400, "request_metadata_required"),
+    ),
+)
+def test_v2_post_rejects_origin_content_type_and_metadata_confusion(
+    tmp_path, headers, expected_status, expected_code
+):
+    server, base = start_v2_server(tmp_path)
+    try:
+        status, _, payload = post_json(
+            base, "/api/v2/contexts/preview", {"expected_version": 0}, headers=headers
+        )
+    finally:
+        stop(server)
+    assert status == expected_status
+    assert payload["error"]["code"] == expected_code
+
+
+def test_v2_post_rejects_duplicate_metadata_and_content_length(tmp_path):
+    server, base = start_v2_server(tmp_path)
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+    body = b"{}"
+    try:
+        connection.putrequest("POST", "/api/v2/contexts/preview", skip_host=True)
+        connection.putheader("Host", "127.0.0.1:%d" % server.server_port)
+        connection.putheader("Origin", base)
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("X-Immortal-Request-Id", "req_1")
+        connection.putheader("X-Immortal-Request-Id", "req_2")
+        connection.putheader("Idempotency-Key", "idem_1")
+        connection.endheaders(body)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+    finally:
+        connection.close()
+        stop(server)
+    assert response.status == 400
+    assert payload["error"]["code"] == "request_metadata_required"
+
+
+@pytest.mark.parametrize("origin", ("http://127.0.0.1:abc", "http://127.0.0.1:99999", "http://127.0.0.1:00080"))
+def test_v2_post_malformed_or_noncanonical_origin_port_is_stable(tmp_path, origin):
+    server, base = start_v2_server(tmp_path)
+    try:
+        status, _, payload = post_json(
+            base, "/api/v2/contexts/preview", {"expected_version": 0},
+            headers={"Origin": origin},
+        )
+    finally:
+        stop(server)
+    assert status == 403
+    assert payload["error"]["code"] == "origin_not_allowed"
+
+
+def test_v2_post_unknown_mutation_error_is_redacted(tmp_path):
+    from product_mutations import MutationError
+
+    server, base = start_v2_server(tmp_path)
+    server.product_mutations.failure = MutationError(
+        "private_dynamic_code", "/Users/private secret body"
+    )
+    try:
+        status, _, payload = post_json(
+            base, "/api/v2/contexts/preview", {"expected_version": 0}
+        )
+    finally:
+        stop(server)
+    assert status == 503
+    assert payload["error"]["code"] == "mutation_failed"
+    assert "private" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"x":1,"x":2}',
+        b'{"nested":{"x":1,"x":2}}',
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+    ),
+)
+def test_v2_post_rejects_ambiguous_nonstandard_json_before_coordinator(tmp_path, raw):
+    server, base = start_v2_server(tmp_path)
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+    try:
+        connection.request(
+            "POST", "/api/v2/contexts/preview", body=raw,
+            headers={
+                "Host": "127.0.0.1:%d" % server.server_port,
+                "Origin": base, "Content-Type": "application/json",
+                "X-Immortal-Request-Id": "req_json",
+                "Idempotency-Key": "idem_json",
+            },
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+    finally:
+        connection.close()
+        stop(server)
+    assert response.status == 400
+    assert payload["error"]["code"] == "invalid_json"
+    assert server.product_mutations.calls == []
+
+
+def test_v2_success_response_redacts_domain_paths_secrets_and_debug_fields(tmp_path):
+    class LeakyCoordinator:
+        def mutate(self, *args, **kwargs):
+            return {
+                "context_id": "ctx_1",
+                "message": "/Users/private/.immortal/token.txt",
+                "debug": "Bearer private-token",
+                "stdout": "Cookie: private-cookie",
+                "token": "sk-private-secret",
+            }
+
+    server, base = start_v2_server(tmp_path)
+    server.product_mutations = LeakyCoordinator()
+    try:
+        status, _, payload = post_json(
+            base, "/api/v2/contexts/preview", {"expected_version": 0}
+        )
+    finally:
+        stop(server)
+    serialized = json.dumps(payload)
+    assert status == 200
+    assert "debug" not in payload and "stdout" not in payload and "token" not in payload
+    assert "/Users/private" not in serialized
+    assert "private-token" not in serialized
 
 
 def test_diff_contract_uses_path_as_to_and_requires_one_from(tmp_path):
