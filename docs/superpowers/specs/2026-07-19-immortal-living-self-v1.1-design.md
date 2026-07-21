@@ -735,6 +735,10 @@ core/product_assets/
 - `POST /api/v2/self/items/{id}/actions`
 - `POST /api/v2/self/versions/{id}/restore`
 
+版本 diff 的路径 `{id}` 是目标 `to_version_id`，并且必须提供唯一的
+`from` 查询参数作为 `from_version_id`。缺失、重复或附带冗余 `to`
+参数都返回稳定的 `invalid_query`，避免两个目标版本来源互相冲突。
+
 动作：
 
 - `confirm`
