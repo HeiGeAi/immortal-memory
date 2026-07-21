@@ -3411,7 +3411,7 @@ Completion evidence recorded 2026-07-22:
 - Modify: `.github/workflows/ci.yml`
 - Modify: `docs/ci.example.yml`
 
-- [ ] **Step 1: Write clean wheel and P0 scenarios**
+- [x] **Step 1: Write clean wheel and P0 scenarios**
 
 `tests/test_v11_packaging.py` builds and installs a wheel into a temporary venv, then verifies:
 
@@ -3442,7 +3442,7 @@ S9 service restart preserves claim, context, and outcome state
 S10 v1.0 vault migrates without changing raw hashes
 ```
 
-- [ ] **Step 2: Run and confirm failures**
+- [x] **Step 2: Run and confirm failures**
 
 ```bash
 PYTHONPATH=core python3 -m pytest tests/test_v11_packaging.py -q
@@ -3451,7 +3451,7 @@ python3 tests/regression_living_self_p0.py
 
 Expected: failures reveal any remaining packaging or integrated trust gaps.
 
-- [ ] **Step 3: Fix only the proven package and integration gaps**
+- [x] **Step 3: Fix only the proven package and integration gaps**
 
 Ensure every module imported by CLI is included by setuptools. Do not add private generated data to package data. Add to CI:
 
@@ -3460,7 +3460,7 @@ Ensure every module imported by CLI is included by setuptools. Do not add privat
   run: python3 tests/regression_living_self_p0.py
 ```
 
-- [ ] **Step 4: Run package and both P0 suites**
+- [x] **Step 4: Run package and both P0 suites**
 
 ```bash
 PYTHONPATH=core python3 -m pytest tests/test_v11_packaging.py -q
@@ -3470,7 +3470,7 @@ python3 tests/regression_living_self_p0.py
 
 Expected: clean package passes, legacy P0 `8/8`, Living Self P0 `10/10`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add \
@@ -3481,6 +3481,16 @@ git add \
   docs/ci.example.yml
 git commit -m "test: enforce Living Self release gates"
 ```
+
+Completion evidence recorded 2026-07-22:
+
+- Clean wheel build, isolated venv install, and installed CLI gate: 1 passed.
+- Legacy production-readiness regression: 8/8 passed.
+- Living Self regression: 10/10 passed.
+- Full pytest suite after package integration: 1215 passed in 71.08 seconds.
+- Old pip 21.2.4 plus setuptools 58 now builds a real
+  `immortal_memory-1.0.0` wheel instead of an empty `UNKNOWN-0.0.0` wheel.
+- Independent review: Ready, no remaining P0/P1.
 
 ### Task 19: Browser acceptance, performance, documentation, and version
 
