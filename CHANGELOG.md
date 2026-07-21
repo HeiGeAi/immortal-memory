@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0
+
+- Add versioned Claim, Living Self, Judgment, Context, and Outcome authorities.
+- Replace the monitoring-first surface with seven evidence-backed product modules.
+- Add strict index, migration, backup, restore, privacy, browser, and release gates.
+- Retire the unsafe live-runtime `package` workflow in favor of clean-commit release artifacts.
+- Move the legacy personal Obsidian `project` workflow behind a separately audited local extension boundary.
+
 ## 0.9.0
 
 - Add an evidence-driven local Control Center for runtime heartbeat, stages, outputs, risks, history, and safe operations.

@@ -128,7 +128,7 @@ immortal-memory agent-factory
 immortal-memory backup --vault-dir "$HOME/.immortal" --output-dir "/Volumes/IMMORTAL_BACKUP/immortal-v1.0"
 EXPORT_DIR="$(find "/Volumes/IMMORTAL_BACKUP/immortal-v1.0" -maxdepth 1 -type d -name 'immortal-export-*' | sort | tail -n 1)"
 immortal-memory restore-check "$EXPORT_DIR" --strict --json
-python3 core/export_restore.py restore-export "$EXPORT_DIR" "/tmp/immortal-v11-staging"
+python3 core/export_restore.py restore-export "$EXPORT_DIR" "/tmp/immortal-v11-staging" --rebind-vault-config
 TIMEZONE_CONTRACT="/absolute/path/to/hermes-timezone-contract.json"
 python3 core/export_restore.py stage-v11-index --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
 python3 core/export_restore.py v11-migrate --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
@@ -139,6 +139,12 @@ python3 core/export_restore.py v11-migrate --vault-dir "/tmp/immortal-v11-stagin
 这一步产生的 `index.staging.jsonl` 还不是已发布的 schema-v3 索引，不能紧接着把 staging 当成生产。正式切换必须走生产发布流程：从已合并 `main` 构建唯一 wheel，在隔离 vault 发布 staging source 并重建 schema-v3 SQLite，运行 `prewarm_index_verification`，再以 `v11_production_switch_gate` 绑定迁移报告、已发布 source、数据库 generation 和 receipt。只有 `production_switch_allowed=true` 才能运行模型阶段并安装同一 wheel 到真实环境；之后还要核对原始哈希、真实 API、浏览器、外置备份和 v1.0 回滚包。仓库目前故意没有提供绕过这些门禁的一键覆盖命令。
 
 v1.1 先派生、后切换，不改写 v1.0 原始文件。需要回滚时，停止 v1.1 服务，恢复 v1.0 安装包和 LaunchAgent，忽略 v1.1 新增派生目录，然后核对原始 vault 哈希并重新运行 v1.0 健康检查。
+
+### v1.0 命令迁移
+
+`immortal package` 已安全退役。公开发布只能从干净 Git commit 构建 wheel 和 source archive，并分别扫描源码、wheel、archive 和 adapter。不要从真实运行目录复制文件，也不要用姓名、路径或客户名替换表冒充脱敏。
+
+旧版 `immortal project` 是绑定个人 Obsidian 目录、旧索引接口和旧卡片格式的本地工作流，不属于 v1.1 七模块公共产品。需要这项能力时，应把审查后的扩展保存在 Git 外，通过独立的 `immortal-project` 命令运行。公开 wheel 不会从私有 vault 动态加载 Python。显式调用两个旧命令会返回稳定迁移提示，不会读取 HOME 或创建文件。
 
 ### 生产健康与全新安装验收
 
@@ -331,6 +337,12 @@ immortal-memory agent-factory
 Then visit http://127.0.0.1:8765/
 
 The dashboard has seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. v1.0 reading paths, health checks, Agent Bridge, and the legacy Control Center remain compatible for one release cycle. See [Architecture](./docs/ARCHITECTURE.md), [Product](./docs/PRODUCT.md), and [Privacy](./docs/PRIVACY.md) for migration, rollback, health, and privacy contracts.
+
+The legacy `immortal package` command is retired in favor of release artifacts
+built from a clean Git commit. The old personal Obsidian `immortal project`
+workflow is available only as a separately reviewed local extension invoked as
+`immortal-project`; it is not included in the public wheel and the runtime does
+not load Python from the private vault.
 
 ## How other agents use it
 

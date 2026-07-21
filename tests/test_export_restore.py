@@ -210,6 +210,48 @@ def test_restore_failure_removes_anchored_temporary_tree(tmp_path, monkeypatch):
     assert not list(tmp_path.glob(".restored.restore-*"))
 
 
+def test_restore_can_rebind_vault_config_after_strict_copy_verification(tmp_path):
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    config = write_file(
+        export_dir,
+        "config.json",
+        json.dumps({"vault_dir": "/old/live/vault", "keep": True}).encode(),
+    )
+    write_manifest(export_dir, [config])
+    target = tmp_path / "restored"
+
+    result = export_restore.restore_export(
+        export_dir,
+        target,
+        rebind_vault_config=True,
+    )
+
+    assert result["ok"] is True
+    assert result["config_rebound"] is True
+    assert result["source_check"]["ok"] is True
+    assert result["check"]["ok"] is True
+    assert result["derived_generation"]["config_sha256"] == hashlib.sha256(
+        (target / "config.json").read_bytes()
+    ).hexdigest()
+    assert result["derived_generation"]["receipt_sha256"] == hashlib.sha256(
+        (target / "restore-config-rebind-receipt.json").read_bytes()
+    ).hexdigest()
+    assert json.loads((target / "config.json").read_text()) == {
+        "vault_dir": str(target.absolute()),
+        "keep": True,
+    }
+    assert json.loads((export_dir / "config.json").read_text())["vault_dir"] == (
+        "/old/live/vault"
+    )
+    assert (target / "config.json").stat().st_mode & 0o777 == 0o600
+    assert export_restore.restore_check(target, strict=True)["ok"] is True
+    derived_manifest = json.loads((target / export_restore.MANIFEST_NAME).read_text())
+    assert derived_manifest["derived_from"]["manifest_sha256"] == hashlib.sha256(
+        (export_dir / export_restore.MANIFEST_NAME).read_bytes()
+    ).hexdigest()
+
+
 def test_restore_rejects_export_replaced_after_initial_check(tmp_path, monkeypatch):
     export_dir = tmp_path / "export"
     export_dir.mkdir()

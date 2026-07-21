@@ -6,6 +6,11 @@ Repository code is public. Vault data is private and normally stays in `~/.immor
 
 Never commit raw chats, documents, meeting transcripts, generated profiles, Claims, Living Self versions, Judgment cards, Context Packs, Outcomes, connector tokens, API keys, logs, local account identifiers, or backup exports.
 
+Do not create a public release from a live installation and do not treat a
+personal-name replacement table as a privacy proof. Release input must be a
+clean tracked commit. Local workflow extensions, their configuration, and their
+generated project views stay outside Git, wheel, source archives, and adapters.
+
 ## Privacy labels
 
 All Claims and Judgment cards carry one of these labels:

@@ -55,11 +55,14 @@ immortal-memory profile-review --host 127.0.0.1 --port 8765
 
 Then open `http://127.0.0.1:8765/`.
 
-The root page is the evidence-driven Immortal Control Center. It provides eight
-real modules for overview, runs, memories, sources, profile review, agent
-context, backups, and diagnostics. The task context compiler remains at
-`/agent-factory`. The legacy static snapshot is retired and returns HTTP 410 at
-`/snapshot`.
+The root page is the evidence-driven Immortal Memory dashboard. It provides
+seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. Home
+shows current value and blocking health; Memory traces evidence; Self shows the
+versioned Living Self; Judgment preserves decisions and outcomes; Use previews
+and compiles the exact Context Pack; Trust exposes attribution and privacy
+boundaries; System reports collection, verified index, backup, scheduler,
+service, and version state. The legacy static snapshot is retired and returns
+HTTP 410 at `/snapshot`.
 
 ## Core Commands
 
@@ -81,7 +84,22 @@ immortal-memory role-distill "stable repeated workflow" --mode auto --install-sk
 immortal-memory backup-status
 immortal-memory export
 immortal-memory restore-guide
+immortal-memory migration-preflight --require-external-backup --json
+immortal-memory claims-migrate --json
 ```
+
+## v1.0 command migration
+
+`immortal package` is retired. Public releases must be built from a clean Git
+checkout, scanned as source and built artifacts, and distributed as the signed
+release wheel and source archive. Never build a public package from a live
+runtime or by replacing personal strings.
+
+The old `immortal project` command was a personal Obsidian workflow rather than
+a portable product authority. It is not part of the public wheel. Install a
+separately reviewed local extension and use `immortal-project` when that
+workflow is required. The public runtime never loads arbitrary Python from the
+private vault.
 
 ## Feishu / Lark
 

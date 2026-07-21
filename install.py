@@ -37,18 +37,19 @@ def main() -> int:
     prefix = Path(args.prefix).expanduser()
     core_target = prefix / "core"
     copytree_replace(ROOT / "core", core_target)
+    runtime_entry = core_target / "cli.py"
 
     bin_dir = Path.home() / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper = bin_dir / "immortal-memory"
     wrapper.write_text(
         "#!/usr/bin/env sh\n"
-        f"exec python3 {str(core_target / 'immortal.py')!r} \"$@\"\n",
+        f"exec python3 {str(runtime_entry)!r} \"$@\"\n",
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
 
-    init_cmd = [sys.executable, str(core_target / "immortal.py"), "init"]
+    init_cmd = [sys.executable, str(runtime_entry), "init"]
     if args.owner_display_name:
         init_cmd.extend(["--owner-display-name", args.owner_display_name])
     for alias in args.alias:
@@ -72,7 +73,7 @@ def main() -> int:
             print()
 
     if install_daily:
-        subprocess.check_call([sys.executable, str(core_target / "immortal.py"), "daily-install"])
+        subprocess.check_call([sys.executable, str(runtime_entry), "daily-install"])
     elif args.no_daily:
         print("已按 --no-daily 跳过每日自动采集：数据不会持续沉淀，你不受持续保护。")
         print("之后可用 `immortal-memory daily-install` 启用。")

@@ -1748,6 +1748,8 @@ def _capture_export_generation(export_dir: Path) -> dict[str, Any] | None:
 def restore_export(
     export_path: str | Path,
     destination: str | Path,
+    *,
+    rebind_vault_config: bool = False,
 ) -> dict[str, Any]:
     """Restore through an anchored temporary tree, then atomically publish it."""
     export_dir = resolve_export_path(export_path).absolute()
@@ -1850,9 +1852,75 @@ def restore_export(
             != (parent_metadata.st_dev, parent_metadata.st_ino)
         ):
             raise RuntimeError("restore destination identity changed")
+        source_check = restore_check(temp_path, strict=True)
+        if not source_check.get("ok"):
+            raise RuntimeError("restored files failed strict verification")
+        config_rebound = False
+        derived_generation: dict[str, Any] | None = None
+        if rebind_vault_config:
+            config_path = temp_path / "config.json"
+            config = _read_json_nofollow(config_path)
+            source_config = generation["files"].get("config.json")
+            if not config or not isinstance(source_config, dict):
+                raise RuntimeError("restored config is missing or unsafe")
+            config["vault_dir"] = str(target)
+            _write_private_json(config_path, config)
+            config_stat = config_path.stat()
+            config_sha256 = sha256_file(config_path)
+            receipt_path = temp_path / "restore-config-rebind-receipt.json"
+            receipt = {
+                "schema_version": 1,
+                "kind": "vault_config_rebind",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "destination": str(target),
+                "source_manifest_sha256": generation["manifest_sha256"],
+                "source_config_sha256": source_config["sha256"],
+                "derived_config_sha256": config_sha256,
+            }
+            _write_private_json(receipt_path, receipt)
+            receipt_stat = receipt_path.stat()
+            receipt_sha256 = sha256_file(receipt_path)
+            derived_manifest = dict(manifest)
+            derived_items = []
+            config_bound = False
+            for original in manifest["items"]:
+                item = dict(original)
+                if item.get("relpath") == "config.json":
+                    item["size"] = config_stat.st_size
+                    item["sha256"] = config_sha256
+                    config_bound = True
+                derived_items.append(item)
+            if not config_bound:
+                raise RuntimeError("restored manifest does not bind config.json")
+            derived_items.append(
+                {
+                    "relpath": receipt_path.name,
+                    "size": receipt_stat.st_size,
+                    "sha256": receipt_sha256,
+                }
+            )
+            derived_manifest["items"] = derived_items
+            totals = dict(derived_manifest.get("totals") or {})
+            totals["files"] = len(derived_items)
+            totals["bytes"] = sum(int(item["size"]) for item in derived_items)
+            derived_manifest["totals"] = totals
+            derived_manifest["vault_dir"] = str(target)
+            derived_manifest["export_dir"] = str(target)
+            derived_manifest["derived_from"] = {
+                "manifest_sha256": generation["manifest_sha256"],
+                "operation": "vault_config_rebind",
+            }
+            _write_private_json(temp_path / MANIFEST_NAME, derived_manifest)
+            derived_generation = {
+                "manifest_sha256": sha256_file(temp_path / MANIFEST_NAME),
+                "config_sha256": config_sha256,
+                "receipt_sha256": receipt_sha256,
+                "receipt": receipt_path.name,
+            }
+            config_rebound = True
         restored_check = restore_check(temp_path, strict=True)
         if not restored_check.get("ok"):
-            raise RuntimeError("restored files failed strict verification")
+            raise RuntimeError("final restored generation failed strict verification")
         if (
             _secure_directory_identity(temp_path)
             != (root_metadata.st_dev, root_metadata.st_ino)
@@ -1885,6 +1953,9 @@ def restore_export(
         "ok": True,
         "destination": str(target),
         "copied_files": copied,
+        "config_rebound": config_rebound,
+        "source_check": source_check,
+        "derived_generation": derived_generation,
         "check": restored_check,
     }
 
@@ -2126,6 +2197,11 @@ def main() -> int:
     p_restore = sub.add_parser("restore-export")
     p_restore.add_argument("export_path")
     p_restore.add_argument("destination")
+    p_restore.add_argument(
+        "--rebind-vault-config",
+        action="store_true",
+        help="Bind the restored config.json vault_dir to the destination",
+    )
 
     p_stage_v11 = sub.add_parser("stage-v11-index")
     p_stage_v11.add_argument("--vault-dir", required=True)
@@ -2162,7 +2238,11 @@ def main() -> int:
         print_json(result)
         return 0 if result.get("ok") else 1
     if args.command == "restore-export":
-        result = restore_export(args.export_path, args.destination)
+        result = restore_export(
+            args.export_path,
+            args.destination,
+            rebind_vault_config=args.rebind_vault_config,
+        )
         print_json(result)
         return 0 if result.get("ok") else 1
     if args.command == "stage-v11-index":

@@ -69,3 +69,9 @@ Suggested health commands are `daily-status`, `backup-status --verify --max-age-
 ## Product boundaries
 
 The product can recall sourced evidence, mirror verified expression preferences, pre-evaluate routine decisions, draft, review, and explain its reasoning. It cannot claim to replace a person, make irreversible decisions without approval, expose raw private messages by default, collect an unverified account, or treat one generated inference as permanent truth.
+
+The v1.0 `project` command is outside the seven-module authority. It was a
+personal Obsidian projection bound to legacy index and card formats. A user may
+keep an audited project projection as a Git-external local extension, but the
+public runtime must not dynamically execute Python from the vault. Public
+release packaging is likewise a repository concern, not a live-vault feature.
