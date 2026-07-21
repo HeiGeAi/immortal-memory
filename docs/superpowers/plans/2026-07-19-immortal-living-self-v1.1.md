@@ -3179,6 +3179,17 @@ Expected: all tests pass and P0 is `8/8`.
 
 ### Task 17: Export, restore, and v1.1 migration compatibility
 
+**Production migration blocker discovered 2026-07-22:** the read-only live
+index audit found 467 `hermes-conversation` rows whose legacy timestamps are
+naive, while the other 678,390 rows contain an explicit timezone. Schema v3
+must continue to reject naive timestamps. Before rebuilding or switching the
+production index, migration must derive the missing offset from authoritative
+source metadata or a separately verified source contract. If that evidence is
+unavailable, quarantine and report the 467 records and keep the production
+switch blocked. Never guess UTC or the host timezone silently. Tests must cover
+both an evidence-backed conversion and the fail-closed quarantine path, while
+proving that raw source bytes remain unchanged.
+
 **Files:**
 - Modify: `core/export_restore.py`
 - Modify: `core/orchestrator.py`
