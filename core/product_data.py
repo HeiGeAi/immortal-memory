@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 from contextlib import contextmanager
@@ -18,7 +19,17 @@ from claim_store import ClaimStore
 from context_store import ContextStore
 from control_center import ControlCenter
 from control_data import ControlData
-from index_integrity import INDEX_SCHEMA_VERSION, locator_schema_is_current
+from event_store import (
+    EventPathError,
+    _exclusive_lock,
+    safe_atomic_write_text,
+    safe_read_text,
+)
+from index_integrity import (
+    INDEX_SCHEMA_VERSION,
+    locator_schema_is_current,
+    normalize_timestamp_utc,
+)
 from index_locks import index_lock_pair
 from judgment_store import JudgmentStore
 from living_self_service import LivingSelfService
@@ -221,6 +232,7 @@ class ProductIndexIntegrity:
         self.source_path = self.vault_dir / "index.jsonl"
         self.database_path = self.vault_dir / "search_index.db"
         self._forced_untrusted = ""
+        self._verified_database_generation = None
 
     def mark_untrusted(self, reason: str) -> None:
         self._forced_untrusted = str(reason or "untrusted")
@@ -283,6 +295,61 @@ class ProductIndexIntegrity:
         digest = rows["indexed_ids_sha256"]
         if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
             raise ValueError("indexed ID digest is invalid")
+        database_stat = self._regular_file(self.database_path)
+        sidecar_signatures = []
+        for suffix in ("-wal", "-shm"):
+            path = Path(str(self.database_path) + suffix)
+            try:
+                sidecar_signatures.append(self._signature(self._regular_file(path)))
+            except FileNotFoundError:
+                sidecar_signatures.append(None)
+        cache_key = (
+            self._signature(database_stat),
+            tuple(sidecar_signatures),
+            rows["indexed_id_count"],
+            digest,
+        )
+        if self._verified_database_generation != cache_key:
+            # The surrounding shared source/database locks make this cache
+            # stable against cooperative index publishers. Main, WAL, and SHM
+            # signatures still invalidate it after a published generation
+            # changes; this is not a claim of protection from an attacker that
+            # bypasses the repository lock contract and restores file metadata.
+            actual_digest = hashlib.sha256()
+            actual_count = 0
+            for (rec_id,) in connection.execute(
+                "SELECT rec_id FROM docs ORDER BY rec_id"
+            ):
+                encoded = str(rec_id).encode("utf-8")
+                actual_digest.update(
+                    len(encoded).to_bytes(8, byteorder="big", signed=False)
+                )
+                actual_digest.update(encoded)
+                actual_count += 1
+            if (
+                actual_count != int(rows["indexed_id_count"])
+                or actual_digest.hexdigest() != digest
+            ):
+                raise ValueError("actual indexed IDs differ from metadata")
+            fts_count = int(
+                connection.execute("SELECT count(*) FROM docs_fts").fetchone()[0]
+            )
+            if fts_count != actual_count:
+                raise ValueError("FTS row count differs from docs")
+            if connection.execute(
+                "SELECT 1 FROM docs d LEFT JOIN docs_fts f ON f.rowid=d.rowid "
+                "WHERE f.rowid IS NULL LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("FTS is missing a docs row")
+            if connection.execute(
+                "SELECT 1 FROM docs_fts f LEFT JOIN docs d ON d.rowid=f.rowid "
+                "WHERE d.rowid IS NULL LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("FTS contains an unknown docs row")
+            database_after = self._regular_file(self.database_path)
+            if self._signature(database_stat) != self._signature(database_after):
+                raise ValueError("database changed during integrity validation")
+            self._verified_database_generation = cache_key
         coverage_rows = dict(
             connection.execute(
                 "SELECT key,value FROM meta WHERE key IN (?,?,?)",
@@ -374,12 +441,41 @@ class ProductData:
             self.vault_dir
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._cursor_key = hashlib.sha256(
-            (
-                "immortal-product-cursor-v1:"
-                + os.path.normcase(str(self.vault_dir))
-            ).encode("utf-8")
-        ).digest()
+        self._cursor_key = None
+
+    def _signing_key(self) -> bytes:
+        if self._cursor_key is None:
+            self._cursor_key = self._load_cursor_key()
+        return self._cursor_key
+
+    def _load_cursor_key(self) -> bytes:
+        key_path = self.vault_dir / "product" / "cursor-signing.key"
+        try:
+            with _exclusive_lock(
+                self.vault_dir / "product" / "cursor-signing.lock",
+                timeout=3.0,
+                stale_after=30.0,
+            ):
+                raw = safe_read_text(key_path)
+                if raw is None:
+                    safe_atomic_write_text(key_path, secrets.token_hex(32) + "\n")
+                    raw = safe_read_text(key_path)
+                metadata = os.lstat(str(key_path))
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or metadata.st_mode & 0o777 != 0o600
+                    or raw is None
+                    or re.fullmatch(r"[0-9a-f]{64}\n?", raw) is None
+                ):
+                    raise ValueError("cursor key is unsafe")
+                return bytes.fromhex(raw.strip())
+        except ProductDataError:
+            raise
+        except (EventPathError, OSError, TypeError, ValueError) as exc:
+            raise ProductDataError(
+                "cursor_key_unavailable", "分页安全密钥当前不可用"
+            ) from exc
 
     @staticmethod
     def _query_value(query: Mapping[str, Sequence[str]], key: str) -> str:
@@ -439,7 +535,9 @@ class ProductData:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        signature = hmac.new(self._cursor_key, payload, hashlib.sha256).digest()
+        signature = hmac.new(
+            self._signing_key(), payload, hashlib.sha256
+        ).digest()
         return _b64_encode(payload) + "." + _b64_encode(signature)
 
     def _decode_cursor(
@@ -457,7 +555,9 @@ class ProductData:
         encoded, encoded_signature = cursor.split(".", 1)
         payload = _b64_decode(encoded)
         signature = _b64_decode(encoded_signature)
-        expected = hmac.new(self._cursor_key, payload, hashlib.sha256).digest()
+        expected = hmac.new(
+            self._signing_key(), payload, hashlib.sha256
+        ).digest()
         if not hmac.compare_digest(signature, expected):
             raise ProductDataError("invalid_cursor", "分页游标无效")
         try:
@@ -524,7 +624,7 @@ class ProductData:
                 )
             normalized = parsed.astimezone(timezone.utc)
             time_values[field] = normalized
-            filters[field] = normalized.isoformat()
+            filters[field] = normalize_timestamp_utc(filters[field])
         if (
             "from" in time_values
             and "to" in time_values
@@ -554,8 +654,8 @@ class ProductData:
             for name, column, operator in (
                 ("source", "d.source", "="),
                 ("project", "d.project", "="),
-                ("from", "d.ts", ">="),
-                ("to", "d.ts", "<="),
+                ("from", "d.ts_utc", ">="),
+                ("to", "d.ts_utc", "<="),
             ):
                 if filters.get(name):
                     clauses.append(column + operator + "?")
@@ -572,16 +672,16 @@ class ProductData:
             if key is not None:
                 if not isinstance(key[0], str) or not isinstance(key[1], int):
                     raise ProductDataError("invalid_cursor", "分页游标无效")
-                clauses.append("(d.ts < ? OR (d.ts = ? AND d.rowid < ?))")
-                params.extend((key[0], key[0], key[1]))
+                clauses.append("(d.ts_utc,d.rowid) < (?,?)")
+                params.extend((key[0], key[1]))
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             try:
                 rows = connection.execute(
-                    "SELECT d.rowid,d.rec_id,d.ts,d.source,d.role,d.project,d.content "
+                    "SELECT d.rowid,d.rec_id,d.ts,d.ts_utc,d.source,d.role,d.project,d.content "
                     "FROM docs d"
                     + joins
                     + where
-                    + " ORDER BY d.ts DESC,d.rowid DESC LIMIT ?",
+                    + " ORDER BY d.ts_utc DESC,d.rowid DESC LIMIT ?",
                     params + [limit + 1],
                 ).fetchall()
             except sqlite3.Error as exc:
@@ -594,11 +694,11 @@ class ProductData:
                 {
                     "id": str(row[1] or ""),
                     "timestamp": str(row[2] or ""),
-                    "source": _compact_text(row[3], 80),
-                    "role": _compact_text(row[4], 40),
-                    "project": _compact_text(row[5], 100),
+                    "source": _compact_text(row[4], 80),
+                    "role": _compact_text(row[5], 40),
+                    "project": _compact_text(row[6], 100),
                     "sensitivity": "internal",
-                    "summary": _compact_text(row[6]),
+                    "summary": _compact_text(row[7]),
                 }
                 for row in visible
             ]
@@ -609,7 +709,7 @@ class ProductData:
                     "memories",
                     filters,
                     meta["generation"],
-                    (str(last[2] or ""), int(last[0])),
+                    (str(last[3] or ""), int(last[0])),
                 )
         coverage = self._coverage(meta)
         requested_coverage = [coverage[key] for key in ("person", "project", "topic") if key in filters]
@@ -1025,7 +1125,24 @@ class ProductData:
             ),
             reverse=True,
         )
-        generation = "model-v1"
+        canonical_rows = [
+            json.dumps(
+                row,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            for row in rows
+        ]
+        generation_digest = hashlib.sha256()
+        for encoded_row in sorted(canonical_rows):
+            encoded = encoded_row.encode("utf-8")
+            generation_digest.update(
+                len(encoded).to_bytes(8, byteorder="big", signed=False)
+            )
+            generation_digest.update(encoded)
+        generation = generation_digest.hexdigest()
         key = self._decode_cursor(
             cursor, endpoint, filters, generation, 2
         )
@@ -1214,21 +1331,18 @@ class ProductData:
             "recent_correction": "partial",
             "model_evaluation": "partial",
         }
-        category_items = {key: [] for key in category_coverage}
-        visible_count = [0]
+        category_items = {key: {} for key in category_coverage}
 
         def add(kind: str, item_id: str, summary: str, severity: str) -> None:
-            if visible_count[0] >= MAX_PAGE_SIZE:
+            normalized_id = str(item_id or "")
+            if not normalized_id or normalized_id in category_items[kind]:
                 return
-            category_items[kind].append(
-                {
-                    "kind": kind,
-                    "id": item_id,
-                    "summary": _compact_text(summary, 240),
-                    "severity": severity,
-                }
-            )
-            visible_count[0] += 1
+            category_items[kind][normalized_id] = {
+                "kind": kind,
+                "id": normalized_id,
+                "summary": _compact_text(summary, 240),
+                "severity": severity,
+            }
 
         now = self._clock()
         if not isinstance(now, datetime) or now.tzinfo is None:
@@ -1318,19 +1432,37 @@ class ProductData:
         candidate_claims = sum(
             1 for row in claims if row.get("status") == "candidate"
         )
-        categories = {
-            key: {
-                "count": len(category_items[key]),
-                "coverage": category_coverage[key],
-                "items": category_items[key],
-            }
+        visible_by_category = {key: [] for key in category_coverage}
+        pending = {
+            key: list(category_items[key].values())
             for key in category_coverage
         }
-        flat_items = [
-            item
-            for key in category_coverage
-            for item in category_items[key]
-        ][:MAX_PAGE_SIZE]
+        flat_items = []
+        while len(flat_items) < MAX_PAGE_SIZE:
+            made_progress = False
+            for key in category_coverage:
+                if len(flat_items) >= MAX_PAGE_SIZE:
+                    break
+                rows = pending[key]
+                visible_count = len(visible_by_category[key])
+                if visible_count >= len(rows):
+                    continue
+                item = rows[visible_count]
+                visible_by_category[key].append(item)
+                flat_items.append(item)
+                made_progress = True
+            if not made_progress:
+                break
+        categories = {}
+        for key in category_coverage:
+            total = len(category_items[key])
+            visible = visible_by_category[key]
+            categories[key] = {
+                "count": total,
+                "coverage": category_coverage[key],
+                "items": visible,
+                "truncated": total > len(visible),
+            }
         return {
             "summary": {
                 "needs_confirmation": candidate_claims + candidate_judgments,

@@ -9,6 +9,7 @@ import os
 import sqlite3
 import stat as stat_module
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Set, Tuple
 
@@ -29,20 +30,25 @@ from index_publication import (
 
 SOURCE_STABILITY_ATTEMPTS = 3
 MISSING_ID_SAMPLE_LIMIT = 100
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 LOCATOR_COLUMNS = frozenset(
     {
         "source_offset",
         "source_length",
         "line_number",
         "content_sha256",
+        "ts_utc",
     }
 )
 LOCATOR_INDEXES = {
-    "idx_docs_rec_id": ("rec_id", None),
-    "idx_docs_source_offset": ("source_offset", True),
-    "idx_docs_line_number": ("line_number", True),
+    "idx_docs_rec_id": (("rec_id", False),),
+    "idx_docs_source_offset": (("source_offset", False),),
+    "idx_docs_line_number": (("line_number", False),),
+    "idx_docs_ts_utc_rowid": (("ts_utc", True), ("rowid", True)),
 }
+UNIQUE_INDEXES = frozenset(
+    {"idx_docs_source_offset", "idx_docs_line_number"}
+)
 
 
 class IndexIntegrityError(RuntimeError):
@@ -51,6 +57,18 @@ class IndexIntegrityError(RuntimeError):
 
 class SourceChangedError(IndexIntegrityError):
     """The source changed while a consistency-sensitive scan was running."""
+
+
+def normalize_timestamp_utc(value: object) -> str:
+    """Return a fixed-width UTC key while requiring an aware ISO timestamp."""
+    raw = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise IndexIntegrityError("record timestamp must be valid ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise IndexIntegrityError("record timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _normalized_source_path(path: Path) -> Path:
@@ -248,7 +266,7 @@ def _revision_stat_matches(
 def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS docs("
-        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
+        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, ts_utc TEXT NOT NULL, source TEXT, "
         "role TEXT, project TEXT, content TEXT, "
         "source_offset INTEGER NOT NULL, source_length INTEGER NOT NULL, "
         "line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
@@ -256,6 +274,10 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docs_ts_utc_rowid "
+        "ON docs(ts_utc DESC,rowid DESC)"
+    )
     con.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_source_offset "
         "ON docs(source_offset)"
@@ -304,31 +326,29 @@ def locator_schema_is_current(con: sqlite3.Connection) -> bool:
             str(row[1]): row
             for row in con.execute("PRAGMA index_list(docs)")
         }
-        for name, (expected_column, expected_unique) in LOCATOR_INDEXES.items():
+        for name, expected_keys in LOCATOR_INDEXES.items():
             index_row = index_rows.get(name)
             if index_row is None:
                 return False
             is_unique = bool(index_row[2])
             is_partial = bool(index_row[4])
-            if is_partial or (
-                expected_unique is not None
-                and is_unique is not expected_unique
-            ):
+            if is_partial or is_unique != (name in UNIQUE_INDEXES):
                 return False
             key_columns = [
                 row
                 for row in con.execute(
-                    "SELECT cid,name,coll,key FROM pragma_index_xinfo(?) "
+                    "SELECT cid,name,desc,coll,key FROM pragma_index_xinfo(?) "
                     "ORDER BY seqno",
                     (name,),
                 )
-                if bool(row[3])
+                if bool(row[4])
             ]
-            if (
-                len(key_columns) != 1
-                or int(key_columns[0][0]) < 0
-                or str(key_columns[0][1]) != expected_column
-                or str(key_columns[0][2]).upper() != "BINARY"
+            actual_keys = tuple(
+                (str(row[1]), bool(row[2])) for row in key_columns
+            )
+            if actual_keys != expected_keys or any(
+                int(row[0]) < 0 or str(row[3]).upper() != "BINARY"
+                for row in key_columns
             ):
                 return False
     except (IndexError, sqlite3.DatabaseError):
@@ -347,14 +367,17 @@ def _insert_record(
     content = row.get("content", "") or ""
     content_text = str(content)
     content_sha256 = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
+    raw_timestamp = str(row.get("timestamp") or "")
+    timestamp_utc = normalize_timestamp_utc(raw_timestamp)
     cur = con.execute(
         "INSERT INTO docs("
-        "rec_id,ts,source,role,project,content,"
+        "rec_id,ts,ts_utc,source,role,project,content,"
         "source_offset,source_length,line_number,content_sha256"
-        ") VALUES(?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         (
             str(row.get("id") or ""),
-            str(row.get("timestamp") or ""),
+            raw_timestamp,
+            timestamp_utc,
             str(row.get("source") or ""),
             str(row.get("role") or ""),
             str(row.get("project") or ""),

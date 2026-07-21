@@ -38,6 +38,56 @@ def db_ids(path: Path):
         }
 
 
+def test_index_build_preserves_raw_timestamp_and_adds_canonical_utc_seek_key(
+    tmp_path,
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    first = record("first", "alpha")
+    first["timestamp"] = "2026-07-22T00:00:00+08:00"
+    second = record("second", "bravo")
+    second["timestamp"] = "2026-07-21T17:00:00Z"
+    write_records(source, [first, second])
+
+    reconcile_index(source, database)
+
+    with sqlite3.connect(str(database)) as con:
+        rows = con.execute(
+            "SELECT rec_id,ts,ts_utc FROM docs ORDER BY ts_utc DESC,rowid DESC"
+        ).fetchall()
+        plan = con.execute(
+            "EXPLAIN QUERY PLAN SELECT rowid FROM docs "
+            "WHERE (ts_utc,rowid) < (?,?) "
+            "ORDER BY ts_utc DESC,rowid DESC LIMIT 50",
+            ("2026-07-22T00:00:00.000000Z", 999),
+        ).fetchall()
+    assert rows == [
+        ("second", "2026-07-21T17:00:00Z", "2026-07-21T17:00:00.000000Z"),
+        ("first", "2026-07-22T00:00:00+08:00", "2026-07-21T16:00:00.000000Z"),
+    ]
+    assert any(
+        "SEARCH" in str(row).upper()
+        and "idx_docs_ts_utc_rowid" in str(row)
+        for row in plan
+    )
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["", "2026-07-22", "2026-07-22T00:00:00", "not-a-time"],
+)
+def test_index_build_rejects_missing_naive_or_invalid_timestamp(
+    tmp_path, timestamp
+):
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    row = record("first", "alpha")
+    row["timestamp"] = timestamp
+    write_records(source, [row])
+    with pytest.raises(index_integrity.IndexIntegrityError):
+        reconcile_index(source, database)
+
+
 def test_middle_insertion_triggers_staging_rebuild_and_bidirectional_id_parity(tmp_path):
     source = tmp_path / "index.jsonl"
     database = tmp_path / "search_index.db"
@@ -198,7 +248,7 @@ def test_full_rebuild_records_exact_utf8_jsonl_byte_locators(tmp_path):
         )
         offset += len(raw)
     assert stored == expected
-    assert meta["index_schema_version"] == "2"
+    assert meta["index_schema_version"] == str(index_integrity.INDEX_SCHEMA_VERSION)
 
 
 def test_incremental_sync_records_offsets_from_previous_source_size(tmp_path):

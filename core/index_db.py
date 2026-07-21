@@ -96,7 +96,7 @@ def _connect() -> sqlite3.Connection:
 def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS docs("
-        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
+        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, ts_utc TEXT NOT NULL, source TEXT, "
         "role TEXT, project TEXT, content TEXT, "
         "source_offset INTEGER NOT NULL, source_length INTEGER NOT NULL, "
         "line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
@@ -104,6 +104,10 @@ def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docs_ts_utc_rowid "
+        "ON docs(ts_utc DESC,rowid DESC)"
+    )
     con.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_source_offset "
         "ON docs(source_offset)"

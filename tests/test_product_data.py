@@ -262,7 +262,7 @@ def _seed_trusted_index(vault, memory_count=120):
     db = vault / "search_index.db"
     con = sqlite3.connect(str(db))
     con.execute(
-        "CREATE TABLE docs(rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
+        "CREATE TABLE docs(rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, ts_utc TEXT NOT NULL, source TEXT, "
         "role TEXT, project TEXT, content TEXT, source_offset INTEGER NOT NULL, "
         "source_length INTEGER NOT NULL, line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
     )
@@ -270,6 +270,9 @@ def _seed_trusted_index(vault, memory_count=120):
     con.execute("CREATE INDEX idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE INDEX idx_docs_ts_utc_rowid ON docs(ts_utc DESC,rowid DESC)"
+    )
     con.execute("CREATE UNIQUE INDEX idx_docs_source_offset ON docs(source_offset)")
     con.execute("CREATE UNIQUE INDEX idx_docs_line_number ON docs(line_number)")
     con.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(content, tokenize='trigram')")
@@ -281,11 +284,12 @@ def _seed_trusted_index(vault, memory_count=120):
         if index == 0:
             content += " " + "Bear" + "er memory-private-token"
         con.execute(
-            "INSERT INTO docs(rec_id,ts,source,role,project,content,source_offset,source_length,line_number,content_sha256) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO docs(rec_id,ts,ts_utc,source,role,project,content,source_offset,source_length,line_number,content_sha256) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (
                 memory_id,
                 "2026-07-%02dT%02d:%02d:00+00:00" % (1 + index // (24 * 60), (index // 60) % 24, index % 60),
+                "2026-07-%02dT%02d:%02d:00.000000Z" % (1 + index // (24 * 60), (index // 60) % 24, index % 60),
                 "codex" if index % 2 else "claude",
                 "user",
                 "project-A" if index % 3 else "project-B",
@@ -589,6 +593,25 @@ def test_invalid_sqlite_trust_evidence_fails_closed(tmp_path, mutation):
     assert "search_index" not in str(raised.value)
 
 
+@pytest.mark.parametrize("mutation", ["delete_doc", "replace_id", "delete_fts"])
+def test_sqlite_actual_rows_must_match_trusted_count_and_digest(tmp_path, mutation):
+    data, _control, _center = seeded_product_data(tmp_path)
+    con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
+    if mutation == "delete_doc":
+        con.execute("DELETE FROM docs WHERE rec_id='memory-0000'")
+    elif mutation == "replace_id":
+        con.execute(
+            "UPDATE docs SET rec_id='memory-replaced' WHERE rec_id='memory-0000'"
+        )
+    else:
+        con.execute("DELETE FROM docs_fts WHERE rowid=1")
+    con.commit()
+    con.close()
+    with pytest.raises(ProductDataError) as raised:
+        data.memories({"limit": ["2"]})
+    assert raised.value.code == "index_unavailable"
+
+
 @pytest.mark.parametrize(
     ("endpoint", "id_field", "expected"),
     [
@@ -636,6 +659,41 @@ def test_model_cursor_is_bound_to_filter(tmp_path):
         data.judgments(
             {"status": ["candidate"], "limit": ["2"], "cursor": [page["next_cursor"]]}
         )
+    assert raised.value.code == "invalid_cursor"
+
+
+@pytest.mark.parametrize("endpoint", ["self_versions", "judgments", "contexts"])
+def test_model_cursor_is_invalidated_when_authority_generation_changes(
+    tmp_path, endpoint
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    method = getattr(data, endpoint)
+    first = method({"limit": ["2"]})
+    cursor = first["next_cursor"]
+    assert cursor
+    if endpoint == "self_versions":
+        rows = data.living_self.versions()
+        extra = dict(rows[-1])
+        extra["version_id"] = "lsv_" + "f" * 32
+        extra["confirmed_at"] = "2026-07-22T00:00:00+00:00"
+        data.living_self.versions = lambda: rows + [extra]
+    elif endpoint == "judgments":
+        rows = data.judgment_store.list()
+        extra = dict(rows[-1])
+        extra["card_id"] = "jud_" + "f" * 32
+        extra["updated_at"] = "2026-07-22T00:00:00+00:00"
+        extra["revision"] = 2
+        data.judgment_store.list = lambda: rows + [extra]
+    else:
+        rows = data.context_store.list()
+        extra = dict(rows[-1])
+        extra["context_id"] = "ctx_" + "e" * 32
+        extra["preview_id"] = "prv_" + "e" * 32
+        extra["updated_at"] = "2026-07-22T00:00:00+00:00"
+        extra["revision"] = 3
+        data.context_store.list = lambda: rows + [extra]
+    with pytest.raises(ProductDataError) as raised:
+        method({"limit": ["2"], "cursor": [cursor]})
     assert raised.value.code == "invalid_cursor"
 
 
@@ -777,10 +835,16 @@ def test_memory_query_plan_uses_index_and_never_offset(tmp_path):
     with data.index_integrity.trusted_connection() as (connection, _meta):
         plan = connection.execute(
             "EXPLAIN QUERY PLAN SELECT rowid,rec_id,ts FROM docs "
-            "WHERE ts < ? ORDER BY ts DESC,rowid DESC LIMIT ?",
-            ("2026-08-01T00:00:00+00:00", 51),
+            "WHERE (ts_utc,rowid) < (?,?) "
+            "ORDER BY ts_utc DESC,rowid DESC LIMIT ?",
+            ("2026-08-01T00:00:00.000000Z", 4000, 51),
         ).fetchall()
-    assert any("idx_docs_ts" in str(row) for row in plan)
+    assert any(
+        "SEARCH" in str(row).upper()
+        and "idx_docs_ts_utc_rowid" in str(row)
+        for row in plan
+    )
+    assert not any("SCAN" in str(row).upper() for row in plan)
     first = data.memories({"limit": ["50"]})
     assert len(first["items"]) == 50
     assert first["next_cursor"]
@@ -855,13 +919,13 @@ def test_home_today_uses_clock_local_timezone_boundary(tmp_path):
     data, _control, _center = seeded_product_data(tmp_path, memory_count=3)
     con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
     con.execute(
-        "UPDATE docs SET ts='2026-07-21T16:30:00+00:00' WHERE rec_id='memory-0000'"
+        "UPDATE docs SET ts='2026-07-21T16:30:00+00:00',ts_utc='2026-07-21T16:30:00.000000Z' WHERE rec_id='memory-0000'"
     )
     con.execute(
-        "UPDATE docs SET ts='2026-07-21T15:30:00+00:00' WHERE rec_id='memory-0001'"
+        "UPDATE docs SET ts='2026-07-21T15:30:00+00:00',ts_utc='2026-07-21T15:30:00.000000Z' WHERE rec_id='memory-0001'"
     )
     con.execute(
-        "UPDATE docs SET ts='2026-07-21T17:30:00+00:00' WHERE rec_id='memory-0002'"
+        "UPDATE docs SET ts='2026-07-21T17:30:00+00:00',ts_utc='2026-07-21T17:30:00.000000Z' WHERE rec_id='memory-0002'"
     )
     con.commit()
     con.close()
@@ -974,9 +1038,12 @@ def test_trust_has_all_spec_categories_with_counts_and_coverage(tmp_path):
     }
     assert set(trust["categories"]) == expected
     for category in trust["categories"].values():
-        assert set(category) == {"count", "coverage", "items"}
+        assert set(category) == {"count", "coverage", "items", "truncated"}
         assert category["coverage"] in {"complete", "partial", "unknown"}
-        assert category["count"] == len(category["items"])
+        assert category["count"] >= len(category["items"])
+        assert category["truncated"] is (
+            category["count"] > len(category["items"])
+        )
         assert len(category["items"]) <= 50
     assert trust["categories"]["unknown_speaker"]["count"] == 1
     assert trust["categories"]["expired_model"]["count"] == 1
@@ -985,6 +1052,7 @@ def test_trust_has_all_spec_categories_with_counts_and_coverage(tmp_path):
         "count": 0,
         "coverage": "unknown",
         "items": [],
+        "truncated": False,
     }
 
 
@@ -1043,13 +1111,24 @@ def test_trust_and_nested_product_lists_share_a_global_fifty_item_budget(tmp_pat
     )
     assert visible <= 50
     assert len(trust["items"]) <= 50
+    missing = trust["categories"]["missing_evidence"]
+    low = trust["categories"]["low_confidence"]
+    assert missing["count"] == 120
+    assert low["count"] == 120
+    assert missing["truncated"] is True
+    assert low["truncated"] is True
+    assert len({item["id"] for item in missing["items"]}) == len(
+        missing["items"]
+    )
+    assert missing["items"]
+    assert low["items"]
 
 
 def test_time_filters_normalize_offsets_before_sql_comparison(tmp_path):
     data, _control, _center = seeded_product_data(tmp_path, memory_count=1)
     con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
     con.execute(
-        "UPDATE docs SET ts='2026-07-21T16:30:00+00:00' WHERE rec_id='memory-0000'"
+        "UPDATE docs SET ts='2026-07-21T16:30:00+00:00',ts_utc='2026-07-21T16:30:00.000000Z' WHERE rec_id='memory-0000'"
     )
     con.commit()
     con.close()
@@ -1060,6 +1139,99 @@ def test_time_filters_normalize_offsets_before_sql_comparison(tmp_path):
         }
     )
     assert [row["id"] for row in page["items"]] == ["memory-0000"]
+
+
+def test_memory_order_uses_normalized_utc_not_raw_iso_text(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path, memory_count=2)
+    con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
+    con.execute(
+        "UPDATE docs SET ts=?,ts_utc=? WHERE rec_id='memory-0000'",
+        ("2026-07-22T00:00:00+08:00", "2026-07-21T16:00:00.000000Z"),
+    )
+    con.execute(
+        "UPDATE docs SET ts=?,ts_utc=? WHERE rec_id='memory-0001'",
+        ("2026-07-21T17:00:00+00:00", "2026-07-21T17:00:00.000000Z"),
+    )
+    con.commit()
+    con.close()
+    page = data.memories({"limit": ["2"]})
+    assert [row["id"] for row in page["items"]] == [
+        "memory-0001",
+        "memory-0000",
+    ]
+    assert [row["timestamp"] for row in page["items"]] == [
+        "2026-07-21T17:00:00+00:00",
+        "2026-07-22T00:00:00+08:00",
+    ]
+
+
+def test_product_read_model_rejects_old_v2_index_until_rebuilt(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
+    con.execute("UPDATE meta SET value='2' WHERE key='index_schema_version'")
+    con.execute("DROP INDEX idx_docs_ts_utc_rowid")
+    con.commit()
+    con.close()
+    with pytest.raises(ProductDataError) as raised:
+        data.memories({"limit": ["2"]})
+    assert raised.value.code == "index_unavailable"
+
+
+def _reopen_product_data(data):
+    return ProductData(
+        data.vault_dir,
+        control_data=data.control_data,
+        control_center=data.control_center,
+        claim_store=data.claim_store,
+        living_self=data.living_self,
+        judgment_store=data.judgment_store,
+        context_store=data.context_store,
+        outcome_store=data.outcome_store,
+        clock=data._clock,
+    )
+
+
+def test_cursor_signing_key_is_random_persistent_private_and_vault_bound(tmp_path):
+    first, _control, _center = seeded_product_data(tmp_path / "first")
+    page = first.memories({"limit": ["2"]})
+    cursor = page["next_cursor"]
+    key_path = first.vault_dir / "product" / "cursor-signing.key"
+    assert key_path.is_file()
+    assert key_path.stat().st_mode & 0o777 == 0o600
+    assert len(key_path.read_text(encoding="ascii").strip()) == 64
+
+    reopened = _reopen_product_data(first)
+    assert reopened.memories(
+        {"limit": ["2"], "cursor": [cursor]}
+    )["items"]
+
+    second, _control, _center = seeded_product_data(tmp_path / "second")
+    with pytest.raises(ProductDataError) as crossed:
+        second.memories({"limit": ["2"], "cursor": [cursor]})
+    assert crossed.value.code == "invalid_cursor"
+    second_key = (
+        second.vault_dir / "product" / "cursor-signing.key"
+    ).read_text(encoding="ascii")
+    assert second_key != key_path.read_text(encoding="ascii")
+
+
+@pytest.mark.parametrize("mutation", ["corrupt", "permissions", "symlink"])
+def test_cursor_signing_key_unsafe_state_fails_closed(tmp_path, mutation):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["next_cursor"]
+    key_path = data.vault_dir / "product" / "cursor-signing.key"
+    if mutation == "corrupt":
+        key_path.write_text("not-a-key\n", encoding="ascii")
+    elif mutation == "permissions":
+        key_path.chmod(0o644)
+    else:
+        key_path.unlink()
+        key_path.symlink_to(data.vault_dir / "index.jsonl")
+    reopened = _reopen_product_data(data)
+    assert reopened.home()["system_health"]["status"] == "healthy"
+    with pytest.raises(ProductDataError) as raised:
+        reopened.memories({"limit": ["2"]})
+    assert raised.value.code == "cursor_key_unavailable"
 
 
 def test_self_model_has_one_global_fifty_item_response_budget(tmp_path):
