@@ -505,10 +505,13 @@ class OutcomeStore:
                 row["operation"]["context_expected_version"] == expected
                 for row in existing
             ):
-                raise OutcomeStoreError(
-                    "outcome_conflict",
-                    "context has an unresolved outcome with a valid version",
-                )
+                prior = self._find_idempotent(idem, operation)
+                if prior is None:
+                    raise OutcomeStoreError(
+                        "outcome_conflict",
+                        "context has an unresolved outcome with a valid version",
+                    )
+        if prior is None:
             outcome_stream_version = len(existing) + 1
             envelope = new_event(
                 event_type="outcome.recorded",

@@ -1213,6 +1213,7 @@ class ContextCompiler:
         }
         if (
             ready != expected_ready
+            or markdown != self._render_markdown(pack)
             or pack["context_id"] != context_id
             or pack["lifecycle_status"] != "compiled"
             or pack["task"] != record["task"]

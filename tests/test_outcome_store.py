@@ -420,6 +420,50 @@ def test_concurrent_same_key_converges_to_one_committed_outcome(tmp_path):
     assert store.events.watermark() == 1
 
 
+def test_lagging_same_intent_rereads_idempotency_winner_before_conflict(
+    tmp_path, monkeypatch
+):
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    entered = threading.Event()
+    release = threading.Event()
+    original = store._events_for_context
+    delayed_once = {"value": False}
+
+    def delayed(context_id):
+        if (
+            threading.current_thread().name == "lagging-outcome"
+            and not delayed_once["value"]
+        ):
+            delayed_once["value"] = True
+            entered.set()
+            assert release.wait(timeout=5)
+        return original(context_id)
+
+    monkeypatch.setattr(store, "_events_for_context", delayed)
+    lagging_results = []
+    lagging_failures = []
+
+    def lagging_worker():
+        try:
+            lagging_results.append(_record(store, compiled))
+        except Exception as exc:
+            lagging_failures.append(exc)
+
+    thread = threading.Thread(target=lagging_worker, name="lagging-outcome")
+    thread.start()
+    assert entered.wait(timeout=5)
+    winner = _record(store, compiled)
+    release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert lagging_failures == []
+    assert lagging_results[0]["outcome_id"] == winner["outcome_id"]
+    assert store.events.watermark() == 1
+
+
 def test_pack_tamper_blocks_consume_and_outcome(tmp_path):
     from outcome_store import OutcomeStore, OutcomeStoreError
 
