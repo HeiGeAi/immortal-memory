@@ -36,6 +36,8 @@ from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
 from pipeline_capabilities import missing_pipeline_stages
+from product_data import ProductData
+from product_http import is_v2_get_target, route_product_get
 
 
 HOME = Path.home()
@@ -1893,6 +1895,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.server.control_data = value  # type: ignore[attr-defined]
         return value
 
+    @property
+    def product_data(self) -> ProductData:
+        value = getattr(self.server, "product_data", None)
+        if value is None:
+            value = ProductData(
+                self.control_center.immortal_dir,
+                control_data=self.control_data,
+                control_center=self.control_center,
+            )
+            self.server.product_data = value  # type: ignore[attr-defined]
+        return value
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
@@ -1952,6 +1966,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if not self.host_is_allowed():
+            return
+        if is_v2_get_target(self.path):
+            status, payload = route_product_get(
+                self.path, lambda: self.product_data
+            )
+            self.send_json(payload, status=status)
             return
         parsed = urlparse(self.path)
         if parsed.path == "/healthz":
