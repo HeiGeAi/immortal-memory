@@ -596,6 +596,41 @@ def test_compiled_context_becomes_unusable_when_authority_changes(tmp_path):
     assert failure.value.code == "stale_context"
 
 
+def test_load_compiled_returns_safe_read_body_when_path_is_replaced_after_read(
+    tmp_path, monkeypatch
+):
+    import context_compiler as context_compiler_module
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    markdown_path = Path(compiled["context_md"])
+    verified_markdown = markdown_path.read_text(encoding="utf-8")
+    attacker_path = tmp_path / "attacker.md"
+    attacker_path.write_text("# attacker replacement\n", encoding="utf-8")
+    original_safe_read = context_compiler_module.safe_read_text
+
+    def replace_after_safe_read(path):
+        body = original_safe_read(path)
+        if Path(path) == markdown_path:
+            markdown_path.unlink()
+            markdown_path.symlink_to(attacker_path)
+        return body
+
+    monkeypatch.setattr(
+        context_compiler_module, "safe_read_text", replace_after_safe_read
+    )
+
+    loaded = instance.load_compiled(compiled["context_id"])
+
+    assert loaded["context_markdown"] == verified_markdown
+    assert Path(loaded["context_md"]).read_text(encoding="utf-8") == (
+        "# attacker replacement\n"
+    )
+
+
 def test_compile_contract_rejects_client_body_invalid_exclusions_hash_and_ttl(
     tmp_path,
 ):

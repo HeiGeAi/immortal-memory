@@ -194,7 +194,7 @@ def load_ready_context(payload: dict[str, Any]) -> tuple[str, str, str]:
         )
     context_md = str(loaded["context_md"])
     context_json = str(loaded["context_json"])
-    content = read_text(Path(context_md), "")
+    content = str(loaded.get("context_markdown") or "")
     if not content:
         raise ContextCompilerError(
             "context_not_ready", "READY context Markdown is unavailable"

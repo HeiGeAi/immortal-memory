@@ -256,6 +256,44 @@ class AgentBridgeCorsTest(unittest.TestCase):
             self.assertNotIn("stale context", json.dumps(result))
             self.assertIn("packs/ctx_one/TASK_CONTEXT.md", result["paths"]["context_md"])
 
+    def test_ready_delivery_uses_verified_body_without_reopening_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attacker = root / "attacker.md"
+            attacker.write_text("# attacker replacement\n", encoding="utf-8")
+            canonical = root / "packs" / "ctx_one" / "TASK_CONTEXT.md"
+            canonical.parent.mkdir(parents=True)
+            canonical.symlink_to(attacker)
+            canonical_json = canonical.parent / "context.json"
+
+            class Compiler:
+                def __init__(self, _vault):
+                    pass
+
+                def load_compiled(self, _context_id):
+                    return {
+                        "context_id": "ctx_one",
+                        "content_hash": "sha256:" + "2" * 64,
+                        "lifecycle_status": "compiled",
+                        "context_md": str(canonical),
+                        "context_json": str(canonical_json),
+                        "context_markdown": "# verified safe-read body\n",
+                    }
+
+            payload = {
+                "context_id": "ctx_one",
+                "content_hash": "sha256:" + "2" * 64,
+            }
+            with mock.patch.object(agent_bridge_server, "ContextCompiler", Compiler):
+                content, context_md, context_json = agent_bridge_server.load_ready_context(
+                    payload
+                )
+
+            self.assertEqual(content, "# verified safe-read body\n")
+            self.assertEqual(context_md, str(canonical))
+            self.assertEqual(context_json, str(canonical_json))
+            self.assertNotIn("attacker", content)
+
     def test_invalid_ready_verification_never_falls_back_to_stdout_or_latest_md(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

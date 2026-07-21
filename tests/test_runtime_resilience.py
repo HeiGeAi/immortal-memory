@@ -155,6 +155,9 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
 
                 def compile(self, **kwargs):
                     calls.append(("compile", kwargs))
+                    canonical_md.write_text(
+                        "# replacement after verification\n", encoding="utf-8"
+                    )
                     return {
                         "context_id": "ctx_one",
                         "preview_id": "prv_one",
@@ -168,6 +171,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                         "expires_at": "2026-07-22T00:00:00+00:00",
                         "context_json": str(canonical_json),
                         "context_md": str(canonical_md),
+                        "context_markdown": "# authoritative\n",
                     }
 
             args = argparse.Namespace(
@@ -226,6 +230,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             self.assertEqual(payload["task"], "authoritative review task")
             self.assertEqual(payload["mode"], "reviewer")
             self.assertEqual(payload["request_label"], "forged writer request label")
+            self.assertNotIn("context_markdown", payload)
             compile_call = [item for item in calls if item[0] == "compile"][0]
             self.assertEqual(compile_call[1]["resolved_mode"], "reviewer")
             self.assertEqual(

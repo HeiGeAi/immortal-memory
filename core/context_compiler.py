@@ -1194,4 +1194,5 @@ class ContextCompiler:
             **pack,
             "context_json": str(context_path),
             "context_md": str(markdown_path),
+            "context_markdown": markdown,
         }

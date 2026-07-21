@@ -546,7 +546,15 @@ def command_context(args: argparse.Namespace) -> int:
         return _write_authoritative_error(args, preflight, exc)
 
     canonical_md = Path(str(compiled["context_md"]))
-    content = canonical_md.read_text(encoding="utf-8")
+    content = str(compiled.get("context_markdown") or "")
+    if not content:
+        return _write_authoritative_error(
+            args,
+            preflight,
+            ContextCompilerError(
+                "context_not_ready", "verified Context Markdown is unavailable"
+            ),
+        )
     output = Path(args.output).expanduser() if args.output else canonical_md
     if output != canonical_md:
         _safe_write_text(output, content)
