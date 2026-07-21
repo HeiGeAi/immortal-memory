@@ -61,11 +61,18 @@ class ProductHttpError(Exception):
     retryable: bool = False
 
 
-def error_body(code: str, message: str, *, retryable: bool = False) -> Dict[str, Any]:
+def error_body(
+    code: str,
+    message: str,
+    *,
+    detail: str = "",
+    retryable: bool = False,
+) -> Dict[str, Any]:
     return {
         "error": {
             "code": code,
             "message": message,
+            "detail": detail,
             "retryable": retryable,
         }
     }
@@ -113,7 +120,7 @@ def _parse_target(target: str) -> Tuple[List[str], Dict[str, List[str]]]:
         query = parse_qs(
             raw_query,
             keep_blank_values=True,
-            strict_parsing=False,
+            strict_parsing=True,
             encoding="utf-8",
             errors="strict",
             max_num_fields=MAX_QUERY_FIELDS,

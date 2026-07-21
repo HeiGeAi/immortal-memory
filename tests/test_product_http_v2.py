@@ -162,6 +162,7 @@ def test_list_query_preserves_values_and_rejects_duplicates_in_domain(tmp_path):
         "error": {
             "code": "invalid_query",
             "message": "查询参数不能重复",
+            "detail": "",
             "retryable": False,
         }
     }
@@ -253,6 +254,7 @@ def test_unknown_routes_are_stable_404_including_v2_root(tmp_path):
                 "error": {
                     "code": "not_found",
                     "message": "未找到接口",
+                    "detail": "",
                     "retryable": False,
                 }
             }
@@ -280,7 +282,12 @@ def test_product_data_errors_map_to_stable_status(tmp_path, code, status, retrya
         stop(server)
     assert actual == status
     assert payload == {
-        "error": {"code": code, "message": "安全消息", "retryable": retryable}
+        "error": {
+            "code": code,
+            "message": "安全消息",
+            "detail": "",
+            "retryable": retryable,
+        }
     }
 
 
@@ -298,6 +305,7 @@ def test_unknown_exception_is_generic_500_without_leak(tmp_path):
     assert payload["error"] == {
         "code": "internal_error",
         "message": "服务暂时无法完成请求",
+        "detail": "",
         "retryable": True,
     }
     assert "private-user" not in encoded
@@ -319,6 +327,7 @@ def test_unknown_domain_error_code_and_message_are_not_exposed(tmp_path):
     assert payload["error"] == {
         "code": "service_unavailable",
         "message": "产品数据暂时不可用",
+        "detail": "",
         "retryable": True,
     }
     assert "private-user" not in encoded
@@ -344,6 +353,7 @@ def test_product_data_construction_failure_is_stable_500(tmp_path, monkeypatch):
     assert payload["error"] == {
         "code": "internal_error",
         "message": "服务暂时无法完成请求",
+        "detail": "",
         "retryable": True,
     }
     assert "private-user" not in encoded
@@ -383,3 +393,43 @@ def test_query_encoding_errors_and_query_on_scalar_route_are_400(tmp_path):
     for status, _, payload in (bad_percent, bad_utf8, scalar_query):
         assert status == 400
         assert payload["error"]["code"] in {"invalid_query", "invalid_path"}
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "/api/v2/self/versions/version_2/diff?from=x&",
+        "/api/v2/self/versions/version_2/diff?from=x&&",
+        "/api/v2/home?&&",
+        "/api/v2/memories?bare",
+        "/api/v2/memories?q=abc&&limit=2",
+    ),
+)
+def test_malformed_query_fields_are_rejected_strictly(tmp_path, target):
+    server, _ = start_v2_server(tmp_path)
+    try:
+        status, _, payload = raw_get(server, target)
+    finally:
+        stop(server)
+    assert status == 400
+    assert payload == {
+        "error": {
+            "code": "invalid_query",
+            "message": "查询参数无效",
+            "detail": "",
+            "retryable": False,
+        }
+    }
+
+
+def test_valid_percent_encoding_and_blank_known_value_reach_domain(tmp_path):
+    server, base = start_v2_server(tmp_path)
+    try:
+        encoded_status, _, encoded = get_json(base + "/api/v2/memories?q=a%26b")
+        blank_status, _, blank = get_json(base + "/api/v2/memories?q=")
+    finally:
+        stop(server)
+    assert encoded_status == 200
+    assert encoded["args"] == [{"q": ["a&b"]}]
+    assert blank_status == 200
+    assert blank["args"] == [{"q": [""]}]
