@@ -3075,7 +3075,24 @@ git commit -m "feat: replace ops homepage with memory product"
 - Modify: `core/product_assets/product.css`
 - Modify: `tests/test_product_ui_v2.py`
 
-- [ ] **Step 1: Add failing interaction contract tests**
+- [x] **Step 0: Close read contracts required by real interactions**
+
+Before adding interactive controls, extend the bounded read models so the UI
+never guesses concurrency authority or relies on a transient mutation response:
+
+- Self item detail exposes bounded `claim_refs` with the authoritative Claim
+  revision required by `correct`, and the top-level Self response reports when
+  its 50-item view is truncated;
+- Context detail exposes the immutable preview approval fields after refresh,
+  including `preview_hash`, expiry, sections, budget, provenance, and privacy;
+- compiled, consumed, and outcome-recorded Context detail exposes the verified
+  immutable pack snapshot and the exact `context_markdown` delivered to the
+  Agent, without rebuilding it from the current model.
+
+Tests must prove the read response is bounded, redacted, version-complete, and
+fail-closed when the immutable Context snapshot cannot be verified.
+
+- [x] **Step 1: Add failing interaction contract tests**
 
 ```python
 def test_self_ui_exposes_evidence_versions_and_real_correction():
@@ -3128,7 +3145,7 @@ def test_ui_is_responsive_accessible_and_motion_safe():
     assert "aria-modal" in page
 ```
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ```bash
 PYTHONPATH=core python3 -m pytest tests/test_product_ui_v2.py -q
@@ -3136,7 +3153,7 @@ PYTHONPATH=core python3 -m pytest tests/test_product_ui_v2.py -q
 
 Expected: new assertions fail.
 
-- [ ] **Step 3: Implement remaining real renderers**
+- [x] **Step 3: Implement remaining real renderers**
 
 Export these renderer functions from the dedicated view modules:
 
@@ -3198,7 +3215,7 @@ Button visual states:
 - success only after server response;
 - failure with retry.
 
-- [ ] **Step 4: Run UI and HTTP tests**
+- [x] **Step 4: Run UI and HTTP tests**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -3209,14 +3226,14 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add core/product_assets tests/test_product_ui_v2.py
 git commit -m "feat: complete the Living Self product dashboard"
 ```
 
-- [ ] **Step 6: Run Milestone D full suite**
+- [x] **Step 6: Run Milestone D full suite**
 
 ```bash
 PYTHONPATH=core python3 -m pytest -q
