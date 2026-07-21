@@ -161,7 +161,7 @@ function openJob(jobId, trigger) {
     appendFact(details, "结果说明", job.summary);
     appendFact(details, "失败原因", redactJobText(job.error || job.error_code));
     fragment.append(details, node("h3", "脱敏运行日志"));
-    const log = node("pre", logs.text || "服务端尚未产生运行日志。", "context-markdown");
+    const log = node("pre", redactJobText(logs.text) || "服务端尚未产生运行日志。", "context-markdown");
     fragment.append(log);
     body.replaceChildren(fragment);
   }).catch((error) => {

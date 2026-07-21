@@ -173,7 +173,8 @@ def test_use_ui_has_preview_compile_consume_and_outcome_states():
         assert state in page
     assert "preview_hash" in page
     assert "context_markdown" in page
-    assert '"custom"' not in page
+    assert '"custom"' in page
+    assert "custom_scope_ids" in page
     assert "window.confirm" not in page
     assert "window.prompt" not in page
     assert "innerHTML" not in page

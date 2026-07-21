@@ -8,7 +8,7 @@ const STATES = {
   consumed: "已交给 Agent · 待记录结果",
   outcome_recorded: "结果已记录",
 };
-const MODES = ["auto", "advisor", "writer", "reviewer", "business", "project"];
+const MODES = ["auto", "advisor", "writer", "reviewer", "business", "project", "custom"];
 const SECTION_LABELS = {
   verified_facts: "已经核验的事实",
   confirmed_self_models: "已确认的自我理解",
@@ -24,6 +24,7 @@ const MODE_LABELS = {
   reviewer: "评审",
   business: "商业",
   project: "项目",
+  custom: "自定义范围",
 };
 
 function node(tag, value = "", className = "") {
@@ -200,17 +201,29 @@ function newPreview(trigger, refresh) {
     const task = control("这次要完成什么", "task", "textarea");
     const mode = control("使用方式", "mode", "select");
     MODES.forEach((value) => mode.input.append(new Option(MODE_LABELS[value] || value, value)));
+    const customScope = control("稳定范围 ID，可用空格或逗号分隔", "custom_scope_ids", "textarea");
+    customScope.wrapper.hidden = true;
+    customScope.input.required = false;
+    const syncCustomScope = () => {
+      const enabled = mode.input.value === "custom";
+      customScope.wrapper.hidden = !enabled;
+      customScope.input.required = enabled;
+    };
+    mode.input.addEventListener("change", syncCustomScope);
     const reason = control("为什么需要这份 Context", "reason", "textarea");
     const submit = node("button", "生成预览");
     submit.type = "submit";
     const feedback = node("p", "准备中", "form-feedback");
     const attempt = createMutationAttempt();
-    form.append(task.wrapper, mode.wrapper, reason.wrapper, submit, feedback);
+    form.append(task.wrapper, mode.wrapper, customScope.wrapper, reason.wrapper, submit, feedback);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       pending(submit, true, "正在生成……", "生成预览");
       try {
         const payload = { task: task.input.value, mode: mode.input.value, expected_version: 0, reason: reason.input.value };
+        if (mode.input.value === "custom") {
+          payload.custom_scope_ids = customScope.input.value.split(/[\s,，]+/).filter(Boolean);
+        }
         const preview = await mutate("/api/v2/contexts/preview", payload, attempt.options(payload));
         feedback.textContent = "预览完成";
         body.replaceChildren(previewBody(preview, refresh));
