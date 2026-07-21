@@ -593,7 +593,10 @@ def test_invalid_sqlite_trust_evidence_fails_closed(tmp_path, mutation):
     assert "search_index" not in str(raised.value)
 
 
-@pytest.mark.parametrize("mutation", ["delete_doc", "replace_id", "delete_fts"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["delete_doc", "replace_id", "delete_fts", "replace_fts_content"],
+)
 def test_sqlite_actual_rows_must_match_trusted_count_and_digest(tmp_path, mutation):
     data, _control, _center = seeded_product_data(tmp_path)
     con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
@@ -603,13 +606,185 @@ def test_sqlite_actual_rows_must_match_trusted_count_and_digest(tmp_path, mutati
         con.execute(
             "UPDATE docs SET rec_id='memory-replaced' WHERE rec_id='memory-0000'"
         )
-    else:
+    elif mutation == "delete_fts":
         con.execute("DELETE FROM docs_fts WHERE rowid=1")
+    else:
+        con.execute(
+            "UPDATE docs_fts SET content='篡改命中标记' WHERE rowid=1"
+        )
     con.commit()
     con.close()
     with pytest.raises(ProductDataError) as raised:
         data.memories({"limit": ["2"]})
     assert raised.value.code == "index_unavailable"
+
+
+def test_missing_index_verification_receipt_is_rebuilt_after_full_validation(
+    tmp_path, monkeypatch
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    receipt = data.vault_dir / "product" / "index-verification.json"
+    assert receipt.is_file()
+    receipt.unlink()
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    calls = []
+    original = integrity._deep_validate_index
+
+    def counted(connection, metadata):
+        calls.append(True)
+        return original(connection, metadata)
+
+    monkeypatch.setattr(integrity, "_deep_validate_index", counted)
+    with integrity.trusted_connection():
+        pass
+    assert calls == [True]
+    assert receipt.is_file()
+    assert receipt.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("mutation", ["corrupt", "permissions", "symlink"])
+def test_unsafe_index_verification_receipt_fails_closed(tmp_path, mutation):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    receipt = data.vault_dir / "product" / "index-verification.json"
+    if mutation == "corrupt":
+        receipt.write_text("not-json\n", encoding="utf-8")
+    elif mutation == "permissions":
+        receipt.chmod(0o644)
+    else:
+        receipt.unlink()
+        receipt.symlink_to(data.vault_dir / "index.jsonl")
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    with pytest.raises(ProductDataError) as raised:
+        with integrity.trusted_connection():
+            pass
+    assert raised.value.code == "index_unavailable"
+
+
+@pytest.mark.parametrize("mutation", ["delete", "corrupt", "permissions", "symlink"])
+def test_same_integrity_instance_rechecks_receipt_safety_on_every_access(
+    tmp_path, mutation
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    receipt = data.vault_dir / "product" / "index-verification.json"
+    if mutation == "delete":
+        receipt.unlink()
+    elif mutation == "corrupt":
+        receipt.write_text("not-json\n", encoding="utf-8")
+    elif mutation == "permissions":
+        receipt.chmod(0o644)
+    else:
+        receipt.unlink()
+        receipt.symlink_to(data.vault_dir / "index.jsonl")
+    with pytest.raises(ProductDataError) as raised:
+        data.memories({"limit": ["2"]})
+    assert raised.value.code == "index_unavailable"
+
+
+def test_stale_index_verification_receipt_forces_full_revalidation(
+    tmp_path, monkeypatch
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    receipt = data.vault_dir / "product" / "index-verification.json"
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    body["validation_version"] = 0
+    receipt.write_text(json.dumps(body), encoding="utf-8")
+    receipt.chmod(0o600)
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    calls = []
+    original = integrity._deep_validate_index
+
+    def counted(connection, metadata):
+        calls.append(True)
+        return original(connection, metadata)
+
+    monkeypatch.setattr(integrity, "_deep_validate_index", counted)
+    with integrity.trusted_connection():
+        pass
+    assert calls == [True]
+    assert json.loads(receipt.read_text(encoding="utf-8"))[
+        "validation_version"
+    ] == 1
+
+
+def test_matching_receipt_skips_deep_scan_across_integrity_instances(
+    tmp_path, monkeypatch
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    monkeypatch.setattr(
+        integrity,
+        "_deep_validate_index",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("matching receipt must skip deep scan")
+        ),
+    )
+    with integrity.trusted_connection():
+        pass
+
+
+def test_receipt_does_not_hide_later_fts_content_change(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
+    con.execute("UPDATE docs_fts SET content='后续篡改命中' WHERE rowid=1")
+    con.commit()
+    con.close()
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    with pytest.raises(ProductDataError) as raised:
+        with integrity.trusted_connection():
+            pass
+    assert raised.value.code == "index_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "id_field", "time_field"),
+    [
+        ("self_versions", "version_id", "confirmed_at"),
+        ("judgments", "card_id", "updated_at"),
+        ("contexts", "context_id", "updated_at"),
+    ],
+)
+def test_model_keyset_uses_utc_order_for_mixed_offsets_without_gaps(
+    tmp_path, endpoint, id_field, time_field
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    if endpoint == "self_versions":
+        rows = data.living_self.versions()
+        data.living_self.versions = lambda: rows
+    elif endpoint == "judgments":
+        rows = data.judgment_store.list()
+        data.judgment_store.list = lambda: rows
+    else:
+        rows = data.context_store.list()
+        data.context_store.list = lambda: rows
+    for index, row in enumerate(rows):
+        utc_value = datetime(2026, 7, 20, 0, index, tzinfo=timezone.utc)
+        if index % 2 == 0:
+            row[time_field] = (
+                utc_value.astimezone(ZoneInfo("Asia/Shanghai")).isoformat()
+            )
+        else:
+            row[time_field] = utc_value.isoformat().replace("+00:00", "Z")
+    expected = [row[id_field] for row in reversed(rows)]
+    raw_times = {row[id_field]: row[time_field] for row in rows}
+
+    seen = []
+    cursor = ""
+    while True:
+        page = getattr(data, endpoint)({"limit": ["2"], "cursor": [cursor]})
+        for item in page["items"]:
+            seen.append(item[id_field])
+            assert item[time_field] == raw_times[item[id_field]]
+        cursor = page["next_cursor"]
+        if not cursor:
+            break
+    assert seen == expected
+    assert len(seen) == len(set(seen)) == len(rows)
 
 
 @pytest.mark.parametrize(
@@ -769,6 +944,7 @@ def test_product_payload_redacts_all_supported_private_shapes(tmp_path):
     )
     con = sqlite3.connect(str(data.vault_dir / "search_index.db"))
     con.execute("UPDATE docs SET content=? WHERE rec_id='memory-0000'", (secret,))
+    con.execute("UPDATE docs_fts SET content=? WHERE rowid=1", (secret,))
     con.commit()
     con.close()
     payload = json.dumps(data.memory_detail("memory-0000"))

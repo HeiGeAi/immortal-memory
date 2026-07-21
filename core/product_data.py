@@ -27,6 +27,7 @@ from event_store import (
 )
 from index_integrity import (
     INDEX_SCHEMA_VERSION,
+    IndexIntegrityError,
     locator_schema_is_current,
     normalize_timestamp_utc,
 )
@@ -65,6 +66,7 @@ INDEX_META_KEYS = (
     "indexed_ids_sha256",
     "index_schema_version",
 )
+INDEX_VERIFICATION_VERSION = 1
 
 
 class ProductDataError(ValueError):
@@ -260,6 +262,100 @@ class ProductIndexIntegrity:
         connection.execute("PRAGMA query_only=ON")
         return connection
 
+    def _database_signature(self) -> Tuple[Any, ...]:
+        result = [self._signature(self._regular_file(self.database_path))]
+        for suffix in ("-wal", "-shm"):
+            path = Path(str(self.database_path) + suffix)
+            try:
+                result.append(self._signature(self._regular_file(path)))
+            except FileNotFoundError:
+                result.append(None)
+        return tuple(result)
+
+    def _verification_identity(
+        self,
+        rows: Mapping[str, str],
+        source_stat: os.stat_result,
+        database_signature: Tuple[Any, ...],
+    ) -> Dict[str, Any]:
+        metadata = json.dumps(
+            {key: rows[key] for key in INDEX_META_KEYS},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return {
+            "validation_version": INDEX_VERIFICATION_VERSION,
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "source_signature": list(self._signature(source_stat)),
+            "database_signature": [
+                list(value) if value is not None else None
+                for value in database_signature
+            ],
+            "metadata_generation": hashlib.sha256(metadata).hexdigest(),
+        }
+
+    def _read_verification_receipt(self, path: Path) -> Optional[Dict[str, Any]]:
+        raw = safe_read_text(path)
+        if raw is None:
+            return None
+        metadata = os.lstat(str(path))
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_mode & 0o777 != 0o600
+        ):
+            raise ValueError("index verification receipt is unsafe")
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("index verification receipt is corrupt") from exc
+        if not isinstance(value, dict):
+            raise ValueError("index verification receipt is corrupt")
+        return value
+
+    def _deep_validate_index(
+        self,
+        connection: sqlite3.Connection,
+        rows: Mapping[str, str],
+    ) -> None:
+        actual_digest = hashlib.sha256()
+        actual_count = 0
+        for (rec_id,) in connection.execute(
+            "SELECT rec_id FROM docs ORDER BY rec_id"
+        ):
+            encoded = str(rec_id).encode("utf-8")
+            actual_digest.update(
+                len(encoded).to_bytes(8, byteorder="big", signed=False)
+            )
+            actual_digest.update(encoded)
+            actual_count += 1
+        if (
+            actual_count != int(rows["indexed_id_count"])
+            or actual_digest.hexdigest() != rows["indexed_ids_sha256"]
+        ):
+            raise ValueError("actual indexed IDs differ from metadata")
+        fts_count = int(
+            connection.execute("SELECT count(*) FROM docs_fts").fetchone()[0]
+        )
+        if fts_count != actual_count:
+            raise ValueError("FTS row count differs from docs")
+        if connection.execute(
+            "SELECT 1 FROM docs d LEFT JOIN docs_fts f ON f.rowid=d.rowid "
+            "WHERE f.rowid IS NULL LIMIT 1"
+        ).fetchone() is not None:
+            raise ValueError("FTS is missing a docs row")
+        if connection.execute(
+            "SELECT 1 FROM docs_fts f LEFT JOIN docs d ON d.rowid=f.rowid "
+            "WHERE d.rowid IS NULL LIMIT 1"
+        ).fetchone() is not None:
+            raise ValueError("FTS contains an unknown docs row")
+        if connection.execute(
+            "SELECT 1 FROM docs d JOIN docs_fts f ON f.rowid=d.rowid "
+            "WHERE d.content IS NOT f.content LIMIT 1"
+        ).fetchone() is not None:
+            raise ValueError("FTS content differs from docs")
+
     def _validate(
         self,
         connection: sqlite3.Connection,
@@ -295,60 +391,52 @@ class ProductIndexIntegrity:
         digest = rows["indexed_ids_sha256"]
         if re.fullmatch(r"[0-9a-f]{64}", digest or "") is None:
             raise ValueError("indexed ID digest is invalid")
-        database_stat = self._regular_file(self.database_path)
-        sidecar_signatures = []
-        for suffix in ("-wal", "-shm"):
-            path = Path(str(self.database_path) + suffix)
-            try:
-                sidecar_signatures.append(self._signature(self._regular_file(path)))
-            except FileNotFoundError:
-                sidecar_signatures.append(None)
-        cache_key = (
-            self._signature(database_stat),
-            tuple(sidecar_signatures),
-            rows["indexed_id_count"],
-            digest,
+        database_signature = self._database_signature()
+        identity = self._verification_identity(
+            rows,
+            source_stat,
+            database_signature,
         )
-        if self._verified_database_generation != cache_key:
-            # The surrounding shared source/database locks make this cache
-            # stable against cooperative index publishers. Main, WAL, and SHM
-            # signatures still invalidate it after a published generation
-            # changes; this is not a claim of protection from an attacker that
-            # bypasses the repository lock contract and restores file metadata.
-            actual_digest = hashlib.sha256()
-            actual_count = 0
-            for (rec_id,) in connection.execute(
-                "SELECT rec_id FROM docs ORDER BY rec_id"
-            ):
-                encoded = str(rec_id).encode("utf-8")
-                actual_digest.update(
-                    len(encoded).to_bytes(8, byteorder="big", signed=False)
-                )
-                actual_digest.update(encoded)
-                actual_count += 1
+        cache_key = json.dumps(
+            identity, sort_keys=True, separators=(",", ":")
+        )
+        # The surrounding shared source/database locks make the identity
+        # stable against cooperative index publishers. Main, WAL, and SHM
+        # signatures invalidate the receipt after a published generation
+        # changes; this is not a claim of protection from an attacker that
+        # bypasses the repository lock contract and restores file metadata.
+        # The receipt itself is re-read on every access so a long-running
+        # process cannot hide later corruption behind its in-memory cache.
+        receipt_path = self.vault_dir / "product" / "index-verification.json"
+        with _exclusive_lock(
+            self.vault_dir / "product" / "index-verification.lock",
+            timeout=30.0,
+            stale_after=60.0,
+        ):
+            receipt = self._read_verification_receipt(receipt_path)
             if (
-                actual_count != int(rows["indexed_id_count"])
-                or actual_digest.hexdigest() != digest
+                receipt is None
+                and self._verified_database_generation == cache_key
             ):
-                raise ValueError("actual indexed IDs differ from metadata")
-            fts_count = int(
-                connection.execute("SELECT count(*) FROM docs_fts").fetchone()[0]
-            )
-            if fts_count != actual_count:
-                raise ValueError("FTS row count differs from docs")
-            if connection.execute(
-                "SELECT 1 FROM docs d LEFT JOIN docs_fts f ON f.rowid=d.rowid "
-                "WHERE f.rowid IS NULL LIMIT 1"
-            ).fetchone() is not None:
-                raise ValueError("FTS is missing a docs row")
-            if connection.execute(
-                "SELECT 1 FROM docs_fts f LEFT JOIN docs d ON d.rowid=f.rowid "
-                "WHERE d.rowid IS NULL LIMIT 1"
-            ).fetchone() is not None:
-                raise ValueError("FTS contains an unknown docs row")
-            database_after = self._regular_file(self.database_path)
-            if self._signature(database_stat) != self._signature(database_after):
-                raise ValueError("database changed during integrity validation")
+                raise ValueError("index verification receipt disappeared")
+            if receipt != identity:
+                self._deep_validate_index(connection, rows)
+                if self._database_signature() != database_signature:
+                    raise ValueError(
+                        "database changed during integrity validation"
+                    )
+                safe_atomic_write_text(
+                    receipt_path,
+                    json.dumps(
+                        identity,
+                        ensure_ascii=True,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                )
+                if self._read_verification_receipt(receipt_path) != identity:
+                    raise ValueError("index verification receipt write failed")
             self._verified_database_generation = cache_key
         coverage_rows = dict(
             connection.execute(
@@ -400,7 +488,14 @@ class ProductIndexIntegrity:
                 yield connection, metadata
         except ProductDataError:
             raise
-        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        except (
+            EventPathError,
+            OSError,
+            sqlite3.Error,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as exc:
             raise ProductDataError(
                 "index_unavailable", "记忆索引当前不可用"
             ) from exc
@@ -1118,13 +1213,23 @@ class ProductData:
             ):
                 continue
             filtered.append(row)
-        filtered.sort(
-            key=lambda row: (
-                str(row.get(time_field) or ""),
-                str(row.get(id_field) or ""),
-            ),
-            reverse=True,
-        )
+        try:
+            keyed = [
+                (
+                    normalize_timestamp_utc(row.get(time_field)),
+                    str(row.get(id_field) or ""),
+                    row,
+                )
+                for row in filtered
+            ]
+        except IndexIntegrityError as exc:
+            code = {
+                "self_versions": "self_model_unavailable",
+                "judgments": "judgment_unavailable",
+                "contexts": "context_unavailable",
+            }.get(endpoint, "model_unavailable")
+            raise ProductDataError(code, "权威时间信息当前不可用") from exc
+        keyed.sort(key=lambda value: (value[0], value[1]), reverse=True)
         canonical_rows = [
             json.dumps(
                 row,
@@ -1149,16 +1254,12 @@ class ProductData:
         if key is not None:
             if not all(isinstance(value, str) for value in key):
                 raise ProductDataError("invalid_cursor", "分页游标无效")
-            filtered = [
-                row
-                for row in filtered
-                if (
-                    str(row.get(time_field) or ""),
-                    str(row.get(id_field) or ""),
-                )
-                < (key[0], key[1])
+            keyed = [
+                value
+                for value in keyed
+                if (value[0], value[1]) < (key[0], key[1])
             ]
-        visible = filtered[: limit + 1]
+        visible = keyed[: limit + 1]
         has_more = len(visible) > limit
         visible = visible[:limit]
         next_cursor = ""
@@ -1168,13 +1269,10 @@ class ProductData:
                 endpoint,
                 filters,
                 generation,
-                (
-                    str(last.get(time_field) or ""),
-                    str(last.get(id_field) or ""),
-                ),
+                (last[0], last[1]),
             )
         return {
-            "items": [transform(row) for row in visible],
+            "items": [transform(value[2]) for value in visible],
             "limit": limit,
             "has_more": has_more,
             "next_cursor": next_cursor,
