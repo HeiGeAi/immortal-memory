@@ -695,6 +695,9 @@ HTTP 协调层使用一个不记录正文的幂等意图账本。账本只保存
 覆盖 prepare、领域提交、崩溃恢复和 complete 全流程；领域存储自己的事件幂等
 仍是最终权威，账本不能替代事件流。账本文件和锁必须是受锚定路径保护的
 `0600` 普通文件，符号链接、宽权限、损坏或锁超时均失败关闭。
+账本 JSON 必须拒绝重复键、`NaN`、`Infinity` 和不一致的 pending、completed、
+failed 字段组合。只完成 prepare 的空结果 pending 条目必须能在重启后继续恢复，
+不能被账本读取器误判为损坏。
 
 ### 9.1 首页
 
@@ -746,21 +749,22 @@ HTTP 协调层使用一个不记录正文的幂等意图账本。账本只保存
 `from` 查询参数作为 `from_version_id`。缺失、重复或附带冗余 `to`
 参数都返回稳定的 `invalid_query`，避免两个目标版本来源互相冲突。
 
-动作：
+当前 item 动作只支持：
 
-- `confirm`
-- `reject`
 - `correct`
-- `reconsider`
 
-`correct` 必须包含新正文和原因。
+`correct` 必须包含新正文和原因。`confirm`、`reject` 和 `reconsider`
+不属于这个接口：Living Self 只聚合已确认 Claim，而 Claim 状态机不允许
+已确认 Claim 再进入这三种转换。候选 Claim 的确认、拒绝和重新考虑必须由
+后续独立的 Claim 审阅 read model 与 endpoint 承担，禁止在已确认的
+Living Self item 上展示永远无法成功的动作。
 
 SelfModelItem 是 Claim 的派生聚合。所有 item 动作必须显式提交
 `claim_id`、当前 `expected_self_version` 和该 Claim 的整数
 `expected_version`。服务端确认 item 来自当前 Living Self 版本，并确认
 `claim_id` 属于该 item 的 `claim_ids`。禁止默认选择第一个 Claim，也禁止把
-多个 Claim 伪装成一次原子批量修改。`confirm`、`reject`、`correct` 和
-`reconsider` 分别调用 Claim 状态机；提交 Claim 后生成新的不可变 Living Self
+多个 Claim 伪装成一次原子批量修改。`correct` 调用 Claim 的纠正操作，原 Claim
+被 supersede，新 Claim 保持 confirmed；提交后生成新的不可变 Living Self
 版本，失败时明确标记派生版本落后，不能声称 item 已原地修改。
 
 版本恢复的 `expected_version` 是请求开始时的当前 Living Self
@@ -792,6 +796,8 @@ SelfModelItem 是 Claim 的派生聚合。所有 item 动作必须显式提交
 - `POST /api/v2/contexts/{id}/outcomes`
 
 预览不写入正式 Context Pack。正式编译返回可读 Markdown、结构化清单和排除说明。
+返回的 `context_markdown` 必须保留原始换行和层级格式，同时继续执行凭证与内部
+路径脱敏；禁止使用摘要压缩器把完整 Markdown 折叠成单行。
 
 预览响应必须包含 `preview_id`、`source_revision`、`preview_hash`、`expires_at`、入选项和排除原因。
 

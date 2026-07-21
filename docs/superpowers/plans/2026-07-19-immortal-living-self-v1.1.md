@@ -2716,7 +2716,7 @@ git commit -m "feat: expose Living Self read APIs"
 - Modify: `tests/test_living_self_service.py`
 - Modify: `tests/test_product_http_v2.py`
 
-- [ ] **Step 1: Add failing write-contract tests**
+- [x] **Step 1: Add failing write-contract tests**
 
 ```python
 def test_write_requires_local_origin_request_id_and_idempotency(tmp_path):
@@ -2724,7 +2724,7 @@ def test_write_requires_local_origin_request_id_and_idempotency(tmp_path):
     try:
         status, payload = post_json(
             base + "/api/v2/self/items/self-1/actions",
-            {"action": "confirm"},
+            {"action": "correct"},
             headers={},
         )
     finally:
@@ -2764,7 +2764,7 @@ def test_wrong_port_origin_content_type_and_large_body_are_rejected(tmp_path):
     try:
         wrong_origin_status, _ = post_json(
             base + "/api/v2/self/items/self-1/actions",
-            {"action": "confirm", "expected_version": 1},
+            {"action": "correct", "expected_version": 1},
             headers={
                 "Origin": "http://127.0.0.1:1",
                 "X-Immortal-Request-Id": "req-wrong-origin",
@@ -2794,7 +2794,7 @@ def test_stale_expected_version_returns_conflict(tmp_path):
     try:
         status, payload = post_json(
             base + "/api/v2/self/items/self-1/actions",
-            {"action": "confirm", "expected_version": 0},
+            {"action": "correct", "expected_version": 0},
             headers=headers,
         )
     finally:
@@ -2803,7 +2803,7 @@ def test_stale_expected_version_returns_conflict(tmp_path):
     assert payload["error"]["code"] == "version_conflict"
 ```
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -2813,7 +2813,7 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: missing safety enforcement.
 
-- [ ] **Step 3: Implement explicit mutation routes**
+- [x] **Step 3: Implement explicit mutation routes**
 
 Implement:
 
@@ -2868,12 +2868,24 @@ Hold one coordinator lock across prepare, domain commit or recovery, and
 completion. Native Claim, Judgment, Context, and Outcome event idempotency
 remains authoritative.
 
+The ledger parser rejects duplicate JSON keys, non-standard numeric constants,
+and inconsistent pending, completed, or failed field combinations. A prepared
+entry with no domain result remains readable after restart. Public compiled
+Context markdown preserves its line structure while path and credential
+redaction remains active.
+
 Self item actions require explicit `claim_id`, `expected_self_version`, and the
 Claim revision in integer `expected_version`. Verify that the item belongs to
 the current Living Self snapshot and that the Claim belongs to the item; never
 choose the first Claim or batch multiple Claim streams implicitly. After the
 Claim event, materialize exactly one new Living Self version or return an
 explicit stale-derived result.
+
+The item action contract supports `correct` only. Living Self contains confirmed
+Claims, while the Claim state machine cannot confirm, reject, or reconsider an
+already confirmed Claim. Reject those three action names with stable
+`invalid_transition`. A future candidate-Claim review queue needs its own read
+model and endpoint; do not expose impossible controls on a confirmed Self item.
 
 Living Self restore uses the current Living Self `version_id` as
 `expected_version`. Preallocate the result version ID in the pending ledger and
@@ -2882,7 +2894,7 @@ method. Test crashes after intent prepare, immutable version publication,
 current publication, and before ledger completion. Retrying must converge on
 the same result ID; a third-party current version causes `version_conflict`.
 
-- [ ] **Step 4: Run all HTTP tests**
+- [x] **Step 4: Run all HTTP tests**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -2893,11 +2905,20 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add core/product_http.py core/profile_review.py tests/test_product_http_v2.py
-git commit -m "feat: secure Living Self mutations"
+git add \
+  core/living_self_service.py \
+  core/outcome_store.py \
+  core/product_http.py \
+  core/product_mutations.py \
+  core/profile_review.py \
+  tests/test_living_self_service.py \
+  tests/test_outcome_store.py \
+  tests/test_product_http_v2.py \
+  tests/test_product_mutations.py
+git commit -m "feat: secure product mutations"
 ```
 
 ### Task 15: Product UI shell, System, and Memories
