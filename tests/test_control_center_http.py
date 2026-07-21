@@ -64,10 +64,11 @@ def post(url, body, *, origin=None):
         return exc.code, json.loads(exc.read())
 
 
-def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
+def test_root_serves_product_and_control_center_is_preserved(tmp_path):
     server, base = start_server(tmp_path)
     try:
         status, content_type, body = get(base + "/")
+        legacy_status, legacy_type, legacy_body = get(base + "/control-center")
         try:
             get(base + "/snapshot")
             raise AssertionError("retired snapshot unexpectedly returned success")
@@ -80,7 +81,10 @@ def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
 
     assert status == 200
     assert content_type == "text/html"
-    assert b"CONTROL" in body
+    assert b"IMMORTAL" in body
+    assert legacy_status == 200
+    assert legacy_type == "text/html"
+    assert b"CONTROL" in legacy_body
     assert snapshot_status == 410
     assert "已停用".encode() in snapshot_body
 

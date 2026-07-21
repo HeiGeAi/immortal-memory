@@ -26,13 +26,19 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 from control_center import ControlCenter
 from control_center_ui import control_center_page_html
 from control_data import ControlData
-from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
+from control_http import (
+    LEGACY_SECURITY_HEADERS,
+    SECURITY_HEADERS,
+    error_page,
+    error_payload,
+    is_allowed_host,
+)
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
 from pipeline_capabilities import missing_pipeline_stages
@@ -48,6 +54,7 @@ from product_http import (
     route_product_post,
 )
 from product_mutations import ProductMutationCoordinator
+from product_ui import PRODUCT_ASSETS, PRODUCT_ASSET_ROOT, product_page_html
 
 
 HOME = Path.home()
@@ -1929,7 +1936,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def end_headers(self) -> None:
-        for name, value in SECURITY_HEADERS.items():
+        headers = LEGACY_SECURITY_HEADERS if getattr(self, "_legacy_security", False) else SECURITY_HEADERS
+        for name, value in headers.items():
             self.send_header(name, value)
         super().end_headers()
 
@@ -1951,6 +1959,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -1962,6 +1971,46 @@ class ReviewHandler(BaseHTTPRequestHandler):
         payload = value.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def send_legacy_html(self, value: str, status: int = 200) -> None:
+        self._legacy_security = True
+        try:
+            self.send_html(value, status=status)
+        finally:
+            self._legacy_security = False
+
+    def send_product_asset(self, request_path: str) -> None:
+        raw_name = request_path.removeprefix("/assets/")
+        try:
+            name = unquote(raw_name, errors="strict")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            self.send_json(error_payload("invalid_asset_path", "资源路径无效。"), status=400)
+            return
+        if (
+            not raw_name
+            or name not in PRODUCT_ASSETS
+            or name.startswith("/")
+            or "\\" in name
+            or any(part in {"", ".", ".."} for part in name.split("/"))
+        ):
+            self.send_json(error_payload("asset_not_found", "资源不存在。"), status=404)
+            return
+        path = PRODUCT_ASSET_ROOT / name
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            self.send_json(error_payload("asset_not_found", "资源不存在。"), status=404)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", PRODUCT_ASSETS[name])
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -1992,6 +2041,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.send_json(payload, status=status)
             return
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/assets/"):
+            self.send_product_asset(parsed.path)
+            return
         if parsed.path == "/healthz":
             self.send_json({"status": "ok"})
             return
@@ -2097,12 +2149,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.send_json(error_payload("job_not_found", str(exc)), status=404)
             return
         if parsed.path == "/":
-            payload = control_center_page_html("Immortal Control Center").encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            self.send_html(product_page_html("Immortal Memory"))
+            return
+        if parsed.path == "/control-center":
+            self.send_legacy_html(control_center_page_html("Immortal Control Center"))
             return
         if parsed.path == "/snapshot":
             if DEFAULT_DASHBOARD.exists():
@@ -2122,21 +2172,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/review":
-            payload = page_html("长期画像审阅台").encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", "/?view=self&filter=candidate")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(payload)
             return
         if parsed.path == "/agent-factory":
-            embedded = parse_qs(parsed.query).get("embed", ["0"])[0] == "1"
-            payload = factory_page_html("任务上下文生成器", embedded=embedded).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", "/?view=use")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(payload)
             return
         if parsed.path == "/agent-entry":
             if not DEFAULT_AGENT_ENTRY.exists():
