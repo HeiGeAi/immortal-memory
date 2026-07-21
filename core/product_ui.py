@@ -18,6 +18,10 @@ PRODUCT_ASSETS = {
     "views/home.js": "text/javascript; charset=utf-8",
     "views/memories.js": "text/javascript; charset=utf-8",
     "views/system.js": "text/javascript; charset=utf-8",
+    "views/self.js": "text/javascript; charset=utf-8",
+    "views/judgments.js": "text/javascript; charset=utf-8",
+    "views/contexts.js": "text/javascript; charset=utf-8",
+    "views/trust.js": "text/javascript; charset=utf-8",
 }
 
 _NAV_ITEMS = (

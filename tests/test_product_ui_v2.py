@@ -98,6 +98,7 @@ def test_router_api_and_dialog_contracts_are_real_and_safe():
     assert 'aria-modal' in dialog
     assert "Escape" in dialog
     assert "shiftKey" in dialog
+    assert "alreadyOpen && keyHandler" in dialog
 
 
 def test_styles_are_archive_specific_accessible_and_static():
@@ -129,6 +130,96 @@ def test_system_evidence_uses_human_labels_and_local_times():
     assert 'memory_index: "记忆索引"' in system
     assert 'verified: "已经核验"' in system
     assert "formatTimestamp(content)" in system
+
+
+def test_self_ui_exposes_evidence_versions_and_real_correction():
+    self_js = (ASSETS / "views" / "self.js").read_text(encoding="utf-8")
+    api_js = (ASSETS / "api.js").read_text(encoding="utf-8")
+    for endpoint in ("/api/v2/self", "/api/v2/self/versions", "/actions", "/restore"):
+        assert endpoint in self_js
+    assert "claim_refs" in self_js
+    assert "expected_self_version" in self_js
+    assert "Idempotency-Key" in api_js
+    assert "X-Immortal-Request-Id" in api_js
+    assert "If-Match" in api_js
+    assert "window.confirm" not in self_js
+    assert "window.prompt" not in self_js
+    assert "innerHTML" not in self_js
+
+
+def test_use_ui_has_preview_compile_consume_and_outcome_states():
+    page = (ASSETS / "views" / "contexts.js").read_text(encoding="utf-8")
+    for endpoint in (
+        "/api/v2/contexts/preview",
+        "/api/v2/contexts",
+        "/consume",
+        "/outcomes",
+    ):
+        assert endpoint in page
+    for state in (
+        "准备中",
+        "预览完成",
+        "编译中",
+        "可使用",
+        "已交给 Agent",
+        "待记录结果",
+        "结果已记录",
+        "失败",
+    ):
+        assert state in page
+    assert "preview_hash" in page
+    assert "context_markdown" in page
+    assert "window.confirm" not in page
+    assert "window.prompt" not in page
+    assert "innerHTML" not in page
+
+
+def test_judgment_and_trust_are_real_and_coverage_honest():
+    judgments = (ASSETS / "views" / "judgments.js").read_text(encoding="utf-8")
+    trust = (ASSETS / "views" / "trust.js").read_text(encoding="utf-8")
+    assert "/api/v2/judgments" in judgments
+    assert "/actions" in judgments
+    assert "revision" in judgments
+    assert "/api/v2/trust" in trust
+    for state in ("complete", "partial", "unknown", "truncated"):
+        assert state in trust
+    assert "window.confirm" not in judgments
+    assert "innerHTML" not in judgments
+    assert "innerHTML" not in trust
+
+
+def test_app_wires_all_real_product_renderers():
+    app = (ASSETS / "app.js").read_text(encoding="utf-8")
+    for renderer in ("renderSelf", "renderJudgments", "renderUse", "renderTrust"):
+        assert renderer in app
+    assert "CONNECTION PENDING" not in app
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_mutation_helper_sends_real_concurrency_and_idempotency_headers():
+    module = (ASSETS / "api.js").as_uri()
+    script = f'''
+      import {{ mutate }} from "{module}";
+      globalThis.fetch = async (path, options) => ({{
+        ok: true,
+        status: 200,
+        json: async () => ({{ path, options }}),
+      }});
+      const result = await mutate("/api/v2/test", {{ expected_version: 7, value: "real" }});
+      const headers = result.options.headers;
+      if (result.options.method !== "POST") process.exit(2);
+      if (headers["Content-Type"] !== "application/json") process.exit(3);
+      if (!headers["X-Immortal-Request-Id"] || !headers["Idempotency-Key"]) process.exit(4);
+      if (headers["X-Immortal-Request-Id"] !== headers["Idempotency-Key"]) process.exit(5);
+      if (headers["If-Match"] !== "7") process.exit(6);
+      if (JSON.parse(result.options.body).value !== "real") process.exit(7);
+    '''
+    subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")

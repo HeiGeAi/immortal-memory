@@ -18,8 +18,8 @@
 * { box-sizing: border-box; }
 html { background: var(--ink); color: var(--bone); }
 body { margin: 0; min-width: 320px; font: 15px/1.62 var(--body); background: var(--ink); }
-button, input { font: inherit; }
-button, input, .nav-link { min-height: 44px; }
+button, input, select, textarea { font: inherit; }
+button, input, select, textarea, .nav-link { min-height: 44px; }
 button {
   position: relative;
   border: 1px solid var(--copper);
@@ -74,7 +74,8 @@ h1 { max-width: 900px; margin: 10px 0 20px; font-size: clamp(40px, 6vw, 84px); l
 .filter-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 18px; border: 1px solid var(--line); background: var(--ink-raised); }
 .field-label { display: grid; gap: 6px; color: var(--bone-soft); font-size: 11px; }
 .field-label:first-child { grid-column: span 2; }
-input { width: 100%; border: 1px solid #3b463f; border-radius: 0; padding: 9px 11px; background: var(--ink); color: var(--bone); }
+input, select, textarea { width: 100%; border: 1px solid #3b463f; border-radius: 0; padding: 9px 11px; background: var(--ink); color: var(--bone); }
+textarea { min-height: 112px; resize: vertical; }
 .memory-stack { display: grid; margin-top: 22px; border-top: 1px solid var(--line); }
 .memory-card { display: grid; grid-template-columns: 190px minmax(0, 1fr) auto; gap: 22px; align-items: start; padding: 24px 0; border-bottom: 1px solid var(--line); }
 .memory-meta { display: grid; gap: 8px; color: var(--bone-faint); font: 10px var(--mono); }
@@ -101,6 +102,23 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .drawer-head h2 { margin: 0; font-size: 30px; }
 .drawer-body { padding-top: 24px; }
 .toast:empty { display: none; }
+.status-chip { color: var(--copper-bright); font: 10px var(--mono); overflow-wrap: anywhere; }
+.action-form { display: grid; gap: 14px; }
+.form-feedback { min-height: 1.6em; color: var(--bone-soft); }
+.self-sections, .context-list { display: grid; gap: 18px; margin-top: 28px; }
+.self-section { padding-top: 20px; border-top: 1px solid var(--line); }
+.self-section > h2 { color: var(--copper-bright); }
+.self-card, .context-card, .version-card { padding: 18px; border: 1px solid var(--line); background: var(--ink-raised); }
+.self-card h3, .context-card h2, .version-card h3 { margin: 0 0 8px; }
+.self-card p, .context-card p { color: var(--bone-soft); }
+.version-list, .preview-sections { display: grid; gap: 12px; }
+.preview-section { padding: 14px; border: 1px solid var(--line); }
+.preview-section h3 { margin-top: 0; color: var(--copper-bright); }
+.exclusion-row { display: grid; grid-template-columns: 24px 1fr; gap: 10px; align-items: start; padding: 8px 0; }
+.exclusion-row input { min-height: auto; width: 18px; height: 18px; }
+.context-preview, .context-detail { display: grid; gap: 16px; }
+.context-markdown { max-height: 46vh; overflow: auto; padding: 16px; border: 1px solid var(--line); background: var(--ink); color: var(--bone-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
+.outcome-summary { padding: 14px; border-left: 3px solid var(--copper); background: var(--ink-raised); }
 
 @media (max-width: 760px) {
   .shell { display: block; }
@@ -114,7 +132,7 @@ dd { margin: 0; overflow-wrap: anywhere; }
   .fact-grid, .system-grid, .filter-form { grid-template-columns: 1fr; }
   .field-label:first-child { grid-column: auto; }
   .memory-card { grid-template-columns: 1fr; gap: 10px; }
-  input { font-size: 16px; }
+  input, select, textarea { font-size: 16px; }
 }
 
 @media print {

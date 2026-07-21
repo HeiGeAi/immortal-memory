@@ -20,7 +20,9 @@ export function closeDialog() {
 
 export function openDialog(title, renderBody, trigger = document.activeElement) {
   const drawer = document.getElementById("drawer");
-  previousFocus = trigger;
+  const alreadyOpen = drawer.getAttribute("aria-hidden") !== "true";
+  if (alreadyOpen && keyHandler) document.removeEventListener("keydown", keyHandler);
+  if (!alreadyOpen) previousFocus = trigger;
   const heading = document.createElement("h2");
   heading.id = "drawer-title";
   heading.textContent = title;
