@@ -1,4 +1,4 @@
-import { api, mutate, explainApiError } from "../api.js";
+import { api, mutate, explainApiError, createMutationAttempt } from "../api.js";
 import { openDialog, closeDialog } from "../dialog.js";
 import { formatTimestamp } from "../format.js";
 
@@ -8,7 +8,23 @@ const STATES = {
   consumed: "已交给 Agent · 待记录结果",
   outcome_recorded: "结果已记录",
 };
-const MODES = ["auto", "advisor", "writer", "reviewer", "business", "project", "custom"];
+const MODES = ["auto", "advisor", "writer", "reviewer", "business", "project"];
+const SECTION_LABELS = {
+  verified_facts: "已经核验的事实",
+  confirmed_self_models: "已确认的自我理解",
+  judgment_cards: "相关判断",
+  counter_evidence: "反证与限制",
+  inferences: "仍属推断",
+  unknowns: "尚不确定",
+};
+const MODE_LABELS = {
+  auto: "自动选择",
+  advisor: "顾问",
+  writer: "写作",
+  reviewer: "评审",
+  business: "商业",
+  project: "项目",
+};
 
 function node(tag, value = "", className = "") {
   const element = document.createElement(tag);
@@ -40,7 +56,7 @@ function previewBody(preview, refresh) {
   const selections = node("div", "", "preview-sections");
   Object.entries(preview.sections || {}).forEach(([sectionName, items]) => {
     const section = node("section", "", "preview-section");
-    section.append(node("h3", sectionName));
+    section.append(node("h3", SECTION_LABELS[sectionName] || sectionName));
     (items || []).forEach((item) => {
       const label = document.createElement("label");
       label.className = "exclusion-row";
@@ -58,7 +74,7 @@ function previewBody(preview, refresh) {
   MODES.filter((value) => value !== "auto").forEach((value) => {
     const option = document.createElement("option");
     option.value = value;
-    option.textContent = value;
+    option.textContent = MODE_LABELS[value] || value;
     mode.append(option);
   });
   if (preview.mode === "auto") {
@@ -69,6 +85,7 @@ function previewBody(preview, refresh) {
   const compile = node("button", "确认并生成 Context");
   compile.type = "button";
   const feedback = node("p", "", "form-feedback");
+  const attempt = createMutationAttempt();
   compile.addEventListener("click", async () => {
     pending(compile, true, "编译中……", "确认并生成 Context");
     feedback.textContent = "编译中";
@@ -82,9 +99,8 @@ function previewBody(preview, refresh) {
         reason: "用户确认预览并生成 Context",
       };
       if (preview.mode === "auto") body.resolved_mode = mode.value;
-      const compiled = await mutate("/api/v2/contexts", body);
+      const compiled = await mutate("/api/v2/contexts", body, attempt.options(body));
       feedback.textContent = "可使用";
-      closeDialog();
       await showContext(compiled.context_id, compile, refresh);
     } catch (error) {
       feedback.textContent = `失败：${explainApiError(error)}`;
@@ -106,18 +122,24 @@ function outcomeForm(detail, refresh) {
   const submit = node("button", "记录结果");
   submit.type = "submit";
   const feedback = node("p", "", "form-feedback");
+  const attempt = createMutationAttempt();
   form.append(adopted.wrapper, result.wrapper, summary.wrapper, reason.wrapper, submit, feedback);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     pending(submit, true, "正在记录……", "记录结果");
     try {
-      await mutate(`/api/v2/contexts/${encodeURIComponent(detail.context_id)}/outcomes`, {
+      const payload = {
         adopted: adopted.input.value,
         result: result.input.value,
         summary: summary.input.value,
         expected_version: detail.revision,
         reason: reason.input.value,
-      });
+      };
+      await mutate(
+        `/api/v2/contexts/${encodeURIComponent(detail.context_id)}/outcomes`,
+        payload,
+        attempt.options(payload),
+      );
       feedback.textContent = "结果已记录";
       closeDialog();
       await refresh();
@@ -145,10 +167,16 @@ async function showContext(id, trigger, refresh) {
       const consume = node("button", "标记为已交给 Agent");
       consume.type = "button";
       const feedback = node("p", "", "form-feedback");
+      const attempt = createMutationAttempt();
       consume.addEventListener("click", async () => {
         pending(consume, true, "正在记录……", "标记为已交给 Agent");
         try {
-          await mutate(`/api/v2/contexts/${encodeURIComponent(detail.context_id)}/consume`, { expected_version: detail.revision, reason: "Context 已交给 Agent" });
+          const payload = { expected_version: detail.revision, reason: "Context 已交给 Agent" };
+          await mutate(
+            `/api/v2/contexts/${encodeURIComponent(detail.context_id)}/consume`,
+            payload,
+            attempt.options(payload),
+          );
           closeDialog();
           await refresh();
         } catch (error) {
@@ -171,17 +199,19 @@ function newPreview(trigger, refresh) {
     const form = node("form", "", "action-form");
     const task = control("这次要完成什么", "task", "textarea");
     const mode = control("使用方式", "mode", "select");
-    MODES.forEach((value) => mode.input.append(new Option(value, value)));
+    MODES.forEach((value) => mode.input.append(new Option(MODE_LABELS[value] || value, value)));
     const reason = control("为什么需要这份 Context", "reason", "textarea");
     const submit = node("button", "生成预览");
     submit.type = "submit";
     const feedback = node("p", "准备中", "form-feedback");
+    const attempt = createMutationAttempt();
     form.append(task.wrapper, mode.wrapper, reason.wrapper, submit, feedback);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       pending(submit, true, "正在生成……", "生成预览");
       try {
-        const preview = await mutate("/api/v2/contexts/preview", { task: task.input.value, mode: mode.input.value, expected_version: 0, reason: reason.input.value });
+        const payload = { task: task.input.value, mode: mode.input.value, expected_version: 0, reason: reason.input.value };
+        const preview = await mutate("/api/v2/contexts/preview", payload, attempt.options(payload));
         feedback.textContent = "预览完成";
         body.replaceChildren(previewBody(preview, refresh));
       } catch (error) {
@@ -211,7 +241,7 @@ export async function renderUse(root, { signal, isCurrent, navigate }) {
     const list = node("div", "", "context-list");
     (page.items || []).forEach((item) => {
       const card = node("article", "", "context-card");
-      card.append(node("p", STATES[item.lifecycle_status] || item.lifecycle_status || "状态未知", "status-chip"), node("h2", item.task || "未命名任务"), node("small", `${formatTimestamp(item.updated_at)} · ${item.mode || "模式未知"}`));
+      card.append(node("p", STATES[item.lifecycle_status] || item.lifecycle_status || "状态未知", "status-chip"), node("h2", item.task || "未命名任务"), node("small", `${formatTimestamp(item.updated_at)} · ${MODE_LABELS[item.mode] || item.mode || "模式未知"}`));
       const open = node("button", "查看并继续", "text-button");
       open.type = "button";
       open.addEventListener("click", () => showContext(item.context_id || item.preview_id, open, refresh));

@@ -1,4 +1,4 @@
-import { api } from "../api.js";
+import { api, createMutationAttempt } from "../api.js";
 import { openDialog } from "../dialog.js";
 import { formatTimestamp } from "../format.js";
 
@@ -129,6 +129,7 @@ function openAction(action, detail, { mutate, refresh }) {
   if (prompts[action]) form.append(node("p", prompts[action], "state-message"));
   form.append(field("操作原因", "reason", "", { multiline: true, rows: 3, maxLength: 500 }));
   const feedback = node("p", "", "state-message");
+  const attempt = createMutationAttempt();
   feedback.setAttribute("role", "status");
   const actions = document.createElement("div");
   actions.className = "honest-actions";
@@ -150,18 +151,32 @@ function openAction(action, detail, { mutate, refresh }) {
     feedback.textContent = "";
     try {
       const payload = actionBody(action, detail, form);
-      await mutate(`/api/v2/judgments/${encodeURIComponent(detail.card_id)}/actions`, payload);
+      await mutate(
+        `/api/v2/judgments/${encodeURIComponent(detail.card_id)}/actions`,
+        payload,
+        attempt.options(payload),
+      );
       submit.className = "is-success";
       submit.textContent = "已经写入";
-      await refresh();
     } catch (error) {
       submit.disabled = false;
       submit.className = "is-failure";
       submit.textContent = "写入失败，请重试";
       feedback.textContent = error.message || "操作失败";
+      return;
+    }
+    try {
+      await refresh();
+      document.querySelector("#drawer .icon-button")?.focus();
+    } catch (error) {
+      feedback.textContent = `操作已经写入，但最新状态读取失败：${error.message || "请重新读取"}`;
+      submit.disabled = true;
+      submit.className = "is-success";
+      submit.textContent = "已经写入，等待刷新";
     }
   });
   target.append(form);
+  (form.querySelector("textarea, input, select, button") || document.querySelector("#drawer .icon-button"))?.focus();
 }
 
 function detailView(detail, { mutate, refresh }) {
@@ -206,6 +221,7 @@ export async function renderJudgmentDetail(cardId, trigger, { mutate, onChanged 
     const detail = await api(`/api/v2/judgments/${encodeURIComponent(cardId)}`);
     const currentBody = document.querySelector("#drawer .drawer-body") || body;
     currentBody.replaceChildren(detailView(detail, { mutate, refresh }));
+    document.querySelector("#drawer .icon-button")?.focus();
     await onChanged?.();
   };
   try {

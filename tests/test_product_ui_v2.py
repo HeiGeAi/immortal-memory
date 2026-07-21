@@ -130,6 +130,8 @@ def test_system_evidence_uses_human_labels_and_local_times():
     assert 'memory_index: "记忆索引"' in system
     assert 'verified: "已经核验"' in system
     assert "formatTimestamp(content)" in system
+    assert "redactJobText" in system
+    assert "任务可能已经建立" in system
 
 
 def test_self_ui_exposes_evidence_versions_and_real_correction():
@@ -142,6 +144,8 @@ def test_self_ui_exposes_evidence_versions_and_real_correction():
     assert "Idempotency-Key" in api_js
     assert "X-Immortal-Request-Id" in api_js
     assert "If-Match" in api_js
+    assert "createMutationAttempt" in api_js
+    assert "derived_update_pending" in self_js
     assert "window.confirm" not in self_js
     assert "window.prompt" not in self_js
     assert "innerHTML" not in self_js
@@ -169,6 +173,7 @@ def test_use_ui_has_preview_compile_consume_and_outcome_states():
         assert state in page
     assert "preview_hash" in page
     assert "context_markdown" in page
+    assert '"custom"' not in page
     assert "window.confirm" not in page
     assert "window.prompt" not in page
     assert "innerHTML" not in page
@@ -199,7 +204,7 @@ def test_app_wires_all_real_product_renderers():
 def test_mutation_helper_sends_real_concurrency_and_idempotency_headers():
     module = (ASSETS / "api.js").as_uri()
     script = f'''
-      import {{ mutate }} from "{module}";
+      import {{ mutate, createMutationAttempt }} from "{module}";
       globalThis.fetch = async (path, options) => ({{
         ok: true,
         status: 200,
@@ -213,6 +218,13 @@ def test_mutation_helper_sends_real_concurrency_and_idempotency_headers():
       if (headers["X-Immortal-Request-Id"] !== headers["Idempotency-Key"]) process.exit(5);
       if (headers["If-Match"] !== "7") process.exit(6);
       if (JSON.parse(result.options.body).value !== "real") process.exit(7);
+      const attempt = createMutationAttempt();
+      const body = {{ expected_version: 8, value: "retry" }};
+      const first = attempt.options(body).requestId;
+      const retry = attempt.options(body).requestId;
+      const changed = attempt.options({{ ...body, value: "changed" }}).requestId;
+      if (first !== retry) process.exit(8);
+      if (first === changed) process.exit(9);
     '''
     subprocess.run(
         ["node", "--input-type=module", "--eval", script],

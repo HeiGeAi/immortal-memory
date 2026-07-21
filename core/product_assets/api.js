@@ -41,7 +41,7 @@ export async function api(path, options = {}) {
 }
 
 export async function mutate(path, body, options = {}) {
-  const requestId = crypto.randomUUID();
+  const requestId = options.requestId || crypto.randomUUID();
   return api(path, {
     method: "POST",
     signal: options.signal,
@@ -54,6 +54,25 @@ export async function mutate(path, body, options = {}) {
     },
     body: JSON.stringify(body),
   });
+}
+
+export function createMutationAttempt() {
+  let serialized = "";
+  let requestId = "";
+  return {
+    options(body) {
+      const next = JSON.stringify(body);
+      if (!requestId || next !== serialized) {
+        serialized = next;
+        requestId = crypto.randomUUID();
+      }
+      return { requestId };
+    },
+    clear() {
+      serialized = "";
+      requestId = "";
+    },
+  };
 }
 
 export function explainApiError(error) {

@@ -1,4 +1,4 @@
-import { api, mutate, explainApiError } from "../api.js";
+import { api, mutate, explainApiError, createMutationAttempt } from "../api.js";
 import { openDialog, closeDialog } from "../dialog.js";
 import { formatTimestamp } from "../format.js";
 
@@ -65,20 +65,32 @@ async function correctItem(detail, selfVersion, trigger, refresh) {
     const submit = node("button", "确认纠正");
     submit.type = "submit";
     const feedback = node("p", "", "form-feedback");
+    const attempt = createMutationAttempt();
     form.append(claimLabel, statement, reason, submit, feedback);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const selected = select.selectedOptions[0];
       setButton(submit, true, "正在保存……", "确认纠正");
       try {
-        await mutate(`/api/v2/self/items/${encodeURIComponent(detail.item_id)}/actions`, {
+        const payload = {
           action: "correct",
           claim_id: select.value,
           expected_self_version: selfVersion,
           expected_version: Number(selected.dataset.revision),
           statement: statement.querySelector("textarea").value,
           reason: reason.querySelector("textarea").value,
-        });
+        };
+        const result = await mutate(
+          `/api/v2/self/items/${encodeURIComponent(detail.item_id)}/actions`,
+          payload,
+          attempt.options(payload),
+        );
+        if (result.derived_update_pending === true) {
+          submit.className = "is-success";
+          submit.textContent = "纠正已经保存";
+          feedback.textContent = "Claim 已保存，自我档案仍在生成。请关闭后稍晚刷新，当前旧内容不会被伪装成已更新。";
+          return;
+        }
         feedback.textContent = "纠正已经保存，正在重新读取自我档案。";
         closeDialog();
         await refresh();
@@ -135,15 +147,21 @@ async function showVersions(currentVersion, trigger, refresh) {
             const submit = node("button", "确认恢复");
             submit.type = "submit";
             const feedback = node("p", "", "form-feedback");
+            const attempt = createMutationAttempt();
             form.append(reason, submit, feedback);
             form.addEventListener("submit", async (event) => {
               event.preventDefault();
               setButton(submit, true, "正在恢复……", "确认恢复");
               try {
-                await mutate(`/api/v2/self/versions/${encodeURIComponent(version.version_id)}/restore`, {
+                const payload = {
                   expected_version: currentVersion,
                   reason: reason.querySelector("textarea").value,
-                });
+                };
+                await mutate(
+                  `/api/v2/self/versions/${encodeURIComponent(version.version_id)}/restore`,
+                  payload,
+                  attempt.options(payload),
+                );
                 closeDialog();
                 await refresh();
               } catch (error) {
