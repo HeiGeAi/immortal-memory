@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import uuid
@@ -12,7 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from claim_store import ClaimStore
-from context_store import ContextStore
+from context_store import ContextStore, ContextStoreError
+from event_store import safe_atomic_write_text, safe_read_text
 from evidence_catalog import EvidenceCatalog, EvidenceCatalogError
 from judgment_store import JudgmentStore
 from living_self_service import LivingSelfService
@@ -24,6 +26,8 @@ from model_types import (
     ModelValidationError,
     ROLE_SCOPES,
     validate_claim,
+    new_context_pack,
+    validate_context_pack,
     validate_evidence_ref,
     validate_judgment_card,
     validate_living_self_version,
@@ -144,6 +148,7 @@ class ContextCompiler:
         self.evidence = evidence or EvidenceCatalog(vault / "index.jsonl")
         self.context_store = context_store or ContextStore(vault, clock=clock)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._compile_authorization_hook: Optional[Callable[[], None]] = None
 
     def _now(self) -> datetime:
         try:
@@ -177,6 +182,251 @@ class ContextCompiler:
             raise ContextCompilerError(
                 "index_unavailable", "verified SQLite evidence index is required"
             )
+
+    def _current_source_revision(self) -> Dict[str, Any]:
+        self._require_index()
+        try:
+            living = self.living_self.current()
+            validate_living_self_version(living)
+            if living["status"] != "confirmed":
+                raise ValueError("Living Self current is not confirmed")
+            return {
+                "claims_event_seq": int(self.claims.events.watermark()),
+                "living_self_version": str(living["version_id"]),
+                "judgments_event_seq": int(self.judgments.events.watermark()),
+                "compiler_version": COMPILER_VERSION,
+                "policy_version": POLICY_VERSION,
+            }
+        except ContextCompilerError:
+            raise
+        except Exception as exc:
+            raise ContextCompilerError(
+                "source_changed", "model authority is unavailable"
+            ) from exc
+
+    @staticmethod
+    def _hash_text(value: str) -> str:
+        return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _rehash_pack(pack: Dict[str, Any]) -> Dict[str, Any]:
+        value = dict(pack)
+        value["content_hash"] = ""
+        encoded = json.dumps(
+            {key: item for key, item in value.items() if key != "content_hash"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        value["content_hash"] = "sha256:" + hashlib.sha256(
+            encoded.encode("utf-8")
+        ).hexdigest()
+        validate_context_pack(value)
+        return value
+
+    @staticmethod
+    def _provenance(
+        sections: Mapping[str, List[Mapping[str, Any]]]
+    ) -> Dict[str, List[str]]:
+        items = [
+            item
+            for section in SECTION_ORDER
+            for item in sections[section]
+        ]
+        return {
+            "evidence_ids": _unique(
+                [
+                    evidence_id
+                    for item in items
+                    for evidence_id in item["evidence_ids"]
+                ]
+            ),
+            "claim_ids": _unique(
+                [
+                    claim_id
+                    for item in items
+                    for claim_id in item["claim_ids"]
+                ]
+            ),
+            "self_model_item_ids": [
+                item["id"] for item in sections["confirmed_self_models"]
+            ],
+            "judgment_card_ids": [
+                item["id"] for item in sections["judgment_cards"]
+            ],
+        }
+
+    @staticmethod
+    def _render_markdown(pack: Mapping[str, Any]) -> str:
+        labels = {
+            "verified_facts": "已验证事实",
+            "confirmed_self_models": "已确认自我模型",
+            "judgment_cards": "判断卡",
+            "counter_evidence": "反证",
+            "inferences": "系统推断",
+            "unknowns": "未知与边界",
+        }
+        lines = [
+            "# Immortal Task Context",
+            "",
+            "Task: " + str(pack["task"]),
+            "Mode: " + str(pack["mode"]),
+            "Context ID: " + str(pack["context_id"]),
+            "Source revision: "
+            + json.dumps(
+                pack["source_revision"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "",
+            "这是一份短期、可追溯的任务上下文。事实、推断和未知必须分开使用。",
+        ]
+        for section in SECTION_ORDER:
+            lines.extend(["", "## " + labels[section], ""])
+            items = pack["sections"][section]
+            if not items:
+                lines.append("- 无")
+                continue
+            for item in items:
+                lines.extend(
+                    [
+                        "- " + str(item["summary"]),
+                        "  - ID: " + str(item["id"]),
+                        "  - Evidence IDs: "
+                        + (", ".join(item["evidence_ids"]) or "none"),
+                        "  - Claim IDs: "
+                        + (", ".join(item["claim_ids"]) or "none"),
+                    ]
+                )
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _build_pack(
+        self,
+        *,
+        record: Mapping[str, Any],
+        body: Mapping[str, Any],
+        mode: str,
+        excluded_item_ids: Sequence[str],
+        context_id: str,
+    ) -> Dict[str, Any]:
+        excluded = set(excluded_item_ids)
+        sections = {
+            section: [
+                dict(item)
+                for item in body["sections"][section]
+                if item["id"] not in excluded
+            ]
+            for section in CONTEXT_SECTIONS
+        }
+        policy = body["compile_policy"]
+        pack = new_context_pack(
+            task=str(record["task"]),
+            mode=mode,
+            living_self_version=str(
+                record["source_revision"]["living_self_version"]
+            ),
+            lifecycle_status="compiled",
+            availability_status="active",
+            max_chars=int(policy["max_chars"]),
+            max_bytes=int(policy["max_bytes"]),
+            claims_event_seq=int(
+                record["source_revision"]["claims_event_seq"]
+            ),
+            judgments_event_seq=int(
+                record["source_revision"]["judgments_event_seq"]
+            ),
+            compiler_version=str(
+                record["source_revision"]["compiler_version"]
+            ),
+            policy_version=int(record["source_revision"]["policy_version"]),
+            preview_hash=str(record["preview_hash"]),
+            sections=sections,
+            now=str(record["generated_at"]),
+            expires_at=str(record["expires_at"]),
+        )
+        pack["context_id"] = context_id
+        pack["provenance"] = self._provenance(sections)
+        privacy = dict(record["privacy_policy"])
+        privacy["excluded_count"] = int(privacy["excluded_count"]) + len(excluded)
+        privacy["reasons"] = sorted(
+            set(privacy["reasons"])
+            | ({"user_excluded"} if excluded else set())
+        )
+        pack["privacy_policy"] = privacy
+        return self._rehash_pack(pack)
+
+    def _stage_pack(
+        self,
+        *,
+        preview_id: str,
+        idempotency_key: str,
+        template: Mapping[str, Any],
+    ) -> Path:
+        key = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        path = (
+            self.context_store.root
+            / "packs"
+            / ".staging"
+            / (preview_id + "-" + key + ".json")
+        )
+        safe_atomic_write_text(
+            path,
+            json.dumps(
+                template,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
+        return path
+
+    @staticmethod
+    def _remove_stage(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _publish_pack(
+        self, pack: Mapping[str, Any], markdown: str
+    ) -> Tuple[Path, Path]:
+        root = (
+            self.context_store.root / "packs" / str(pack["context_id"])
+        )
+        context_path = root / "context.json"
+        markdown_path = root / "TASK_CONTEXT.md"
+        ready_path = root / "READY.json"
+        context_text = (
+            json.dumps(
+                pack,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        safe_atomic_write_text(context_path, context_text)
+        safe_atomic_write_text(markdown_path, markdown)
+        ready = {
+            "context_id": pack["context_id"],
+            "content_hash": pack["content_hash"],
+            "context_json_hash": self._hash_text(context_text),
+            "context_md_hash": self._hash_text(markdown),
+            "source_revision": pack["source_revision"],
+        }
+        safe_atomic_write_text(
+            ready_path,
+            json.dumps(
+                ready,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
+        return context_path, markdown_path
 
     @staticmethod
     def _scope_values(
@@ -678,6 +928,10 @@ class ContextCompiler:
             idempotency_key=idem,
             actor=actor_value,
             reason=safe_reason,
+            compile_policy={
+                "max_chars": max_chars,
+                "max_bytes": max_bytes,
+            },
         )
         provenance = {
             "evidence_ids": evidence_ids,
@@ -705,4 +959,233 @@ class ContextCompiler:
             },
             "sections": sections,
             "provenance": provenance,
+        }
+
+    def compile(
+        self,
+        *,
+        preview_id: str,
+        preview_hash: str,
+        excluded_item_ids: List[str],
+        request_id: str,
+        idempotency_key: str,
+        actor: Mapping[str, str],
+        reason: str,
+        resolved_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        try:
+            record = self.context_store.get(preview_id)
+            body = self.context_store.load_preview_body(
+                preview_id, preview_hash
+            )
+        except ContextStoreError as exc:
+            code = (
+                "stale_preview"
+                if exc.code
+                in {"context_expired", "preview_unavailable", "stale_preview"}
+                else exc.code
+            )
+            raise ContextCompilerError(code, str(exc)) from exc
+        if record["availability_status"] != "active":
+            raise ContextCompilerError("stale_preview", "preview has expired")
+        mode = str(record["mode"])
+        if mode == "auto":
+            if (
+                resolved_mode is None
+                or resolved_mode not in CONTEXT_MODES
+                or resolved_mode == "auto"
+            ):
+                raise ContextCompilerError(
+                    "unresolved_context_mode",
+                    "auto mode must be resolved before compilation",
+                )
+            mode = resolved_mode
+        elif resolved_mode is not None and resolved_mode != mode:
+            raise ContextCompilerError(
+                "invalid_context_mode",
+                "resolved mode conflicts with the approved preview",
+            )
+        if (
+            not isinstance(excluded_item_ids, list)
+            or any(
+                not isinstance(item, str) or not item.strip()
+                for item in excluded_item_ids
+            )
+            or len(set(excluded_item_ids)) != len(excluded_item_ids)
+        ):
+            raise ContextCompilerError(
+                "stale_preview", "excluded item IDs are invalid"
+            )
+        excluded = sorted(excluded_item_ids)
+        selected = {
+            item["id"]
+            for section in CONTEXT_SECTIONS
+            for item in body["sections"][section]
+        }
+        if not set(excluded).issubset(selected):
+            raise ContextCompilerError(
+                "stale_preview", "excluded item is not present in preview"
+            )
+        if self._compile_authorization_hook is not None:
+            self._compile_authorization_hook()
+        if self._current_source_revision() != record["source_revision"]:
+            raise ContextCompilerError(
+                "stale_preview", "preview source revision is no longer current"
+            )
+        if record["lifecycle_status"] == "compiled" and (
+            record["selection"]["excluded_item_ids"] == excluded
+        ):
+            if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+                raise ContextCompilerError(
+                    "invalid_idempotency_key", "idempotency key is required"
+                )
+            if not isinstance(request_id, str) or not request_id.strip():
+                raise ContextCompilerError("invalid_request_id", "request ID is required")
+            _safe_summary(reason)
+            pack = self._build_pack(
+                record=record,
+                body=body,
+                mode=mode,
+                excluded_item_ids=excluded,
+                context_id=str(record["context_id"]),
+            )
+            markdown = self._render_markdown(pack)
+            try:
+                context_path, markdown_path = self._publish_pack(pack, markdown)
+            except OSError as exc:
+                raise ContextCompilerError(
+                    "pack_publish_failed",
+                    "compiled pack is not published and cannot be delivered",
+                ) from exc
+            loaded = self.load_compiled(str(record["context_id"]))
+            return {
+                **loaded,
+                "context_json": str(context_path),
+                "context_md": str(markdown_path),
+            }
+        template = self._build_pack(
+            record=record,
+            body=body,
+            mode=mode,
+            excluded_item_ids=excluded,
+            context_id="ctx_pending",
+        )
+        try:
+            stage_path = self._stage_pack(
+                preview_id=preview_id,
+                idempotency_key=idempotency_key,
+                template=template,
+            )
+        except OSError as exc:
+            raise ContextCompilerError(
+                "pack_write_failed", "compiled pack staging failed"
+            ) from exc
+        try:
+            try:
+                compiled = self.context_store.begin_compile(
+                    preview_id,
+                    preview_hash=preview_hash,
+                    source_revision=record["source_revision"],
+                    excluded_item_ids=excluded,
+                    expected_version=1,
+                    request_id=request_id,
+                    idempotency_key=idempotency_key,
+                    actor=actor,
+                    reason=_safe_summary(reason),
+                )
+            except ContextStoreError as exc:
+                if exc.code != "version_conflict":
+                    raise ContextCompilerError(exc.code, str(exc)) from exc
+                winner = self.context_store.get(preview_id)
+                if (
+                    winner["lifecycle_status"] != "compiled"
+                    or winner["preview_hash"] != preview_hash
+                    or winner["source_revision"] != record["source_revision"]
+                    or winner["selection"]["excluded_item_ids"] != excluded
+                ):
+                    raise ContextCompilerError(exc.code, str(exc)) from exc
+                compiled = winner
+            except OSError as exc:
+                raise ContextCompilerError(
+                    "compile_commit_failed", "compile event commit failed"
+                ) from exc
+            pack = self._build_pack(
+                record=record,
+                body=body,
+                mode=mode,
+                excluded_item_ids=excluded,
+                context_id=str(compiled["context_id"]),
+            )
+            markdown = self._render_markdown(pack)
+            try:
+                context_path, markdown_path = self._publish_pack(pack, markdown)
+            except OSError as exc:
+                raise ContextCompilerError(
+                    "pack_publish_failed",
+                    "compiled pack is not published and cannot be delivered",
+                ) from exc
+        finally:
+            self._remove_stage(stage_path)
+        loaded = self.load_compiled(str(compiled["context_id"]))
+        return {
+            **loaded,
+            "context_json": str(context_path),
+            "context_md": str(markdown_path),
+        }
+
+    def load_compiled(self, context_id: str) -> Dict[str, Any]:
+        try:
+            record = self.context_store.get(context_id)
+        except ContextStoreError as exc:
+            raise ContextCompilerError(exc.code, str(exc)) from exc
+        if (
+            record["lifecycle_status"] != "compiled"
+            or record["availability_status"] != "active"
+        ):
+            raise ContextCompilerError(
+                "stale_context", "compiled context is not currently usable"
+            )
+        if self._current_source_revision() != record["source_revision"]:
+            raise ContextCompilerError(
+                "stale_context", "compiled context source revision is stale"
+            )
+        root = self.context_store.root / "packs" / context_id
+        context_path = root / "context.json"
+        markdown_path = root / "TASK_CONTEXT.md"
+        ready_path = root / "READY.json"
+        context_text = safe_read_text(context_path)
+        markdown = safe_read_text(markdown_path)
+        ready_text = safe_read_text(ready_path)
+        if context_text is None or markdown is None or ready_text is None:
+            raise ContextCompilerError(
+                "context_not_ready", "compiled pack publication is incomplete"
+            )
+        try:
+            pack = json.loads(context_text)
+            ready = json.loads(ready_text)
+            validate_context_pack(pack)
+        except (json.JSONDecodeError, ModelValidationError, TypeError) as exc:
+            raise ContextCompilerError(
+                "context_not_ready", "compiled pack publication is invalid"
+            ) from exc
+        expected_ready = {
+            "context_id": pack["context_id"],
+            "content_hash": pack["content_hash"],
+            "context_json_hash": self._hash_text(context_text),
+            "context_md_hash": self._hash_text(markdown),
+            "source_revision": pack["source_revision"],
+        }
+        if (
+            ready != expected_ready
+            or pack["context_id"] != context_id
+            or pack["source_revision"] != record["source_revision"]
+            or pack["preview_hash"] != record["preview_hash"]
+        ):
+            raise ContextCompilerError(
+                "context_not_ready", "compiled pack marker does not match content"
+            )
+        return {
+            **pack,
+            "context_json": str(context_path),
+            "context_md": str(markdown_path),
         }

@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -12,11 +13,12 @@ from model_types import (
     new_living_self_version,
     new_self_model_item,
     validate_claim,
+    validate_context_pack,
     validate_judgment_card,
 )
 
 
-NOW = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 ACTOR = {"kind": "owner", "id": "owner"}
 
 
@@ -46,6 +48,17 @@ class FakeEvents:
 
     def watermark(self):
         return self.value
+
+
+class MutableClock:
+    def __init__(self):
+        self.value = NOW
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += timedelta(seconds=seconds)
 
 
 class FakeLivingSelf:
@@ -197,17 +210,19 @@ def compiler(
     self_model=None,
     judgments=(),
     evidence=None,
+    clock=None,
 ):
     from context_compiler import ContextCompiler
 
+    trusted_clock = clock or (lambda: NOW)
     return ContextCompiler(
         tmp_path,
         claims=FakeClaims(claims),
         living_self=FakeLivingSelf(self_model or living_self()),
         judgments=FakeJudgments(judgments),
         evidence=evidence or FakeEvidence(),
-        context_store=ContextStore(tmp_path, clock=lambda: NOW),
-        clock=lambda: NOW,
+        context_store=ContextStore(tmp_path, clock=trusted_clock),
+        clock=trusted_clock,
     )
 
 
@@ -508,3 +523,397 @@ def test_task_and_reason_are_redacted_in_response_cache_and_events(tmp_path):
     assert reason_secret not in cache_text
     assert task_secret not in event_text
     assert reason_secret not in event_text
+
+
+def compile_preview(instance, preview_result, *, suffix="one", **kwargs):
+    return instance.compile(
+        preview_id=preview_result["preview_id"],
+        preview_hash=preview_result["preview_hash"],
+        excluded_item_ids=[],
+        request_id="req_compile_" + suffix,
+        idempotency_key="idem_compile_" + suffix,
+        actor=ACTOR,
+        reason="preview approved",
+        **kwargs,
+    )
+
+
+def test_compile_rejects_stale_source_before_and_during_authorization(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    before = compiler(
+        tmp_path / "before",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    preview_before = preview(before)
+    before.claims.rows.append(
+        claim("clm_new", "新增约束", event_seq=2)
+    )
+    before.claims.events.value = 2
+
+    with pytest.raises(ContextCompilerError) as stale:
+        compile_preview(before, preview_before)
+    assert stale.value.code == "stale_preview"
+    assert before.context_store.get(preview_before["preview_id"])[
+        "lifecycle_status"
+    ] == "preview"
+
+    during = compiler(
+        tmp_path / "during",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    preview_during = preview(during)
+
+    def mutate_authority():
+        during.claims.rows.append(
+            claim("clm_race", "竞态新增约束", event_seq=2)
+        )
+        during.claims.events.value = 2
+
+    during._compile_authorization_hook = mutate_authority
+    with pytest.raises(ContextCompilerError) as raced:
+        compile_preview(during, preview_during)
+    assert raced.value.code == "stale_preview"
+    packs = during.context_store.root / "packs"
+    assert not packs.exists() or not list(packs.glob("ctx_*/context.json"))
+
+
+def test_compiled_context_becomes_unusable_when_authority_changes(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    instance.claims.rows.append(
+        claim("clm_after", "编译后新增约束", event_seq=2)
+    )
+    instance.claims.events.value = 2
+
+    with pytest.raises(ContextCompilerError) as failure:
+        instance.load_compiled(compiled["context_id"])
+    assert failure.value.code == "stale_context"
+
+
+def test_compile_contract_rejects_client_body_invalid_exclusions_hash_and_ttl(
+    tmp_path,
+):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path / "contract",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    result = preview(instance)
+
+    with pytest.raises(TypeError):
+        instance.compile(
+            preview_id=result["preview_id"],
+            preview_hash=result["preview_hash"],
+            excluded_item_ids=[],
+            sections={"verified_facts": []},
+        )
+    with pytest.raises(ContextCompilerError) as invalid_exclusion:
+        instance.compile(
+            preview_id=result["preview_id"],
+            preview_hash=result["preview_hash"],
+            excluded_item_ids=["not_in_preview"],
+            request_id="req_invalid_exclusion",
+            idempotency_key="idem_invalid_exclusion",
+            actor=ACTOR,
+            reason="invalid exclusion",
+        )
+    assert invalid_exclusion.value.code == "stale_preview"
+    with pytest.raises(ContextCompilerError) as invalid_hash:
+        instance.compile(
+            preview_id=result["preview_id"],
+            preview_hash="sha256:" + "0" * 64,
+            excluded_item_ids=[],
+            request_id="req_invalid_hash",
+            idempotency_key="idem_invalid_hash",
+            actor=ACTOR,
+            reason="invalid hash",
+        )
+    assert invalid_hash.value.code == "stale_preview"
+
+    clock = MutableClock()
+    expiring = compiler(
+        tmp_path / "ttl",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+        clock=clock,
+    )
+    expired = expiring.preview(
+        "评审客户技术方案",
+        mode="reviewer",
+        role_scope=["work"],
+        domain_scope=["technical"],
+        ttl_seconds=1,
+        request_id="req_expiring",
+        idempotency_key="idem_expiring",
+        actor=ACTOR,
+    )
+    clock.advance(2)
+    with pytest.raises(ContextCompilerError) as ttl:
+        compile_preview(expiring, expired)
+    assert ttl.value.code == "stale_preview"
+
+
+def test_compile_idempotency_and_exclusions_recompute_exact_pack(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[
+            claim("clm_keep", "客户技术方案需要可回滚"),
+            claim("clm_remove", "客户技术方案需要灰度发布"),
+        ],
+    )
+    result = preview(instance)
+    first = instance.compile(
+        preview_id=result["preview_id"],
+        preview_hash=result["preview_hash"],
+        excluded_item_ids=["clm_remove"],
+        request_id="req_compile_same",
+        idempotency_key="idem_compile_same",
+        actor=ACTOR,
+        reason="remove one item",
+    )
+    repeated = instance.compile(
+        preview_id=result["preview_id"],
+        preview_hash=result["preview_hash"],
+        excluded_item_ids=["clm_remove"],
+        request_id="req_compile_repeat",
+        idempotency_key="idem_compile_same",
+        actor=ACTOR,
+        reason="remove one item",
+    )
+
+    assert repeated["context_id"] == first["context_id"]
+    pack = json.loads(Path(first["context_json"]).read_text(encoding="utf-8"))
+    validate_context_pack(pack)
+    encoded = json.dumps(pack, ensure_ascii=False)
+    assert "clm_keep" in encoded
+    assert "clm_remove" not in encoded
+    assert pack["provenance"]["claim_ids"] == ["clm_keep"]
+    assert "user_excluded" in pack["privacy_policy"]["reasons"]
+
+    with pytest.raises(ContextCompilerError) as conflict:
+        instance.compile(
+            preview_id=result["preview_id"],
+            preview_hash=result["preview_hash"],
+            excluded_item_ids=[],
+            request_id="req_compile_conflict",
+            idempotency_key="idem_compile_same",
+            actor=ACTOR,
+            reason="remove one item",
+        )
+    assert conflict.value.code == "idempotency_conflict"
+
+
+def test_auto_requires_resolution_and_markdown_has_exact_trust_labels(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    auto = instance.preview(
+        "评审客户技术方案",
+        mode="auto",
+        role_scope=["work"],
+        domain_scope=["technical"],
+        request_id="req_auto_compile",
+        idempotency_key="idem_auto_compile",
+        actor=ACTOR,
+    )
+
+    with pytest.raises(ContextCompilerError) as unresolved:
+        compile_preview(instance, auto)
+    assert unresolved.value.code == "unresolved_context_mode"
+    compiled = compile_preview(
+        instance,
+        auto,
+        suffix="resolved",
+        resolved_mode="reviewer",
+    )
+    markdown = Path(compiled["context_md"]).read_text(encoding="utf-8")
+
+    assert "## 已验证事实" in markdown
+    assert "## 系统推断" in markdown
+    assert "## 未知与边界" in markdown
+    assert "Evidence IDs" in markdown
+    assert ("/" + "Users/") not in markdown
+    assert compiled["lifecycle_status"] == "compiled"
+
+
+def test_pack_staging_and_event_failures_are_not_distributable(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    pack_failure = compiler(
+        tmp_path / "pack",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    pack_preview = preview(pack_failure)
+
+    def fail_stage(*_args, **_kwargs):
+        raise OSError("injected pack failure")
+
+    pack_failure._stage_pack = fail_stage
+    with pytest.raises(ContextCompilerError) as failed_pack:
+        compile_preview(pack_failure, pack_preview)
+    assert failed_pack.value.code == "pack_write_failed"
+    assert pack_failure.context_store.get(pack_preview["preview_id"])[
+        "lifecycle_status"
+    ] == "preview"
+
+    event_failure = compiler(
+        tmp_path / "event",
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    event_preview = preview(event_failure)
+
+    def fail_event(*_args, **_kwargs):
+        raise OSError("injected event failure")
+
+    event_failure.context_store.begin_compile = fail_event
+    with pytest.raises(ContextCompilerError) as failed_event:
+        compile_preview(event_failure, event_preview)
+    assert failed_event.value.code == "compile_commit_failed"
+    packs = event_failure.context_store.root / "packs"
+    assert not packs.exists() or not list(packs.glob("ctx_*/context.json"))
+
+
+def test_same_idempotency_repairs_ready_publication_after_compiled_event(
+    tmp_path, monkeypatch
+):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    result = preview(instance)
+    original = instance._publish_pack
+    attempts = {"count": 0}
+
+    def fail_publication_once(pack, markdown):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("injected READY publication failure")
+        return original(pack, markdown)
+
+    monkeypatch.setattr(instance, "_publish_pack", fail_publication_once)
+    with pytest.raises(ContextCompilerError) as first:
+        compile_preview(instance, result, suffix="repair")
+    assert first.value.code == "pack_publish_failed"
+    compiled_record = instance.context_store.get(result["preview_id"])
+    assert compiled_record["lifecycle_status"] == "compiled"
+    with pytest.raises(ContextCompilerError) as unavailable:
+        instance.load_compiled(compiled_record["context_id"])
+    assert unavailable.value.code == "context_not_ready"
+
+    repaired = compile_preview(instance, result, suffix="repair")
+
+    assert repaired["context_id"] == compiled_record["context_id"]
+    assert Path(repaired["context_json"]).is_file()
+    assert Path(repaired["context_md"]).is_file()
+
+
+def test_different_idempotency_repairs_same_committed_context_without_new_event(
+    tmp_path, monkeypatch
+):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    result = preview(instance)
+    original = instance._publish_pack
+    attempts = {"count": 0}
+
+    def fail_publication_once(pack, markdown):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("injected READY publication failure")
+        return original(pack, markdown)
+
+    monkeypatch.setattr(instance, "_publish_pack", fail_publication_once)
+    with pytest.raises(ContextCompilerError) as first:
+        compile_preview(instance, result, suffix="lost-key")
+    assert first.value.code == "pack_publish_failed"
+    committed = instance.context_store.get(result["preview_id"])
+    head = instance.context_store.events.watermark()
+
+    repaired = compile_preview(instance, result, suffix="new-key")
+
+    assert repaired["context_id"] == committed["context_id"]
+    assert instance.context_store.events.watermark() == head
+    assert instance.load_compiled(committed["context_id"])["context_id"] == committed[
+        "context_id"
+    ]
+
+
+def test_concurrent_equivalent_compile_converges_and_publishes_winning_context(
+    tmp_path, monkeypatch
+):
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    result = preview(instance)
+    original = instance.context_store.begin_compile
+    raced = {"value": False}
+
+    def commit_competitor_then_continue(preview_id, **kwargs):
+        if not raced["value"]:
+            raced["value"] = True
+            competing = dict(kwargs)
+            competing["request_id"] = "req_competing_compile"
+            competing["idempotency_key"] = "idem_competing_compile"
+            original(preview_id, **competing)
+        return original(preview_id, **kwargs)
+
+    monkeypatch.setattr(
+        instance.context_store, "begin_compile", commit_competitor_then_continue
+    )
+
+    compiled = compile_preview(instance, result, suffix="concurrent")
+
+    authority = instance.context_store.get(result["preview_id"])
+    assert compiled["context_id"] == authority["context_id"]
+    assert instance.context_store.events.watermark() == 2
+    assert instance.load_compiled(authority["context_id"])["context_id"] == authority[
+        "context_id"
+    ]
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ["../escape", "prv_../escape", "ctx_../escape", "prv_" + "a" * 31 + "/"],
+)
+def test_context_identifiers_fail_closed_before_any_pack_path(identifier, tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+
+    with pytest.raises(ContextCompilerError) as compile_error:
+        instance.compile(
+            preview_id=identifier,
+            preview_hash="sha256:" + "0" * 64,
+            excluded_item_ids=[],
+            request_id="req_traversal",
+            idempotency_key="idem_traversal",
+            actor=ACTOR,
+            reason="reject traversal",
+        )
+    assert compile_error.value.code == "invalid_identifier"
+
+    with pytest.raises(ContextCompilerError) as load_error:
+        instance.load_compiled(identifier)
+    assert load_error.value.code == "invalid_identifier"
+    assert not (tmp_path.parent / "escape").exists()

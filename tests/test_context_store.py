@@ -387,6 +387,75 @@ def test_future_authority_metadata_fails_closed(tmp_path):
     assert failure.value.code == "future_timestamp"
 
 
+def test_load_preview_body_is_hash_bound_and_returns_an_isolated_copy(tmp_path):
+    from context_store import ContextStore
+
+    store = ContextStore(tmp_path, clock=Clock())
+    preview = create_preview(store)
+
+    first = store.load_preview_body(
+        preview["preview_id"], preview["preview_hash"]
+    )
+    first["sections"]["verified_facts"][0]["summary"] = "mutated caller copy"
+    second = store.load_preview_body(
+        preview["preview_id"], preview["preview_hash"]
+    )
+
+    assert (
+        second["sections"]["verified_facts"][0]["summary"]
+        == "raw private evidence must not be persisted"
+    )
+
+
+def test_load_preview_body_rejects_wrong_hash_missing_and_tampering(tmp_path):
+    from context_store import ContextStore, ContextStoreError
+
+    store = ContextStore(tmp_path, clock=Clock())
+    preview = create_preview(store)
+
+    with pytest.raises(ContextStoreError) as wrong_hash:
+        store.load_preview_body(
+            preview["preview_id"], "sha256:" + "0" * 64
+        )
+    assert wrong_hash.value.code == "stale_preview"
+
+    cache = store.previews_dir / (preview["preview_id"] + ".json")
+    cache.unlink()
+    with pytest.raises(ContextStoreError) as missing:
+        store.load_preview_body(preview["preview_id"], preview["preview_hash"])
+    assert missing.value.code == "preview_unavailable"
+
+    tampered = create_preview(store, suffix="tampered")
+    tampered_cache = store.previews_dir / (tampered["preview_id"] + ".json")
+    body = json.loads(tampered_cache.read_text(encoding="utf-8"))
+    body["sections"]["verified_facts"][0]["summary"] = "tampered"
+    tampered_cache.write_text(
+        json.dumps(body, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ContextStoreError) as changed:
+        store.load_preview_body(
+            tampered["preview_id"], tampered["preview_hash"]
+        )
+    assert changed.value.code == "stale_preview"
+
+
+def test_load_preview_body_rejects_symlink_cache(tmp_path):
+    from context_store import ContextStore
+    from event_store import EventPathError
+
+    store = ContextStore(tmp_path, clock=Clock())
+    preview = create_preview(store)
+    cache = store.previews_dir / (preview["preview_id"] + ".json")
+    outside = tmp_path / "outside-preview.json"
+    outside.write_text(cache.read_text(encoding="utf-8"), encoding="utf-8")
+    cache.unlink()
+    os.symlink(outside, cache)
+
+    with pytest.raises(EventPathError):
+        store.load_preview_body(preview["preview_id"], preview["preview_hash"])
+
+
 def test_relative_vault_is_bound_at_construction(tmp_path, monkeypatch):
     from context_store import ContextStore
 

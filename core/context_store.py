@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import uuid
@@ -21,7 +22,13 @@ from event_store import (
     safe_atomic_write_text,
     safe_read_text,
 )
-from model_types import ACTOR_KINDS, CONTEXT_MODES, CONTEXT_SECTIONS, new_event
+from model_types import (
+    ACTOR_KINDS,
+    CONTEXT_DEFAULT_MAX_BYTES,
+    CONTEXT_MODES,
+    CONTEXT_SECTIONS,
+    new_event,
+)
 
 
 SOURCE_REVISION_FIELDS = {
@@ -66,6 +73,9 @@ LIFECYCLE_EVENTS = {
     "context.consumed": ("compiled", "consumed"),
     "context.outcome_recorded": ("consumed", "outcome_recorded"),
 }
+IDENTIFIER_PATTERN = re.compile(r"\A(?:prv|ctx)_[0-9a-f]{32}\Z")
+PREVIEW_IDENTIFIER_PATTERN = re.compile(r"\Aprv_[0-9a-f]{32}\Z")
+CONTEXT_IDENTIFIER_PATTERN = re.compile(r"\Actx_[0-9a-f]{32}\Z")
 
 
 class ContextStoreError(ValueError):
@@ -94,6 +104,19 @@ def _digest(value: Mapping[str, Any]) -> str:
 
 def _identifier(prefix: str) -> str:
     return prefix + uuid.uuid4().hex
+
+
+def _validated_identifier(value: Any, *, kind: Optional[str] = None) -> str:
+    pattern = {
+        "preview": PREVIEW_IDENTIFIER_PATTERN,
+        "context": CONTEXT_IDENTIFIER_PATTERN,
+        None: IDENTIFIER_PATTERN,
+    }[kind]
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise ContextStoreError(
+            "invalid_identifier", "context identifier is not a canonical ID"
+        )
+    return value
 
 
 def _is_hash(value: Any) -> bool:
@@ -175,6 +198,22 @@ def _privacy_policy(value: Any) -> Dict[str, Any]:
         "excluded_count": count,
         "reasons": _string_list(value["reasons"], "privacy_reasons"),
     }
+
+
+def _compile_policy(value: Any) -> Dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != {"max_chars", "max_bytes"}:
+        raise ContextStoreError(
+            "invalid_compile_policy", "compile policy has an invalid schema"
+        )
+    result = {}
+    for field in ("max_chars", "max_bytes"):
+        item = value[field]
+        if not isinstance(item, int) or isinstance(item, bool) or item < 1:
+            raise ContextStoreError(
+                "invalid_compile_policy", field + " must be positive"
+            )
+        result[field] = item
+    return result
 
 
 def _selection(value: Any) -> Dict[str, Any]:
@@ -345,15 +384,16 @@ class ContextStore:
         if set(record) != RECORD_FIELDS:
             raise cls._corruption(event, "context record fields are invalid")
         if (
-            not isinstance(record["preview_id"], str)
-            or not record["preview_id"].startswith("prv_")
-            or not _is_hash(record["preview_hash"])
+            not _is_hash(record["preview_hash"])
             or not _is_hash(record["preview_body_hash"])
             or record["mode"] not in CONTEXT_MODES
             or record["availability_status"] not in {"active", "expired"}
         ):
             raise cls._corruption(event, "context record identity is invalid")
         try:
+            _validated_identifier(record["preview_id"], kind="preview")
+            if record["context_id"] is not None:
+                _validated_identifier(record["context_id"], kind="context")
             _text(record["task"], "task")
             _source_revision(record["source_revision"])
             _privacy_policy(record["privacy_policy"])
@@ -407,6 +447,7 @@ class ContextStore:
             or set(safe_input)
             != {
                 "mode",
+                "compile_policy",
                 "privacy_policy",
                 "preview_body_hash",
                 "selection",
@@ -499,8 +540,10 @@ class ContextStore:
                 or not set(excluded).issubset(
                     previous["selection"]["selected_item_ids"]
                 )
-                or not isinstance(record.get("context_id"), str)
-                or not record["context_id"].startswith("ctx_")
+                or CONTEXT_IDENTIFIER_PATTERN.fullmatch(
+                    str(record.get("context_id") or "")
+                )
+                is None
             ):
                 raise cls._corruption(event, "compiled context approval is invalid")
             selection = dict(previous["selection"])
@@ -622,7 +665,7 @@ class ContextStore:
     def _lookup(
         self, identifier: str, current: Mapping[str, Mapping[str, Any]]
     ) -> Dict[str, Any]:
-        _text(identifier, "context_id")
+        _validated_identifier(identifier)
         if identifier in current:
             return dict(current[identifier])
         for record in current.values():
@@ -741,7 +784,10 @@ class ContextStore:
             raise ContextStoreError(exc.code, str(exc)) from exc
 
     def _write_preview_cache(
-        self, record: Mapping[str, Any], sections: Mapping[str, Any]
+        self,
+        record: Mapping[str, Any],
+        sections: Mapping[str, Any],
+        compile_policy: Mapping[str, int],
     ) -> None:
         path = self.previews_dir / (str(record["preview_id"]) + ".json")
         try:
@@ -763,13 +809,16 @@ class ContextStore:
             "preview_body_hash": record["preview_body_hash"],
             "source_revision": record["source_revision"],
             "sections": copied_sections,
+            "compile_policy": dict(compile_policy),
             "generated_at": record["generated_at"],
             "expires_at": record["expires_at"],
         }
         with self._write_lock:
             safe_atomic_write_text(path, _canonical(body) + "\n")
 
-    def _verify_preview_cache(self, record: Mapping[str, Any]) -> None:
+    def _verify_preview_cache(
+        self, record: Mapping[str, Any]
+    ) -> Dict[str, Any]:
         path = self.previews_dir / (str(record["preview_id"]) + ".json")
         raw = safe_read_text(path)
         if raw is None:
@@ -791,6 +840,7 @@ class ContextStore:
                 "preview_body_hash",
                 "source_revision",
                 "sections",
+                "compile_policy",
                 "generated_at",
                 "expires_at",
             }
@@ -804,12 +854,21 @@ class ContextStore:
             raise ContextStoreError(
                 "stale_preview", "private preview body does not match authority metadata"
             )
-        if _digest({"sections": body["sections"]}) != record["preview_body_hash"]:
+        if (
+            _digest(
+                {
+                    "sections": body["sections"],
+                    "compile_policy": body["compile_policy"],
+                }
+            )
+            != record["preview_body_hash"]
+        ):
             raise ContextStoreError(
                 "stale_preview", "private preview body hash has changed"
             )
         try:
             cached_selection = _selection(body["sections"])
+            _compile_policy(body["compile_policy"])
         except ContextStoreError as exc:
             raise ContextStoreError("stale_preview", str(exc)) from exc
         expected_selection = dict(record["selection"])
@@ -818,6 +877,21 @@ class ContextStore:
             raise ContextStoreError(
                 "stale_preview", "private preview body selection has changed"
             )
+        return json.loads(json.dumps(body, ensure_ascii=False))
+
+    def load_preview_body(
+        self, preview_id: str, preview_hash: str
+    ) -> Dict[str, Any]:
+        """Return a verified private preview copy without exposing its path."""
+        record = self.get(preview_id)
+        if (
+            not isinstance(preview_hash, str)
+            or preview_hash != record["preview_hash"]
+        ):
+            raise ContextStoreError(
+                "stale_preview", "preview hash no longer matches authority"
+            )
+        return self._verify_preview_cache(record)
 
     def create_preview(
         self,
@@ -833,6 +907,7 @@ class ContextStore:
         idempotency_key: str,
         actor: Mapping[str, str],
         reason: str,
+        compile_policy: Optional[Mapping[str, int]] = None,
     ) -> Dict[str, Any]:
         expected, request, idem, actor_value, why = self._metadata(
             expected_version=expected_version,
@@ -863,6 +938,14 @@ class ContextStore:
         revision = _source_revision(source_revision)
         selection = _selection(sections)
         policy = _privacy_policy(privacy_policy)
+        compile_policy_value = _compile_policy(
+            compile_policy
+            if compile_policy is not None
+            else {
+                "max_chars": 24_000,
+                "max_bytes": CONTEXT_DEFAULT_MAX_BYTES,
+            }
+        )
         try:
             private_sections = json.loads(
                 json.dumps(
@@ -877,9 +960,15 @@ class ContextStore:
                 "invalid_preview_body", "preview sections must be JSON serializable"
             ) from exc
         safe_input = {
+            "compile_policy": compile_policy_value,
             "mode": mode_value,
             "privacy_policy": policy,
-            "preview_body_hash": _digest({"sections": private_sections}),
+            "preview_body_hash": _digest(
+                {
+                    "sections": private_sections,
+                    "compile_policy": compile_policy_value,
+                }
+            ),
             "selection": selection,
             "source_revision": revision,
             "task": task_value,
@@ -895,7 +984,9 @@ class ContextStore:
         prior = self._find_idempotent(idem, operation)
         if prior is not None:
             result = self._return_event(prior)
-            self._write_preview_cache(result, private_sections)
+            self._write_preview_cache(
+                result, private_sections, compile_policy_value
+            )
             return result
         now = self._operation_time()
         preview_id = _identifier("prv_")
@@ -934,7 +1025,7 @@ class ContextStore:
             occurred_at=now.isoformat(),
         )
         result = self._return_event(event)
-        self._write_preview_cache(result, private_sections)
+        self._write_preview_cache(result, private_sections, compile_policy_value)
         return result
 
     def begin_compile(
