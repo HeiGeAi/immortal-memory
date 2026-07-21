@@ -99,6 +99,36 @@ def test_job_output_redacts_local_paths_but_preserves_urls_and_failure_meaning()
     assert "https://example.com/help" in output
 
 
+def test_public_job_recursively_redacts_historical_body_without_mutating_authority(tmp_path):
+    store = FactoryStore(
+        history_path=tmp_path / "runtime" / "control_jobs.json",
+        immortal_dir=tmp_path,
+        skill_dir=tmp_path,
+    )
+    raw_body = {
+        "goal": "inspect /Users/name/My Folder/run.json",
+        "nested": ["https://example.com/help", {"source": "/tmp/private/input.md"}],
+    }
+    store.jobs["job-body"] = {
+        "id": "job-body",
+        "kind": "session",
+        "status": "failed",
+        "created_at": "now",
+        "body": raw_body,
+    }
+
+    listed = store.list_jobs()[0]["body"]
+    fetched = store.get_job("job-body")["body"]
+
+    assert "/Users/name" not in json.dumps(listed, ensure_ascii=False)
+    assert "/tmp/private" not in json.dumps(fetched, ensure_ascii=False)
+    assert listed["nested"][0] == "https://example.com/help"
+    assert store.jobs["job-body"]["body"] == raw_body
+    store.start_job = lambda kind, body: {"kind": kind, "body": body}
+    retried = store.retry_job("job-body")
+    assert retried["body"] == raw_body
+
+
 def test_run_evidence_marker_changes_only_for_new_run(tmp_path):
     current = tmp_path / "runtime" / "current_run.json"
     current.parent.mkdir()

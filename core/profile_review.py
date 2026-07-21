@@ -629,7 +629,25 @@ class FactoryStore:
             sanitize_job_output(str(command))
             for command in (result.get("commands") or [])
         ]
+        result["body"] = FactoryStore._sanitize_public_value(
+            result.get("body") or {}
+        )
         return result
+
+    @staticmethod
+    def _sanitize_public_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): FactoryStore._sanitize_public_value(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [FactoryStore._sanitize_public_value(child) for child in value]
+        if isinstance(value, tuple):
+            return [FactoryStore._sanitize_public_value(child) for child in value]
+        if isinstance(value, str):
+            return sanitize_job_output(value)
+        return value
 
     def snapshot(self) -> dict[str, Any]:
         state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
@@ -740,6 +758,11 @@ class FactoryStore:
         with self.lock:
             job = self.jobs.get(job_id)
             return self._public_job(job) if job else None
+
+    def _raw_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job else None
 
     def _update_job(self, job_id: str, **updates: Any) -> None:
         with self.lock:
@@ -992,7 +1015,7 @@ class FactoryStore:
         return self.immortal_dir / "runtime" / "cancel_requests" / f"{job_id}.json"
 
     def retry_job(self, job_id: str) -> dict[str, Any]:
-        job = self.get_job(job_id)
+        job = self._raw_job(job_id)
         if not job:
             raise KeyError("job not found")
         if job.get("status") not in {"failed", "canceled", "interrupted", "attention"}:
@@ -1000,7 +1023,7 @@ class FactoryStore:
         return self.start_job(str(job.get("kind") or ""), dict(job.get("body") or {}))
 
     def job_logs(self, job_id: str, *, offset: int = 0, limit: int = 8000) -> dict[str, Any]:
-        job = self.get_job(job_id)
+        job = self._raw_job(job_id)
         if not job:
             raise KeyError("job not found")
         raw_text = "\n".join(
