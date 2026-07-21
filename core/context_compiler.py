@@ -1195,4 +1195,5 @@ class ContextCompiler:
             "context_json": str(context_path),
             "context_md": str(markdown_path),
             "context_markdown": markdown,
+            "context_markdown_hash": expected_ready["context_md_hash"],
         }

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,7 +19,7 @@ from zoneinfo import ZoneInfo
 from config import configured_vault_dir, owner_display_name
 from command_hints import cli_command
 from context_compiler import ContextCompiler, ContextCompilerError
-from event_store import safe_atomic_write_text
+from event_store import safe_atomic_write_text, safe_read_text
 from preflight import STATUS_DEGRADED, STATUS_UNAVAILABLE, gather_preflight, render_summary
 from redact_common import redact as redact_credentials
 
@@ -58,6 +59,27 @@ def _canonical_system_alias_path(path: Path) -> Path:
 
 def _safe_write_text(path: Path, content: str) -> None:
     safe_atomic_write_text(_canonical_system_alias_path(path), content)
+
+
+def _hash_text(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _write_verified_delivery(
+    path: Path, content: str, expected_hash: str
+) -> None:
+    if _hash_text(content) != expected_hash:
+        raise ContextCompilerError(
+            "context_not_ready", "verified Context Markdown hash is inconsistent"
+        )
+    canonical = _canonical_system_alias_path(path)
+    _safe_write_text(canonical, content)
+    delivered = safe_read_text(canonical)
+    if delivered is None or _hash_text(delivered) != expected_hash:
+        raise ContextCompilerError(
+            "context_delivery_mismatch",
+            "delivered Context Markdown failed post-write verification",
+        )
 
 
 def redact_external_text(value: Any, max_chars: int = 4000) -> str:
@@ -140,6 +162,17 @@ def file_info(path: Path) -> dict[str, Any]:
         "exists": True,
         "bytes": path.stat().st_size,
         "modified_at": datetime.fromtimestamp(path.stat().st_mtime, tz=LOCAL_TZ).isoformat(timespec="seconds"),
+    }
+
+
+def verified_file_info(
+    path: Path, content: str, content_hash: str
+) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "exists": True,
+        "bytes": len(content.encode("utf-8")),
+        "content_hash": content_hash,
     }
 
 
@@ -547,7 +580,8 @@ def command_context(args: argparse.Namespace) -> int:
 
     canonical_md = Path(str(compiled["context_md"]))
     content = str(compiled.get("context_markdown") or "")
-    if not content:
+    content_hash = str(compiled.get("context_markdown_hash") or "")
+    if not content or not content_hash:
         return _write_authoritative_error(
             args,
             preflight,
@@ -555,9 +589,11 @@ def command_context(args: argparse.Namespace) -> int:
                 "context_not_ready", "verified Context Markdown is unavailable"
             ),
         )
-    output = Path(args.output).expanduser() if args.output else canonical_md
-    if output != canonical_md:
-        _safe_write_text(output, content)
+    output = Path(args.output).expanduser() if args.output else LATEST_CONTEXT_MD
+    try:
+        _write_verified_delivery(output, content, content_hash)
+    except (ContextCompilerError, OSError, RuntimeError, ValueError) as exc:
+        return _write_authoritative_error(args, preflight, exc)
     payload = {
         "generated_at": now_local(),
         "query": compiled["task"],
@@ -573,6 +609,7 @@ def command_context(args: argparse.Namespace) -> int:
         "preview_hash": preview_hash,
         "context_id": compiled["context_id"],
         "content_hash": compiled["content_hash"],
+        "context_markdown_hash": content_hash,
         "expires_at": compiled["expires_at"],
         "source_revision": compiled["source_revision"],
         "context_json": compiled["context_json"],
@@ -580,8 +617,8 @@ def command_context(args: argparse.Namespace) -> int:
         "delivered_context_md": str(output),
         "preflight": _redact_external_tree(preflight),
         "files": {
-            "context": file_info(canonical_md),
-            "delivery": file_info(output),
+            "context": verified_file_info(canonical_md, content, content_hash),
+            "delivery": verified_file_info(output, content, content_hash),
             "entry": file_info(ENTRY_MD),
         },
     }

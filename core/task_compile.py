@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ from zoneinfo import ZoneInfo
 
 from config import configured_vault_dir, owner_display_name
 from agent_bridge import redact_external_text
+from event_store import safe_read_text
 
 
 SKILL_DIR = Path(__file__).resolve().parent
@@ -73,6 +75,22 @@ def read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _canonical_system_alias_path(path: Path) -> Path:
+    absolute = Path(os.path.abspath(str(path.expanduser())))
+    for alias_text in ("/var", "/tmp", "/etc"):
+        alias = Path(alias_text)
+        try:
+            if alias.is_symlink() and (absolute == alias or alias in absolute.parents):
+                return alias.resolve(strict=True) / absolute.relative_to(alias)
+        except (OSError, ValueError):
+            continue
+    return absolute
+
+
+def _hash_text(content: str) -> str:
+    return "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def file_info(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"path": str(path), "exists": False, "bytes": 0}
@@ -81,6 +99,17 @@ def file_info(path: Path) -> dict[str, Any]:
         "exists": True,
         "bytes": path.stat().st_size,
         "modified_at": iso(datetime.fromtimestamp(path.stat().st_mtime, tz=LOCAL_TZ)),
+    }
+
+
+def verified_file_info(
+    path: Path, content: str, content_hash: str
+) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "exists": True,
+        "bytes": len(content.encode("utf-8")),
+        "content_hash": content_hash,
     }
 
 
@@ -208,13 +237,22 @@ def command_compile(args: argparse.Namespace) -> int:
         )
 
     bridge_payload = read_json(bridge_result_path, {})
+    context_text = None
+    try:
+        context_text = safe_read_text(_canonical_system_alias_path(context_path))
+    except (OSError, RuntimeError, ValueError):
+        context_text = None
+    expected_markdown_hash = str(
+        bridge_payload.get("context_markdown_hash") or ""
+    )
     ready = bool(
         result.returncode == 0
         and bridge_payload.get("lifecycle_status") == "compiled"
         and bridge_payload.get("context_id")
         and bridge_payload.get("content_hash")
-        and context_path.is_file()
-        and context_path.stat().st_size > 0
+        and expected_markdown_hash.startswith("sha256:")
+        and context_text
+        and _hash_text(context_text) == expected_markdown_hash
     )
     if not ready:
         shutil.rmtree(session_dir, ignore_errors=True)
@@ -235,7 +273,6 @@ def command_compile(args: argparse.Namespace) -> int:
         print("context_not_ready: compiled authority task or mode is invalid", file=sys.stderr)
         return 1
     owner = owner_display_name()
-    context_text = context_path.read_text(encoding="utf-8", errors="ignore") if context_path.exists() else ""
     prompt_path.write_text(build_system_prompt(owner, authority_task, authority_mode, context_path), encoding="utf-8")
     runbook_path.write_text(build_runbook(session_dir, authority_task), encoding="utf-8")
     manifest = {
@@ -257,10 +294,13 @@ def command_compile(args: argparse.Namespace) -> int:
         "preview_hash": bridge_payload.get("preview_hash"),
         "context_id": bridge_payload.get("context_id"),
         "content_hash": bridge_payload.get("content_hash"),
+        "context_markdown_hash": expected_markdown_hash,
         "source_revision": bridge_payload.get("source_revision"),
         "promoted_to_skill": False,
         "files": {
-            "TASK_CONTEXT.md": file_info(context_path),
+            "TASK_CONTEXT.md": verified_file_info(
+                context_path, context_text, expected_markdown_hash
+            ),
             "SYSTEM_PROMPT.md": file_info(prompt_path),
             "README.md": file_info(runbook_path),
             "manifest.json": {"path": str(manifest_path), "exists": True},

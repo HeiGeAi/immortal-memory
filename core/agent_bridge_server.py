@@ -187,6 +187,8 @@ def load_ready_context(payload: dict[str, Any]) -> tuple[str, str, str]:
     loaded = compiler.load_compiled(context_id)
     if (
         loaded.get("content_hash") != payload.get("content_hash")
+        or loaded.get("context_markdown_hash")
+        != payload.get("context_markdown_hash")
         or loaded.get("lifecycle_status") != "compiled"
     ):
         raise ContextCompilerError(

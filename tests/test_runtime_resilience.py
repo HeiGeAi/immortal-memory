@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -81,6 +82,31 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 agent_bridge._safe_write_text(linked / "context.json", "{}\n")
 
             self.assertFalse((actual / "context.json").exists())
+
+    def test_explicit_delivery_replacement_after_write_fails_hash_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "explicit.md"
+            verified = "# verified delivery\n"
+            expected_hash = "sha256:" + hashlib.sha256(
+                verified.encode("utf-8")
+            ).hexdigest()
+            original_write = agent_bridge._safe_write_text
+
+            def replace_after_write(path, content):
+                original_write(path, content)
+                if Path(path) == agent_bridge._canonical_system_alias_path(output):
+                    output.write_text("# replaced after write\n", encoding="utf-8")
+
+            with mock.patch.object(
+                agent_bridge, "_safe_write_text", side_effect=replace_after_write
+            ):
+                with self.assertRaisesRegex(
+                    agent_bridge.ContextCompilerError,
+                    "post-write verification",
+                ):
+                    agent_bridge._write_verified_delivery(
+                        output, verified, expected_hash
+                    )
 
     def test_context_timeout_writes_bounded_failure_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +192,8 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                         "availability_status": "active",
                         "source_revision": {"claims_event_seq": 1},
                         "content_hash": "sha256:" + "2" * 64,
+                        "context_markdown_hash": "sha256:"
+                        + hashlib.sha256(b"# authoritative\n").hexdigest(),
                         "task": "authoritative review task",
                         "mode": "reviewer",
                         "expires_at": "2026-07-22T00:00:00+00:00",
@@ -325,6 +353,10 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                             "preview_hash": "sha256:" + "1" * 64,
                             "context_id": "ctx_one",
                             "content_hash": "sha256:" + "2" * 64,
+                            "context_markdown_hash": "sha256:"
+                            + hashlib.sha256(
+                                b"# safe authoritative context\n"
+                            ).hexdigest(),
                             "source_revision": {"claims_event_seq": 1},
                             "task": "approved business task",
                             "mode": "business",
@@ -336,10 +368,22 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
             stdout = io.StringIO()
+            original_file_info = task_compile.file_info
+
+            def reject_context_stat(path):
+                if Path(path).name == "TASK_CONTEXT.md":
+                    raise AssertionError(
+                        "verified session Context must not be reopened for stat"
+                    )
+                return original_file_info(path)
+
             with mock.patch.object(task_compile, "SESSIONS_DIR", sessions), \
                  mock.patch.object(task_compile, "LATEST_MD", latest_md), \
                  mock.patch.object(task_compile, "LATEST_JSON", latest_json), \
                  mock.patch.object(task_compile, "BRIDGE_LATEST_JSON", bridge_json), \
+                 mock.patch.object(
+                     task_compile, "file_info", side_effect=reject_context_stat
+                 ), \
                  mock.patch.object(task_compile.subprocess, "run", side_effect=bridge_success), \
                  contextlib.redirect_stdout(stdout):
                 code = task_compile.command_compile(args)
@@ -358,6 +402,70 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             self.assertEqual(manifest["query"], "approved business task")
             self.assertEqual(manifest["mode"], "business")
             self.assertNotEqual(manifest["request_label"], manifest["query"])
+            self.assertEqual(
+                manifest["context_markdown_hash"],
+                "sha256:"
+                + hashlib.sha256(b"# safe authoritative context\n").hexdigest(),
+            )
+
+    def test_task_compile_fails_closed_when_context_is_symlinked_before_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions = root / "sessions"
+            attacker = root / "attacker.md"
+            attacker.write_text("# attacker\n", encoding="utf-8")
+            verified = "# verified session context\n"
+            expected_hash = "sha256:" + hashlib.sha256(
+                verified.encode("utf-8")
+            ).hexdigest()
+            args = task_compile.build_parser().parse_args(
+                [
+                    "compile",
+                    "approved task",
+                    "--mode",
+                    "reviewer",
+                    "--preview-id",
+                    "prv_one",
+                    "--preview-hash",
+                    "sha256:" + "1" * 64,
+                ]
+            )
+
+            def bridge_then_replace(cmd, **_kwargs):
+                output = Path(cmd[cmd.index("--output") + 1])
+                metadata = Path(cmd[cmd.index("--metadata-output") + 1])
+                output.write_text(verified, encoding="utf-8")
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "runtime": "living_self_v1.1",
+                            "preview_id": "prv_one",
+                            "preview_hash": "sha256:" + "1" * 64,
+                            "context_id": "ctx_one",
+                            "content_hash": "sha256:" + "2" * 64,
+                            "context_markdown_hash": expected_hash,
+                            "source_revision": {"claims_event_seq": 1},
+                            "task": "approved task",
+                            "mode": "reviewer",
+                            "lifecycle_status": "compiled",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                output.unlink()
+                output.symlink_to(attacker)
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with mock.patch.object(task_compile, "SESSIONS_DIR", sessions), \
+                 mock.patch.object(
+                     task_compile.subprocess,
+                     "run",
+                     side_effect=bridge_then_replace,
+                 ):
+                code = task_compile.command_compile(args)
+
+            self.assertEqual(code, 1)
+            self.assertFalse(sessions.exists() and any(sessions.iterdir()))
 
     def test_auto_preview_requires_explicit_non_auto_mode_for_approval(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,4 +1,5 @@
 import unittest
+import hashlib
 import json
 import subprocess
 import tempfile
@@ -278,11 +279,15 @@ class AgentBridgeCorsTest(unittest.TestCase):
                         "context_md": str(canonical),
                         "context_json": str(canonical_json),
                         "context_markdown": "# verified safe-read body\n",
+                        "context_markdown_hash": "sha256:"
+                        + hashlib.sha256(b"# verified safe-read body\n").hexdigest(),
                     }
 
             payload = {
                 "context_id": "ctx_one",
                 "content_hash": "sha256:" + "2" * 64,
+                "context_markdown_hash": "sha256:"
+                + hashlib.sha256(b"# verified safe-read body\n").hexdigest(),
             }
             with mock.patch.object(agent_bridge_server, "ContextCompiler", Compiler):
                 content, context_md, context_json = agent_bridge_server.load_ready_context(

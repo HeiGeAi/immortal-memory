@@ -626,6 +626,7 @@ def test_load_compiled_returns_safe_read_body_when_path_is_replaced_after_read(
     loaded = instance.load_compiled(compiled["context_id"])
 
     assert loaded["context_markdown"] == verified_markdown
+    assert loaded["context_markdown_hash"] == instance._hash_text(verified_markdown)
     assert Path(loaded["context_md"]).read_text(encoding="utf-8") == (
         "# attacker replacement\n"
     )
