@@ -190,11 +190,43 @@ def test_compiled_context_consumes_and_expired_consumed_accepts_outcome(
         idempotency_key="idem_outcome",
         actor=ACTOR,
         reason="outcome linked",
+        outcome_id="out_" + "1" * 32,
+        outcome_hash="sha256:" + "2" * 64,
     )
 
     assert consumed["lifecycle_status"] == "consumed"
     assert outcome["lifecycle_status"] == "outcome_recorded"
     assert outcome["availability_status"] == "expired"
+
+
+def test_legacy_compiled_and_consumed_events_replay_with_empty_outcome_link(tmp_path):
+    from context_store import ContextStore
+
+    clock = Clock()
+    store = ContextStore(tmp_path, clock=clock)
+    compiled = compile_preview(store, create_preview(store))
+    store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_legacy_consume",
+        idempotency_key="idem_legacy_consume",
+        actor=ACTOR,
+        reason="legacy Agent receipt",
+    )
+    rows = []
+    for raw in store.events.path.read_text(encoding="utf-8").splitlines():
+        event = json.loads(raw)
+        event["payload"]["record"].pop("outcome_id")
+        event["payload"]["record"].pop("outcome_hash")
+        rows.append(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    store.events.path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    store.current_path.unlink()
+
+    replayed = ContextStore(tmp_path, clock=clock).get(compiled["context_id"])
+
+    assert replayed["lifecycle_status"] == "consumed"
+    assert replayed["outcome_id"] is None
+    assert replayed["outcome_hash"] is None
 
 
 def test_expired_compiled_context_cannot_be_consumed(tmp_path):

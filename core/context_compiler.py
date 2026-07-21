@@ -1139,21 +1139,19 @@ class ContextCompiler:
             "context_md": str(markdown_path),
         }
 
-    def load_compiled(self, context_id: str) -> Dict[str, Any]:
+    def _load_verified_snapshot(
+        self,
+        context_id: str,
+        *,
+        allowed_lifecycle_statuses: Sequence[str],
+    ) -> Dict[str, Any]:
         try:
             record = self.context_store.get(context_id)
         except ContextStoreError as exc:
             raise ContextCompilerError(exc.code, str(exc)) from exc
-        if (
-            record["lifecycle_status"] != "compiled"
-            or record["availability_status"] != "active"
-        ):
+        if record["lifecycle_status"] not in set(allowed_lifecycle_statuses):
             raise ContextCompilerError(
-                "stale_context", "compiled context is not currently usable"
-            )
-        if self._current_source_revision() != record["source_revision"]:
-            raise ContextCompilerError(
-                "stale_context", "compiled context source revision is stale"
+                "stale_context", "context lifecycle does not permit this operation"
             )
         root = self.context_store.root / "packs" / context_id
         context_path = root / "context.json"
@@ -1170,7 +1168,21 @@ class ContextCompiler:
             pack = json.loads(context_text)
             ready = json.loads(ready_text)
             validate_context_pack(pack)
-        except (json.JSONDecodeError, ModelValidationError, TypeError) as exc:
+        except ModelValidationError as exc:
+            if (
+                exc.code != "context_expired"
+                or "compiled" in set(allowed_lifecycle_statuses)
+            ):
+                raise ContextCompilerError(
+                    "context_not_ready", "compiled pack publication is invalid"
+                ) from exc
+            try:
+                self._rehash_pack({**pack, "availability_status": "expired"})
+            except (ModelValidationError, TypeError) as nested:
+                raise ContextCompilerError(
+                    "context_not_ready", "compiled pack publication is invalid"
+                ) from nested
+        except (json.JSONDecodeError, TypeError) as exc:
             raise ContextCompilerError(
                 "context_not_ready", "compiled pack publication is invalid"
             ) from exc
@@ -1184,11 +1196,33 @@ class ContextCompiler:
         if (
             ready != expected_ready
             or pack["context_id"] != context_id
+            or pack["lifecycle_status"] != "compiled"
+            or pack["task"] != record["task"]
+            or pack["mode"] != record["mode"]
             or pack["source_revision"] != record["source_revision"]
             or pack["preview_hash"] != record["preview_hash"]
+            or pack["generated_at"] != record["generated_at"]
+            or pack["expires_at"] != record["expires_at"]
         ):
             raise ContextCompilerError(
                 "context_not_ready", "compiled pack marker does not match content"
+            )
+        excluded = set(record["selection"]["excluded_item_ids"])
+        expected_sections = {
+            section: sorted(
+                item_id
+                for item_id in record["selection"]["section_item_ids"][section]
+                if item_id not in excluded
+            )
+            for section in CONTEXT_SECTIONS
+        }
+        actual_sections = {
+            section: sorted(item["id"] for item in pack["sections"][section])
+            for section in CONTEXT_SECTIONS
+        }
+        if actual_sections != expected_sections:
+            raise ContextCompilerError(
+                "context_not_ready", "compiled pack items do not match approval"
             )
         return {
             **pack,
@@ -1197,3 +1231,36 @@ class ContextCompiler:
             "context_markdown": markdown,
             "context_markdown_hash": expected_ready["context_md_hash"],
         }
+
+    def load_outcome_snapshot(self, context_id: str) -> Dict[str, Any]:
+        """Verify the immutable pack used by a consumed Context.
+
+        This deliberately does not re-check the mutable model source revision:
+        feedback belongs to the exact persisted snapshot that the Agent used.
+        It does not relax the delivery gate in ``load_compiled``.
+        """
+        return self._load_verified_snapshot(
+            context_id,
+            allowed_lifecycle_statuses=("consumed", "outcome_recorded"),
+        )
+
+    def load_compiled(self, context_id: str) -> Dict[str, Any]:
+        try:
+            record = self.context_store.get(context_id)
+        except ContextStoreError as exc:
+            raise ContextCompilerError(exc.code, str(exc)) from exc
+        if (
+            record["lifecycle_status"] != "compiled"
+            or record["availability_status"] != "active"
+        ):
+            raise ContextCompilerError(
+                "stale_context", "compiled context is not currently usable"
+            )
+        if self._current_source_revision() != record["source_revision"]:
+            raise ContextCompilerError(
+                "stale_context", "compiled context source revision is stale"
+            )
+        return self._load_verified_snapshot(
+            context_id,
+            allowed_lifecycle_statuses=("compiled",),
+        )

@@ -596,6 +596,69 @@ def test_compiled_context_becomes_unusable_when_authority_changes(tmp_path):
     assert failure.value.code == "stale_context"
 
 
+def test_consumed_snapshot_verifier_does_not_relax_agent_delivery_gate(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    instance.context_store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_consume_snapshot",
+        idempotency_key="idem_consume_snapshot",
+        actor=ACTOR,
+        reason="Agent receipt",
+    )
+    instance.claims.rows.append(
+        claim("clm_after", "使用后新增约束", event_seq=2)
+    )
+    instance.claims.events.value = 2
+
+    snapshot = instance.load_outcome_snapshot(compiled["context_id"])
+    with pytest.raises(ContextCompilerError) as delivery:
+        instance.load_compiled(compiled["context_id"])
+
+    assert snapshot["context_id"] == compiled["context_id"]
+    assert delivery.value.code == "stale_context"
+
+
+def test_outcome_snapshot_rejects_valid_republished_pack_with_unapproved_item(tmp_path):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    instance.context_store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_consume_tamper",
+        idempotency_key="idem_consume_tamper",
+        actor=ACTOR,
+        reason="Agent receipt",
+    )
+    tampered = dict(compiled)
+    tampered.pop("context_json", None)
+    tampered.pop("context_md", None)
+    tampered.pop("context_markdown", None)
+    tampered.pop("context_markdown_hash", None)
+    tampered["sections"] = {
+        section: [dict(item) for item in items]
+        for section, items in tampered["sections"].items()
+    }
+    tampered["sections"]["verified_facts"][0]["id"] = "clm_evil"
+    tampered = instance._rehash_pack(tampered)
+    instance._publish_pack(tampered, instance._render_markdown(tampered))
+
+    with pytest.raises(ContextCompilerError) as failure:
+        instance.load_outcome_snapshot(compiled["context_id"])
+    assert failure.value.code == "context_not_ready"
+
+
 def test_load_compiled_returns_safe_read_body_when_path_is_replaced_after_read(
     tmp_path, monkeypatch
 ):

@@ -63,6 +63,8 @@ RECORD_FIELDS = {
     "compiled_at",
     "consumed_at",
     "outcome_recorded_at",
+    "outcome_id",
+    "outcome_hash",
     "based_on_event_seq",
     "stream_version",
 }
@@ -329,7 +331,23 @@ class ContextStore:
                 "context event payload is invalid",
                 line_number=int(event["seq"]),
             )
-        return dict(payload["record"])
+        record = dict(payload["record"])
+        missing_link_fields = {
+            field for field in ("outcome_id", "outcome_hash") if field not in record
+        }
+        if missing_link_fields:
+            if (
+                missing_link_fields != {"outcome_id", "outcome_hash"}
+                or event.get("event_type") == "context.outcome_recorded"
+            ):
+                raise EventCorruption(
+                    "invalid_context_event",
+                    "context outcome linkage fields are incomplete",
+                    line_number=int(event["seq"]),
+                )
+            record["outcome_id"] = None
+            record["outcome_hash"] = None
+        return record
 
     @staticmethod
     def _corruption(event: Mapping[str, Any], message: str) -> EventCorruption:
@@ -397,6 +415,21 @@ class ContextStore:
             _text(record["task"], "task")
             _source_revision(record["source_revision"])
             _privacy_policy(record["privacy_policy"])
+            outcome_id = record["outcome_id"]
+            outcome_hash = record["outcome_hash"]
+            if (outcome_id is None) != (outcome_hash is None):
+                raise ContextStoreError(
+                    "invalid_outcome_link", "outcome linkage is incomplete"
+                )
+            if outcome_id is not None:
+                if (
+                    not isinstance(outcome_id, str)
+                    or re.fullmatch(r"out_[0-9a-f]{32}", outcome_id) is None
+                    or not _is_hash(outcome_hash)
+                ):
+                    raise ContextStoreError(
+                        "invalid_outcome_link", "outcome linkage is invalid"
+                    )
         except ContextStoreError as exc:
             raise cls._corruption(event, str(exc)) from exc
         cls._validate_selection(record["selection"], event)
@@ -486,6 +519,8 @@ class ContextStore:
             "compiled_at": None,
             "consumed_at": None,
             "outcome_recorded_at": None,
+            "outcome_id": None,
+            "outcome_hash": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -500,17 +535,17 @@ class ContextStore:
     ) -> Dict[str, Any]:
         method = operation.get("method")
         base_fields = {"actor", "expected_version", "identifier", "method", "reason"}
-        expected_fields = (
-            base_fields
-            | {
+        if method == "begin_compile":
+            expected_fields = base_fields | {
                 "approved_mode",
                 "preview_hash",
                 "source_revision",
                 "excluded_item_ids",
             }
-            if method == "begin_compile"
-            else base_fields
-        )
+        elif method == "mark_outcome_recorded":
+            expected_fields = base_fields | {"outcome_id", "outcome_hash"}
+        else:
+            expected_fields = base_fields
         expected_method = {
             "compiled": "begin_compile",
             "consumed": "consume",
@@ -566,8 +601,19 @@ class ContextStore:
             expected["compiled_at"] = event["occurred_at"]
         elif method == "consume":
             expected["consumed_at"] = event["occurred_at"]
-        else:
+        elif method == "mark_outcome_recorded":
+            if (
+                not isinstance(operation.get("outcome_id"), str)
+                or re.fullmatch(
+                    r"out_[0-9a-f]{32}", str(operation.get("outcome_id"))
+                )
+                is None
+                or not _is_hash(operation.get("outcome_hash"))
+            ):
+                raise cls._corruption(event, "outcome linkage intent is invalid")
             expected["outcome_recorded_at"] = event["occurred_at"]
+            expected["outcome_id"] = operation["outcome_id"]
+            expected["outcome_hash"] = operation["outcome_hash"]
         return expected
 
     @classmethod
@@ -1022,6 +1068,8 @@ class ContextStore:
             "compiled_at": None,
             "consumed_at": None,
             "outcome_recorded_at": None,
+            "outcome_id": None,
+            "outcome_hash": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -1104,6 +1152,8 @@ class ContextStore:
         idempotency_key: str,
         actor: Mapping[str, str],
         reason: str,
+        outcome_id: str,
+        outcome_hash: str,
     ) -> Dict[str, Any]:
         return self._transition(
             context_id,
@@ -1116,6 +1166,8 @@ class ContextStore:
             idempotency_key=idempotency_key,
             actor=actor,
             reason=reason,
+            outcome_id=outcome_id,
+            outcome_hash=outcome_hash,
         )
 
     def _transition(
@@ -1135,6 +1187,8 @@ class ContextStore:
         preview_hash: Optional[str] = None,
         source_revision: Optional[Mapping[str, Any]] = None,
         excluded_item_ids: Optional[List[str]] = None,
+        outcome_id: Optional[str] = None,
+        outcome_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         current = self.get(identifier)
         expected, request, idem, actor_value, why = self._metadata(
@@ -1158,6 +1212,13 @@ class ContextStore:
                     "approved_mode": approved_mode,
                     "source_revision": dict(source_revision or {}),
                     "excluded_item_ids": list(excluded_item_ids or []),
+                }
+            )
+        elif method == "mark_outcome_recorded":
+            operation.update(
+                {
+                    "outcome_id": outcome_id,
+                    "outcome_hash": outcome_hash,
                 }
             )
         prior = self._find_idempotent(idem, operation)
@@ -1201,6 +1262,16 @@ class ContextStore:
                 raise ContextStoreError(
                     "stale_preview", "preview approval no longer matches the preview"
                 )
+        elif method == "mark_outcome_recorded":
+            if (
+                not isinstance(outcome_id, str)
+                or re.fullmatch(r"out_[0-9a-f]{32}", outcome_id) is None
+                or not _is_hash(outcome_hash)
+            ):
+                raise ContextStoreError(
+                    "invalid_outcome_link", "outcome linkage is invalid"
+                )
+            excluded = []
         else:
             excluded = []
         now = self._operation_time(current)
@@ -1220,6 +1291,8 @@ class ContextStore:
             updated["consumed_at"] = now.isoformat()
         else:
             updated["outcome_recorded_at"] = now.isoformat()
+            updated["outcome_id"] = outcome_id
+            updated["outcome_hash"] = outcome_hash
         event = self._append(
             event_type=event_type,
             record=updated,
