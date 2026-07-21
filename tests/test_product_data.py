@@ -70,6 +70,7 @@ class FakeClaims:
                 "evidence_ids": [],
                 "counter_evidence_ids": [],
                 "based_on_event_seq": 4,
+                "revision": 1,
             },
             {
                 "claim_id": "clm_confirmed",
@@ -81,8 +82,15 @@ class FakeClaims:
                 "evidence_ids": ["ev_1"],
                 "counter_evidence_ids": ["ev_2"],
                 "based_on_event_seq": 3,
+                "revision": 7,
             },
         ]
+
+    def get(self, claim_id):
+        for row in self.list():
+            if row["claim_id"] == claim_id:
+                return row
+        raise KeyError(claim_id)
 
 
 class FakeLivingSelf:
@@ -232,6 +240,106 @@ class FakeContexts:
                 return row
         raise KeyError(context_id)
 
+    def load_preview_body(self, preview_id, preview_hash):
+        record = self.get(preview_id)
+        assert preview_hash == record["preview_hash"]
+        return {
+            "preview_id": record["preview_id"],
+            "preview_hash": record["preview_hash"],
+            "preview_body_hash": record["preview_body_hash"],
+            "source_revision": record["source_revision"],
+            "sections": {
+                "verified_facts": [
+                    {
+                        "kind": "claim",
+                        "id": "clm_confirmed",
+                        "revision": 7,
+                        "status": "confirmed",
+                        "source_kind": "explicit",
+                        "summary": "已确认事实",
+                        "privacy": "internal",
+                        "evidence_ids": ["ev_1"],
+                        "claim_ids": ["clm_confirmed"],
+                    }
+                ],
+                "confirmed_self_models": [],
+                "judgment_cards": [],
+                "counter_evidence": [],
+                "inferences": [],
+                "unknowns": [],
+            },
+            "compile_policy": {"max_chars": 12000, "max_bytes": 96000},
+            "generated_at": record["generated_at"],
+            "expires_at": record["expires_at"],
+        }
+
+
+class FakeContextCompiler:
+    def __init__(self, contexts):
+        self.contexts = contexts
+        self.calls = []
+
+    @staticmethod
+    def _snapshot(record):
+        sections = {
+            "verified_facts": [
+                {
+                    "kind": "claim",
+                    "id": "clm_confirmed",
+                    "revision": 7,
+                    "status": "confirmed",
+                    "source_kind": "explicit",
+                    "summary": "不可变快照正文",
+                    "privacy": "internal",
+                    "evidence_ids": ["ev_1"],
+                    "claim_ids": ["clm_confirmed"],
+                }
+            ],
+            "confirmed_self_models": [],
+            "judgment_cards": [],
+            "counter_evidence": [],
+            "inferences": [],
+            "unknowns": [],
+        }
+        return {
+            "context_id": record["context_id"],
+            "task": record["task"],
+            "mode": record["mode"],
+            "lifecycle_status": "compiled",
+            "availability_status": record["availability_status"],
+            "budget": {
+                "max_chars": 12000,
+                "used_chars": 321,
+                "max_bytes": 96000,
+                "used_bytes": 333,
+            },
+            "sections": sections,
+            "provenance": {
+                "evidence_ids": ["ev_1"],
+                "claim_ids": ["clm_confirmed"],
+                "self_model_item_ids": [],
+                "judgment_card_ids": [],
+            },
+            "privacy_policy": {"excluded_count": 1, "reasons": ["private"]},
+            "source_revision": record["source_revision"],
+            "preview_hash": record["preview_hash"],
+            "content_hash": "sha256:" + "5" * 64,
+            "generated_at": record["generated_at"],
+            "expires_at": record["expires_at"],
+            "context_markdown": "# Immutable\n\n不可变快照正文\n",
+            "context_markdown_hash": "sha256:" + "6" * 64,
+            "context_json": "/private/must-not-leak/context.json",
+            "context_md": "/private/must-not-leak/TASK_CONTEXT.md",
+        }
+
+    def load_compiled(self, context_id):
+        self.calls.append(("compiled", context_id))
+        return self._snapshot(self.contexts.get(context_id))
+
+    def load_outcome_snapshot(self, context_id):
+        self.calls.append(("outcome", context_id))
+        return self._snapshot(self.contexts.get(context_id))
+
 
 class FakeOutcomes:
     def list(self):
@@ -332,6 +440,7 @@ def seeded_product_data(tmp_path, memory_count=120):
     _seed_trusted_index(vault, memory_count=memory_count)
     control_data = FakeControlData()
     control_center = FakeControlCenter()
+    contexts = FakeContexts()
     data = ProductData(
         vault,
         control_data=control_data,
@@ -339,7 +448,8 @@ def seeded_product_data(tmp_path, memory_count=120):
         claim_store=FakeClaims(),
         living_self=FakeLivingSelf(),
         judgment_store=FakeJudgments(),
-        context_store=FakeContexts(),
+        context_store=contexts,
+        context_compiler=FakeContextCompiler(contexts),
         outcome_store=FakeOutcomes(),
         clock=lambda: datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
     )
@@ -470,9 +580,30 @@ def test_self_model_and_item_expose_ids_not_private_evidence(tmp_path):
         "honest_boundaries",
     ]
     assert detail["evidence_ids"] == ["ev-private"]
+    assert detail["claim_refs"] == [
+        {"claim_id": "clm_confirmed", "revision": 7}
+    ]
+    assert model["total"] == 1
+    assert model["truncated"] is False
     assert "private-token" not in json.dumps(model)
     assert "private-token" not in json.dumps(detail)
     assert "path" not in json.dumps(detail).lower()
+
+
+def test_self_model_reports_honest_fifty_item_boundary(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    current = data.living_self._current
+    template = current["sections"]["expression_dna"][0]
+    current["sections"]["expression_dna"] = [
+        {**template, "item_id": "self-%02d" % index}
+        for index in range(53)
+    ]
+    model = data.self_model()
+    returned = sum(len(rows) for rows in model["sections"].values())
+    assert returned == 50
+    assert model["total"] == 53
+    assert model["truncated"] is True
+    assert data.self_item("self-52")["item_id"] == "self-52"
 
 
 def test_self_versions_are_keyset_paginated_and_diff_redacted(tmp_path):
@@ -521,6 +652,56 @@ def test_contexts_are_keyset_paginated_and_never_expose_body_or_paths(tmp_path):
     detail = data.context_detail(page["items"][0]["context_id"])
     assert detail["selected_item_ids"] == ["clm_confirmed"]
     assert "private-token" not in json.dumps(detail)
+
+
+def test_preview_context_detail_returns_verified_refresh_contract(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    record = data.context_store.list()[1]
+    record["lifecycle_status"] = "preview"
+    record["context_id"] = ""
+    data.context_store.list = lambda: [record]
+    data.context_store.get = lambda identifier: record
+    detail = data.context_detail(record["preview_id"])
+    assert detail["preview_hash"] == record["preview_hash"]
+    assert detail["expires_at"] == record["expires_at"]
+    assert detail["revision"] == 2
+    assert detail["sections"]["verified_facts"][0]["id"] == "clm_confirmed"
+    assert detail["budget"] == {
+        "max_chars": 12000,
+        "used_chars": 309,
+        "max_bytes": 96000,
+        "used_bytes": 319,
+    }
+    assert detail["provenance"] == {
+        "evidence_ids": ["ev_1"],
+        "claim_ids": ["clm_confirmed"],
+        "self_model_item_ids": [],
+        "judgment_card_ids": [],
+    }
+    assert detail["privacy"] == {"excluded_count": 1, "reasons": ["private"]}
+
+
+@pytest.mark.parametrize(
+    ("status", "loader"),
+    [("compiled", "compiled"), ("consumed", "outcome"), ("outcome_recorded", "outcome")],
+)
+def test_persisted_context_detail_uses_verified_immutable_snapshot(
+    tmp_path, status, loader
+):
+    data, _control, _center = seeded_product_data(tmp_path)
+    record = data.context_store.list()[1]
+    record["lifecycle_status"] = status
+    data.context_store.list = lambda: [record]
+    data.context_store.get = lambda identifier: record
+    detail = data.context_detail(record["context_id"])
+    assert data.context_compiler.calls == [(loader, record["context_id"])]
+    assert detail["context_markdown"] == "# Immutable\n\n不可变快照正文\n"
+    assert detail["context_markdown_hash"] == "sha256:" + "6" * 64
+    assert detail["content_hash"] == "sha256:" + "5" * 64
+    assert detail["sections"]["verified_facts"][0]["summary"] == "不可变快照正文"
+    assert detail["provenance"]["claim_ids"] == ["clm_confirmed"]
+    assert detail["privacy"] == {"excluded_count": 1, "reasons": ["private"]}
+    assert "must-not-leak" not in json.dumps(detail)
 
 
 def test_latest_outcome_is_attached_to_context_detail_without_raw_body(tmp_path):

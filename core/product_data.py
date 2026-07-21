@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from claim_store import ClaimStore
+from context_compiler import ContextCompiler
 from context_store import ContextStore
 from control_center import ControlCenter
 from control_data import ControlData
@@ -517,6 +518,7 @@ class ProductData:
         living_self: Optional[LivingSelfService] = None,
         judgment_store: Optional[JudgmentStore] = None,
         context_store: Optional[ContextStore] = None,
+        context_compiler: Optional[Any] = None,
         outcome_store: Optional[OutcomeStore] = None,
         index_integrity: Optional[ProductIndexIntegrity] = None,
         clock: Optional[Callable[[], datetime]] = None,
@@ -528,6 +530,7 @@ class ProductData:
         self.living_self = living_self or LivingSelfService(self.vault_dir)
         self.judgment_store = judgment_store or JudgmentStore(self.vault_dir)
         self.context_store = context_store or ContextStore(self.vault_dir)
+        self._context_compiler = context_compiler
         self.outcome_store = outcome_store or OutcomeStore(
             self.vault_dir,
             context_store=self.context_store,
@@ -537,6 +540,21 @@ class ProductData:
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._cursor_key = None
+
+    @property
+    def context_compiler(self) -> Any:
+        if self._context_compiler is None:
+            self._context_compiler = ContextCompiler(
+                self.vault_dir,
+                claims=self.claim_store,
+                living_self=self.living_self,
+                judgments=self.judgment_store,
+                # Snapshot verification must not depend on the mutable evidence index.
+                evidence=object(),
+                context_store=self.context_store,
+                clock=self._clock,
+            )
+        return self._context_compiler
 
     def _signing_key(self) -> bytes:
         if self._cursor_key is None:
@@ -882,12 +900,14 @@ class ProductData:
         current = self._current_self()
         sections = {}
         remaining = MAX_PAGE_SIZE
+        total = 0
         for section in SELF_SECTIONS:
             rows = current["sections"].get(section)
             if not isinstance(rows, list):
                 raise ProductDataError(
                     "self_model_unavailable", "当前自我模型不可用"
                 )
+            total += sum(isinstance(row, Mapping) for row in rows)
             sections[section] = [
                 self._self_item_value(row, section)
                 for row in rows[:remaining]
@@ -901,15 +921,47 @@ class ProductData:
             "generated_at": str(current.get("generated_at") or ""),
             "confirmed_at": str(current.get("confirmed_at") or ""),
             "sections": sections,
+            "total": total,
+            "truncated": total > MAX_PAGE_SIZE,
         }
+
+    def _claim_refs(self, claim_ids: Any) -> List[Dict[str, Any]]:
+        refs = []
+        for claim_id in _safe_ids(claim_ids):
+            try:
+                claim = self.claim_store.get(claim_id)
+            except Exception as exc:
+                raise ProductDataError(
+                    "self_model_unavailable", "当前自我模型引用的事实不可用"
+                ) from exc
+            revision = claim.get("revision") if isinstance(claim, Mapping) else None
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 1
+            ):
+                raise ProductDataError(
+                    "self_model_unavailable", "当前自我模型引用的事实不可用"
+                )
+            refs.append({"claim_id": claim_id, "revision": revision})
+        return refs
 
     def self_item(self, item_id: str) -> Dict[str, Any]:
         requested = _safe_identifier(item_id, code="invalid_self_item_id")
-        model = self.self_model()
+        current = self._current_self()
         for section in SELF_SECTIONS:
-            for item in model["sections"][section]:
-                if item["item_id"] == requested:
-                    return dict(item)
+            rows = current["sections"].get(section)
+            if not isinstance(rows, list):
+                raise ProductDataError(
+                    "self_model_unavailable", "当前自我模型不可用"
+                )
+            for item in rows:
+                if isinstance(item, Mapping) and item.get("item_id") == requested:
+                    result = self._self_item_value(item, section)
+                    result["claim_refs"] = self._claim_refs(
+                        result["claim_ids"]
+                    )
+                    return result
         raise ProductDataError("self_item_not_found", "没有找到这条理解")
 
     @staticmethod
@@ -1171,6 +1223,87 @@ class ProductData:
                 },
             }
         )
+        lifecycle = result["lifecycle_status"]
+        if lifecycle == "preview":
+            try:
+                body = self.context_store.load_preview_body(
+                    str(value.get("preview_id") or ""),
+                    str(value.get("preview_hash") or ""),
+                )
+            except Exception as exc:
+                raise ProductDataError(
+                    "context_unavailable", "任务上下文预览当前不可用"
+                ) from exc
+            sections = body.get("sections") if isinstance(body, Mapping) else None
+            policy = body.get("compile_policy") if isinstance(body, Mapping) else None
+            if not isinstance(sections, Mapping) or not isinstance(policy, Mapping):
+                raise ProductDataError(
+                    "context_unavailable", "任务上下文预览当前不可用"
+                )
+            encoded = json.dumps(
+                sections,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            copied_sections = json.loads(encoded)
+            result.update(
+                {
+                    "preview_hash": str(value.get("preview_hash") or ""),
+                    "expires_at": str(value.get("expires_at") or ""),
+                    "sections": copied_sections,
+                    "budget": {
+                        "max_chars": policy.get("max_chars"),
+                        "used_chars": len(encoded),
+                        "max_bytes": policy.get("max_bytes"),
+                        "used_bytes": len(encoded.encode("utf-8")),
+                    },
+                    "provenance": self._context_provenance(copied_sections),
+                }
+            )
+        elif lifecycle in {"compiled", "consumed", "outcome_recorded"}:
+            try:
+                if lifecycle == "compiled":
+                    snapshot = self.context_compiler.load_compiled(
+                        str(value.get("context_id") or "")
+                    )
+                else:
+                    snapshot = self.context_compiler.load_outcome_snapshot(
+                        str(value.get("context_id") or "")
+                    )
+            except Exception as exc:
+                raise ProductDataError(
+                    "context_unavailable", "任务上下文不可变快照当前不可用"
+                ) from exc
+            if not isinstance(snapshot, Mapping):
+                raise ProductDataError(
+                    "context_unavailable", "任务上下文不可变快照当前不可用"
+                )
+            result.update(
+                {
+                    "preview_hash": snapshot.get("preview_hash"),
+                    "expires_at": snapshot.get("expires_at"),
+                    "content_hash": snapshot.get("content_hash"),
+                    "context_markdown_hash": snapshot.get(
+                        "context_markdown_hash"
+                    ),
+                    "context_markdown": snapshot.get("context_markdown"),
+                    "sections": json.loads(
+                        json.dumps(snapshot.get("sections"), ensure_ascii=False)
+                    ),
+                    "budget": json.loads(
+                        json.dumps(snapshot.get("budget"), ensure_ascii=False)
+                    ),
+                    "provenance": json.loads(
+                        json.dumps(snapshot.get("provenance"), ensure_ascii=False)
+                    ),
+                    "privacy": json.loads(
+                        json.dumps(
+                            snapshot.get("privacy_policy"), ensure_ascii=False
+                        )
+                    ),
+                }
+            )
         if result.get("outcome_id") and result.get("context_id"):
             try:
                 outcome = self.outcome_store.get(result["context_id"])
@@ -1188,6 +1321,44 @@ class ProductData:
             if isinstance(outcome, Mapping):
                 result["outcome"] = self._outcome_value(outcome)
         return result
+
+    @staticmethod
+    def _context_provenance(
+        sections: Mapping[str, Any]
+    ) -> Dict[str, List[str]]:
+        items = [
+            item
+            for rows in sections.values()
+            if isinstance(rows, list)
+            for item in rows
+            if isinstance(item, Mapping)
+        ]
+        return {
+            "evidence_ids": sorted(
+                {
+                    item_id
+                    for item in items
+                    for item_id in _safe_ids(item.get("evidence_ids"))
+                }
+            ),
+            "claim_ids": sorted(
+                {
+                    item_id
+                    for item in items
+                    for item_id in _safe_ids(item.get("claim_ids"))
+                }
+            ),
+            "self_model_item_ids": [
+                str(item.get("id") or "")
+                for item in sections.get("confirmed_self_models", [])
+                if isinstance(item, Mapping)
+            ],
+            "judgment_card_ids": [
+                str(item.get("id") or "")
+                for item in sections.get("judgment_cards", [])
+                if isinstance(item, Mapping)
+            ],
+        }
 
     def _model_page(
         self,
