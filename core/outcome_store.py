@@ -27,6 +27,7 @@ from redact_common import redact as redact_credentials
 MAX_OUTCOME_SUMMARY_CHARS = 500
 MAX_OUTCOME_REASON_CHARS = 300
 PUBLIC_IDEMPOTENCY_PREFIX = "outcome:public:v1:"
+TYPED_REF_KEYS = frozenset({"kind", "id", "revision"})
 _SENSITIVE_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"(?i)(cookie\s*[:：=]\s*)\S+"),
@@ -72,12 +73,14 @@ def _copy_refs(value: Optional[Sequence[Mapping[str, Any]]]) -> List[Dict[str, A
         return []
     if not isinstance(value, (list, tuple)):
         raise OutcomeStoreError("invalid_typed_refs", "outcome refs must be a list")
-    try:
-        copied = [dict(item) for item in value]
-    except (TypeError, ValueError) as exc:
-        raise OutcomeStoreError(
-            "invalid_typed_refs", "outcome refs must be objects"
-        ) from exc
+    copied = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != TYPED_REF_KEYS:
+            raise OutcomeStoreError(
+                "invalid_typed_refs",
+                "outcome refs require exactly kind, id, and revision",
+            )
+        copied.append(dict(item))
     return sorted(
         copied,
         key=lambda item: (

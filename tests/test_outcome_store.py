@@ -229,6 +229,34 @@ def test_outcome_refs_fail_closed_when_unknown_stale_or_duplicate(
     assert failure.value.code == code
 
 
+def test_outcome_ref_with_extra_field_is_rejected_without_persistence(tmp_path):
+    from outcome_store import OutcomeStoreError
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    secret = "ghp_" + "s" * 30
+
+    with pytest.raises(OutcomeStoreError) as failure:
+        _record(
+            store,
+            compiled,
+            confirmed_refs=[
+                {
+                    "kind": "claim",
+                    "id": "clm_" + "1" * 32,
+                    "revision": 2,
+                    "unexpected_private_body": secret,
+                }
+            ],
+        )
+
+    assert failure.value.code == "invalid_typed_refs"
+    assert not store.events.exists()
+    assert contexts.get(compiled["context_id"])["lifecycle_status"] == "consumed"
+    assert secret not in str(failure.value)
+
+
 def test_same_ref_cannot_be_confirmed_and_challenged(tmp_path):
     from outcome_store import OutcomeStore, OutcomeStoreError
 
@@ -521,6 +549,38 @@ def test_context_linkage_without_matching_event_fails_closed(tmp_path):
     with pytest.raises(OutcomeStoreError) as failure:
         store.get(compiled["context_id"])
     assert failure.value.code == "outcome_event_corruption"
+
+
+def test_historical_outcome_ref_with_extra_field_fails_closed_on_replay(tmp_path):
+    from outcome_store import OutcomeStoreError
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    _record(store, compiled)
+    secret = "ghp_" + "h" * 30
+    event = json.loads(store.events.path.read_text(encoding="utf-8"))
+    event["payload"]["outcome"]["confirmed_refs"][0][
+        "unexpected_private_body"
+    ] = secret
+    event["payload"]["operation"]["confirmed_refs"][0][
+        "unexpected_private_body"
+    ] = secret
+    store.events.path.write_text(
+        json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OutcomeStoreError) as get_failure:
+        store.get(compiled["context_id"])
+    assert get_failure.value.code == "outcome_event_corruption"
+    assert secret not in str(get_failure.value)
+
+    with pytest.raises(OutcomeStoreError) as list_failure:
+        store.list()
+    assert list_failure.value.code == "outcome_event_corruption"
+    assert secret not in str(list_failure.value)
 
 
 def test_context_linkage_digest_covers_event_actor_reason_and_request(tmp_path):
