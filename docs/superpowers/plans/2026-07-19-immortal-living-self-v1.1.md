@@ -3271,7 +3271,7 @@ stale, corrupt, over-permissive, or symlinked receipt keeps the switch blocked.
 - Modify: `tests/test_export_restore.py`
 - Modify: `tests/test_integrity_audit.py`
 
-- [ ] **Step 1: Write failing migration and restore tests**
+- [x] **Step 1: Write failing migration and restore tests**
 
 ```python
 def test_v10_vault_migrates_without_raw_changes(tmp_path):
@@ -3297,7 +3297,7 @@ def test_export_restore_includes_v11_event_layers(tmp_path):
     ).read_bytes()
 ```
 
-- [ ] **Step 2: Confirm red**
+- [x] **Step 2: Confirm red**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -3307,7 +3307,7 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: v1.1 paths are absent from export or migration.
 
-- [ ] **Step 3: Add derived layers to export and orchestrator**
+- [x] **Step 3: Add derived layers to export and orchestrator**
 
 Add these optional portable paths:
 
@@ -3366,7 +3366,7 @@ quality
 
 Do not alter raw files.
 
-- [ ] **Step 4: Run migration, restore, and integrity tests**
+- [x] **Step 4: Run migration, restore, and integrity tests**
 
 ```bash
 PYTHONPATH=core python3 -m pytest \
@@ -3378,7 +3378,7 @@ PYTHONPATH=core python3 -m pytest \
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add \
@@ -3389,6 +3389,18 @@ git add \
   tests/test_integrity_audit.py
 git commit -m "feat: migrate and restore Living Self layers"
 ```
+
+Completion evidence recorded 2026-07-22:
+
+- Task17 targeted suite: 35 passed.
+- Full suite: 1214 passed in 68.07 seconds.
+- P0 regression: 8/8 passed.
+- Tracked-file privacy scan: ok.
+- Independent production review: Ready, no remaining P0/P1.
+- Live source remained read-only and retained SHA256
+  `311d179ffa36f89b1d52c37b0f7831f3c201c72924793fefa161f10fafdd2f39`.
+- The 467 unresolved legacy naive timestamps remain quarantined and keep the
+  production switch blocked until authoritative timezone evidence exists.
 
 ### Task 18: Clean-package completeness and Living Self P0 regression
 

@@ -14,10 +14,14 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -58,6 +62,49 @@ RAW_PATHS = [
     "feishu/raw",
     "raw",
 ]
+
+V11_DERIVED_PATHS = [
+    "model/claims/events.jsonl",
+    "model/claims/current.jsonl",
+    "model/attribution/latest-report.json",
+    "model/living-self/current.json",
+    "model/living-self/current.md",
+    "model/living-self/versions",
+    "model/living-self/evaluations",
+    "judgment/events.jsonl",
+    "judgment/current.jsonl",
+    "judgment/evaluations.jsonl",
+    "contexts/events.jsonl",
+    "contexts/current.jsonl",
+    "contexts/packs",
+    "outcomes/events.jsonl",
+]
+
+V11_REQUIRED_EVENT_PATHS = [
+    "model/claims/events.jsonl",
+    "judgment/events.jsonl",
+    "contexts/events.jsonl",
+    "outcomes/events.jsonl",
+]
+
+V11_REQUIRED_CURRENT_PATHS = [
+    "model/claims/current.jsonl",
+    "judgment/current.jsonl",
+    "judgment/evaluations.jsonl",
+    "contexts/current.jsonl",
+]
+
+V11_STREAM_PATHS = {
+    "claims": "model/claims/events.jsonl",
+    "judgments": "judgment/events.jsonl",
+    "contexts": "contexts/events.jsonl",
+    "outcomes": "outcomes/events.jsonl",
+}
+
+V11_MIGRATION_DIR = Path("model/migrations/v1.1")
+MAX_INDEX_LINE_BYTES = 16 * 1024 * 1024
+HERMES_SESSIONS_ROOT = Path.home() / ".hermes" / "sessions"
+TIMEZONE_EVIDENCE_AUTHORITY = "hermes-session-metadata-v1"
 
 SKIP_DIR_NAMES = {
     EXPORTS_DIRNAME,
@@ -154,6 +201,13 @@ def collect_source_files(vault: Path, include_raw: bool, warnings: list[str]) ->
         for file_path in iter_files(path, vault):
             selected[relpath(file_path, vault)] = file_path
 
+    for entry in V11_DERIVED_PATHS:
+        path = vault / entry
+        if not path.exists():
+            continue
+        for file_path in iter_files(path, vault):
+            selected[relpath(file_path, vault)] = file_path
+
     return [selected[key] for key in sorted(selected)]
 
 
@@ -195,6 +249,51 @@ def classify_storage_location(target: Path, vault: Path) -> str:
 
 class SecretShapesFound(RuntimeError):
     """出口扫描发现未脱敏凭证形态且调用方要求 fail-closed。"""
+
+
+def _v11_manifest_metadata(vault: Path, warnings: list[str]) -> dict[str, Any]:
+    present = {
+        name: (vault / relative).is_file()
+        for name, relative in V11_STREAM_PATHS.items()
+    }
+    if not any(present.values()):
+        return {
+            "event_heads": {name: 0 for name in V11_STREAM_PATHS},
+            "current_watermarks": {
+                name: 0 for name in ("claims", "judgments", "contexts")
+            },
+            "schema_versions": {"model": 0, "events": 0},
+        }
+    if not all(present.values()):
+        missing = [name for name, available in present.items() if not available]
+        warnings.append("v11_event_layers_incomplete: " + ",".join(missing))
+        return {
+            "event_heads": {name: 0 for name in V11_STREAM_PATHS},
+            "current_watermarks": {
+                name: 0 for name in ("claims", "judgments", "contexts")
+            },
+            "schema_versions": {"model": 0, "events": 0},
+        }
+    missing_current = [
+        relative
+        for relative in V11_REQUIRED_CURRENT_PATHS
+        if not (vault / relative).is_file()
+    ]
+    if missing_current:
+        warnings.append(
+            "v11_current_layers_incomplete: " + ",".join(missing_current)
+        )
+    heads = {
+        name: _read_event_head_without_lock(vault / relative)
+        for name, relative in V11_STREAM_PATHS.items()
+    }
+    return {
+        "event_heads": heads,
+        "current_watermarks": {
+            name: heads[name] for name in ("claims", "judgments", "contexts")
+        },
+        "schema_versions": {"model": 1, "events": 1},
+    }
 
 
 def create_export(
@@ -258,6 +357,12 @@ def create_export(
                     f"export aborted: {report['unique_candidates']} unique secret-shape candidates in index.jsonl"
                 )
 
+    v11_metadata = _v11_manifest_metadata(export_dir, warnings)
+    if v11_metadata.get("schema_versions") == {"model": 1, "events": 1}:
+        replay_warnings = _v11_projection_warnings(export_dir, v11_metadata)
+        warnings.extend(
+            "v11_snapshot_invalid: " + warning for warning in replay_warnings
+        )
     manifest = {
         "generated_at": iso_utc(),
         "vault_dir": str(vault),
@@ -277,6 +382,7 @@ def create_export(
             "Restore is intentionally not automatic in v0.8; copy verified files back into a chosen vault after review.",
         ],
         "warnings": warnings,
+        **v11_metadata,
     }
     write_json_atomic(export_dir / MANIFEST_NAME, manifest)
     return manifest
@@ -621,11 +727,858 @@ def _secure_file_size_and_sha256(path: Path) -> tuple[int, str] | None:
             os.close(fd)
 
 
+def _read_file_generation(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    capture_body: bool = False,
+) -> tuple[bytes | None, str, tuple[int, int, int, int, int]] | None:
+    """Read one regular file and bind the returned bytes to one FD generation."""
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_nofollow(path)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        if max_bytes is not None and before.st_size > max_bytes:
+            return None
+        chunks: list[bytes] | None = [] if capture_body else None
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                return None
+            if chunks is not None:
+                chunks.append(chunk)
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or total != before.st_size:
+            return None
+        body = b"".join(chunks) if chunks is not None else None
+        return body, digest.hexdigest(), before_identity
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_private_json_generation(
+    path: Path,
+    *,
+    max_bytes: int,
+) -> tuple[dict[str, Any], str, tuple[int, int, int, int, int]] | None:
+    descriptor = -1
+    try:
+        descriptor = _open_absolute_nofollow(path)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_mode & 0o777 != 0o600
+            or before.st_size > max_bytes
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if remaining <= 0 or before_identity != after_identity:
+            return None
+        body = b"".join(chunks)
+        value = json.loads(body.decode("utf-8"))
+        if not isinstance(value, dict):
+            return None
+        return value, hashlib.sha256(body).hexdigest(), before_identity
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _valid_aware_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _load_timezone_contract(
+    path: str | Path | None,
+    *,
+    source_sha256: str,
+) -> tuple[dict[str, Any] | None, list[str], str]:
+    if path is None:
+        return None, [], ""
+    candidate = Path(path).expanduser().absolute()
+    contract_generation = _read_private_json_generation(
+        candidate,
+        max_bytes=1024 * 1024,
+    )
+    if contract_generation is None:
+        return None, ["timezone_contract_unsafe"], ""
+    value, contract_sha256, _contract_identity = contract_generation
+    blockers: list[str] = []
+    evidence = value.get("evidence")
+    session_ids = value.get("session_ids")
+    fold_by_record_id = value.get("fold_by_record_id", {})
+    if (
+        value.get("schema_version") != 1
+        or value.get("source") != "hermes-conversation"
+        or value.get("timestamp_semantics") != "local_wall_time"
+        or not isinstance(value.get("timezone"), str)
+        or not value.get("timezone", "").strip()
+        or not isinstance(session_ids, list)
+        or not session_ids
+        or any(not isinstance(item, str) or not item.strip() for item in session_ids)
+        or len(set(session_ids)) != len(session_ids)
+        or not isinstance(fold_by_record_id, dict)
+        or any(
+            not isinstance(record_id, str)
+            or not record_id.strip()
+            or type(fold) is not int
+            or fold not in {0, 1}
+            for record_id, fold in (
+                fold_by_record_id.items()
+                if isinstance(fold_by_record_id, dict)
+                else []
+            )
+        )
+        or not isinstance(value.get("verified_by"), str)
+        or not value.get("verified_by", "").strip()
+        or not _valid_aware_timestamp(value.get("verified_at"))
+        or not isinstance(evidence, dict)
+        or evidence.get("kind") != "source_metadata"
+        or not isinstance(evidence.get("reference"), str)
+        or not evidence.get("reference", "").strip()
+        or not isinstance(evidence.get("path"), str)
+        or not evidence.get("path", "").strip()
+        or not isinstance(evidence.get("sha256"), str)
+        or len(evidence.get("sha256", "")) != 64
+        or any(ch not in "0123456789abcdef" for ch in evidence.get("sha256", ""))
+    ):
+        blockers.append("timezone_contract_invalid")
+    try:
+        ZoneInfo(str(value.get("timezone") or ""))
+    except ZoneInfoNotFoundError:
+        blockers.append("timezone_contract_invalid")
+    if isinstance(evidence, dict) and isinstance(evidence.get("path"), str):
+        evidence_path = Path(evidence["path"]).expanduser()
+        try:
+            trusted_root = HERMES_SESSIONS_ROOT.resolve(strict=True)
+            resolved_evidence = evidence_path.resolve(strict=True)
+            resolved_evidence.relative_to(trusted_root)
+        except (FileNotFoundError, OSError, ValueError):
+            blockers.append("timezone_evidence_unsafe")
+        else:
+            evidence_generation = _read_private_json_generation(
+                resolved_evidence,
+                max_bytes=1024 * 1024,
+            )
+            if (
+                evidence_generation is None
+                or evidence_generation[1] != evidence.get("sha256")
+            ):
+                blockers.append("timezone_evidence_mismatch")
+            else:
+                source_metadata = evidence_generation[0]
+                expected_metadata = {
+                    "schema_version": 1,
+                    "source": value.get("source"),
+                    "timestamp_semantics": value.get("timestamp_semantics"),
+                    "timezone": value.get("timezone"),
+                    "session_ids": session_ids,
+                    "fold_by_record_id": fold_by_record_id,
+                    "verified_by": value.get("verified_by"),
+                    "verified_at": value.get("verified_at"),
+                }
+                if (
+                    source_metadata.get("authority")
+                    != TIMEZONE_EVIDENCE_AUTHORITY
+                    or any(
+                        source_metadata.get(key) != expected
+                        for key, expected in expected_metadata.items()
+                    )
+                ):
+                    blockers.append("timezone_evidence_contract_mismatch")
+    if value.get("source_index_sha256") != source_sha256:
+        blockers.append("timezone_contract_source_mismatch")
+    if blockers:
+        return None, list(dict.fromkeys(blockers)), contract_sha256
+    return value, [], contract_sha256
+
+
+def _aware_wall_time(
+    raw: str,
+    zone: ZoneInfo,
+    *,
+    fold: int | None = None,
+) -> tuple[str | None, str | None]:
+    try:
+        naive = datetime.fromisoformat(raw)
+    except ValueError:
+        return None, "invalid_timestamp"
+    if naive.tzinfo is not None and naive.utcoffset() is not None:
+        return raw, None
+    first = naive.replace(tzinfo=zone, fold=0)
+    second = naive.replace(tzinfo=zone, fold=1)
+    if first.utcoffset() != second.utcoffset() and fold not in {0, 1}:
+        return None, "ambiguous_wall_time"
+    selected = naive.replace(tzinfo=zone, fold=int(fold or 0))
+    round_trip = (
+        selected.astimezone(timezone.utc)
+        .astimezone(zone)
+        .replace(tzinfo=None)
+    )
+    if round_trip != naive:
+        return None, "nonexistent_wall_time"
+    return selected.isoformat(), None
+
+
+def _write_private_json(path: Path, value: dict[str, Any]) -> None:
+    write_json_atomic(path, value)
+    path.chmod(0o600)
+
+
+def stage_v11_index(
+    vault_dir: str | Path,
+    *,
+    timezone_contract: str | Path | None = None,
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Create a schema-v3-safe staging source without changing index.jsonl."""
+    vault = vault_path(vault_dir).absolute()
+    source = vault / "index.jsonl"
+    verified = _secure_file_size_and_sha256(source)
+    if verified is None:
+        return {
+            "ok": False,
+            "production_switch_allowed": False,
+            "blockers": ["source_index_unsafe_or_missing"],
+            "converted": 0,
+            "quarantined": 0,
+        }
+    source_size, source_sha256 = verified
+    contract, contract_blockers, contract_sha256 = _load_timezone_contract(
+        timezone_contract,
+        source_sha256=source_sha256,
+    )
+    target_root = (
+        Path(output_dir).expanduser().absolute()
+        if output_dir is not None
+        else vault / V11_MIGRATION_DIR
+    )
+    target_root.mkdir(parents=True, exist_ok=True)
+    if not _secure_directory(target_root):
+        return {
+            "ok": False,
+            "production_switch_allowed": False,
+            "blockers": ["migration_output_unsafe"],
+            "converted": 0,
+            "quarantined": 0,
+        }
+    staging = target_root / "index.staging.jsonl"
+    quarantine_path = target_root / "timestamp-quarantine.json"
+    receipt_path = target_root / "index-staging-receipt.json"
+    temp = staging.with_name(staging.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    converted = 0
+    total = 0
+    quarantine: list[dict[str, Any]] = []
+    stream_digest = hashlib.sha256()
+    session_ids = set(contract.get("session_ids", [])) if contract else set()
+    folds = contract.get("fold_by_record_id", {}) if contract else {}
+    if not isinstance(folds, dict):
+        folds = {}
+    zone = ZoneInfo(contract["timezone"]) if contract else None
+    source_before = os.lstat(source)
+    try:
+        source_fd = _open_absolute_nofollow(source)
+        with os.fdopen(source_fd, "rb", closefd=True) as handle, temp.open("xb") as output:
+            temp.chmod(0o600)
+            for line_number, raw in enumerate(handle, start=1):
+                total += 1
+                stream_digest.update(raw)
+                reason = ""
+                record: dict[str, Any] | None = None
+                if len(raw) > MAX_INDEX_LINE_BYTES:
+                    reason = "record_too_large"
+                else:
+                    try:
+                        decoded = json.loads(raw)
+                        record = decoded if isinstance(decoded, dict) else None
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        record = None
+                    if record is None:
+                        reason = "invalid_json_record"
+                timestamp = record.get("timestamp") if record else None
+                parsed: datetime | None = None
+                if not reason:
+                    try:
+                        parsed = datetime.fromisoformat(
+                            str(timestamp or "").strip().replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        reason = "invalid_timestamp"
+                if not reason and parsed is not None and (
+                    parsed.tzinfo is None or parsed.utcoffset() is None
+                ):
+                    source_name = str(record.get("source") or "")
+                    session_id = str(record.get("session_id") or "")
+                    if contract is None or source_name != contract["source"]:
+                        reason = "missing_timezone_evidence"
+                    elif session_id not in session_ids:
+                        reason = "session_outside_verified_contract"
+                    else:
+                        resolved, conversion_error = _aware_wall_time(
+                            str(timestamp),
+                            zone,
+                            fold=folds.get(str(record.get("id") or "")),
+                        )
+                        if conversion_error:
+                            reason = conversion_error
+                        else:
+                            assert resolved is not None
+                            migrated = dict(record)
+                            migrated["timestamp"] = resolved
+                            raw = (
+                                json.dumps(
+                                    migrated,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                )
+                                + "\n"
+                            ).encode("utf-8")
+                            converted += 1
+                if reason:
+                    quarantine.append(
+                        {
+                            "line_number": line_number,
+                            "record_id": str((record or {}).get("id") or ""),
+                            "session_id": str((record or {}).get("session_id") or ""),
+                            "source": str((record or {}).get("source") or ""),
+                            "timestamp": str(timestamp or ""),
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        source_after = os.lstat(source)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
+    source_identity_before = (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_size,
+        source_before.st_mtime_ns,
+        source_before.st_ctime_ns,
+    )
+    source_identity_after = (
+        source_after.st_dev,
+        source_after.st_ino,
+        source_after.st_size,
+        source_after.st_mtime_ns,
+        source_after.st_ctime_ns,
+    )
+    if (
+        source_identity_before != source_identity_after
+        or stream_digest.hexdigest() != source_sha256
+        or source_size != source_before.st_size
+    ):
+        temp.unlink(missing_ok=True)
+        return {
+            "ok": False,
+            "production_switch_allowed": False,
+            "blockers": ["source_changed_during_migration"],
+            "converted": 0,
+            "quarantined": 0,
+        }
+    temp.replace(staging)
+    blockers = list(contract_blockers)
+    if quarantine:
+        blockers.append("unresolved_naive_timestamps")
+    blockers = list(dict.fromkeys(blockers))
+    quarantine_report = {
+        "schema_version": 1,
+        "source_index_sha256": source_sha256,
+        "count": len(quarantine),
+        "items": quarantine,
+    }
+    _write_private_json(quarantine_path, quarantine_report)
+    receipt = {
+        "schema_version": 1,
+        "source_index_sha256": source_sha256,
+        "source_size": source_size,
+        "staging_sha256": sha256_file(staging),
+        "staging_size": staging.stat().st_size,
+        "timezone_contract_sha256": contract_sha256,
+        "total_records": total,
+        "converted": converted,
+        "quarantined": len(quarantine),
+        "blockers": blockers,
+    }
+    _write_private_json(receipt_path, receipt)
+    return {
+        "ok": not blockers,
+        "production_switch_allowed": False,
+        "blockers": blockers or ["production_prewarm_pending"],
+        "source_sha256": source_sha256,
+        "source_size": source_size,
+        "staging_source": str(staging),
+        "staging_sha256": receipt["staging_sha256"],
+        "quarantine_report": str(quarantine_path),
+        "receipt": str(receipt_path),
+        "total_records": total,
+        "converted": converted,
+        "quarantined": len(quarantine),
+    }
+
+
+def _ensure_empty_event_layers(vault: Path) -> None:
+    from event_store import safe_atomic_write_text
+
+    for relative in [*V11_REQUIRED_EVENT_PATHS, *V11_REQUIRED_CURRENT_PATHS]:
+        path = vault / relative
+        if not path.exists():
+            safe_atomic_write_text(path, "")
+
+
+def _replay_v11_event_layers(vault: Path) -> None:
+    from claim_store import ClaimStore
+    from context_store import ContextStore
+    from judgment_store import JudgmentStore
+    from outcome_store import OutcomeStore
+
+    ClaimStore(vault)
+    JudgmentStore(vault)
+    contexts = ContextStore(vault)
+    OutcomeStore(vault, context_store=contexts).list()
+
+
+def build_living_self(vault_dir: str | Path) -> dict[str, Any]:
+    vault = vault_path(vault_dir).absolute()
+    _ensure_empty_event_layers(vault)
+    _replay_v11_event_layers(vault)
+    from living_self_service import LivingSelfService
+
+    living_self = LivingSelfService(vault)
+    try:
+        current = living_self.current()
+    except (FileNotFoundError, ValueError):
+        current = None
+    candidate = living_self.build_candidate()
+    changed = bool(
+        current is None
+        or current.get("content_hash") != candidate.get("content_hash")
+        or current.get("based_on_claim_seq") != candidate.get("based_on_claim_seq")
+    )
+    if changed:
+        current = living_self.confirm(candidate, reason="v1.1 migration")
+    return {
+        "ok": True,
+        "changed": changed,
+        "version_id": current.get("version_id") if current else "",
+        "based_on_claim_seq": current.get("based_on_claim_seq") if current else 0,
+    }
+
+
+def run_v11_migration(
+    vault_dir: str | Path,
+    *,
+    timezone_contract: str | Path | None = None,
+) -> dict[str, Any]:
+    """Materialize v1.1 event layers only after the index staging gate passes."""
+    vault = vault_path(vault_dir).absolute()
+    if vault.resolve() == IMMORTAL_DIR.resolve():
+        return {
+            "ok": False,
+            "production_switch_allowed": False,
+            "model_layers_written": False,
+            "blockers": ["staging_vault_required"],
+        }
+    staged = stage_v11_index(vault, timezone_contract=timezone_contract)
+    if not staged.get("ok"):
+        return {
+            **staged,
+            "model_layers_written": False,
+            "production_switch_allowed": False,
+        }
+    legacy_result: dict[str, Any] = {"ok": True, "created": 0, "skipped": 0}
+    if (
+        (vault / "reviewed/profile_memories.jsonl").is_file()
+        or (vault / "profile_nuwa.json").is_file()
+    ):
+        from model_migration import migrate_legacy_profile
+
+        legacy_result = migrate_legacy_profile(vault)
+    living_self = build_living_self(vault)
+    report = {
+        "ok": True,
+        "migration_ready": True,
+        "production_switch_allowed": False,
+        "blockers": ["production_prewarm_pending"],
+        "model_layers_written": True,
+        "index_staging": staged,
+        "claims_migration": legacy_result,
+        "living_self_version_id": living_self["version_id"],
+    }
+    _write_private_json(vault / V11_MIGRATION_DIR / "migration-report.json", report)
+    return report
+
+
+def verify_index_verification(vault_dir: str | Path) -> dict[str, Any]:
+    """Validate the exact source/main/WAL/SHM generation and classify receipt use."""
+    from product_data import ProductDataError, ProductIndexIntegrity
+
+    vault = vault_path(vault_dir).absolute()
+    receipt_path = vault / "product/index-verification.json"
+    before = _read_json_nofollow(receipt_path) if receipt_path.exists() else None
+    started = time.perf_counter()
+    try:
+        with ProductIndexIntegrity(vault).trusted_connection():
+            pass
+    except (ProductDataError, OSError, ValueError):
+        return {
+            "ok": False,
+            "mode": "failed",
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
+            "blockers": ["index_verification_failed"],
+        }
+    elapsed = round((time.perf_counter() - started) * 1000, 3)
+    after = _read_json_nofollow(receipt_path)
+    if not after:
+        return {
+            "ok": False,
+            "mode": "failed",
+            "elapsed_ms": elapsed,
+            "blockers": ["index_verification_receipt_missing"],
+        }
+    return {
+        "ok": True,
+        "mode": "receipt_hit" if before == after and before is not None else "generated",
+        "elapsed_ms": elapsed,
+        "identity": after,
+        "source_sha256": sha256_file(vault / "index.jsonl"),
+    }
+
+
+def prewarm_index_verification(vault_dir: str | Path) -> dict[str, Any]:
+    """Force one deep validation, then measure a new-process receipt hit."""
+    from product_data import _exclusive_lock
+
+    vault = vault_path(vault_dir).absolute()
+    receipt_path = vault / "product/index-verification.json"
+    lock_path = vault / "product/index-verification.lock"
+    receipt_backup: dict[str, Any] | None = None
+    if os.path.lexists(receipt_path):
+        verified = _secure_file_size_and_sha256(receipt_path)
+        try:
+            metadata = os.lstat(receipt_path)
+        except OSError:
+            metadata = None
+        if (
+            verified is None
+            or metadata is None
+            or metadata.st_mode & 0o777 != 0o600
+            or not _read_json_nofollow(receipt_path)
+        ):
+            return {
+                "ok": False,
+                "blockers": ["index_verification_receipt_unsafe"],
+            }
+        receipt_backup = _read_json_nofollow(receipt_path)
+        with _exclusive_lock(lock_path, timeout=30.0, stale_after=60.0):
+            current = _secure_file_size_and_sha256(receipt_path)
+            if current != verified:
+                return {
+                    "ok": False,
+                    "blockers": ["index_verification_receipt_changed"],
+                }
+            receipt_path.unlink()
+    full = verify_index_verification(vault)
+    if not full.get("ok") or full.get("mode") != "generated":
+        if receipt_backup:
+            _write_private_json(receipt_path, receipt_backup)
+        return {
+            "ok": False,
+            "blockers": ["index_full_validation_failed"],
+            "full_validation": full,
+        }
+    module_dir = str(Path(__file__).resolve().parent)
+    script = (
+        "import json,sys;"
+        f"sys.path.insert(0,{module_dir!r});"
+        "import export_restore;"
+        "print(json.dumps(export_restore.verify_index_verification(sys.argv[1]),sort_keys=True))"
+    )
+    process = subprocess.run(
+        [sys.executable, "-c", script, str(vault)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    try:
+        fresh = json.loads(process.stdout) if process.returncode == 0 else {}
+    except json.JSONDecodeError:
+        fresh = {}
+    if not isinstance(fresh, dict) or not fresh.get("ok") or fresh.get("mode") != "receipt_hit":
+        return {
+            "ok": False,
+            "blockers": ["fresh_process_receipt_hit_failed"],
+            "full_validation": full,
+            "fresh_process": fresh,
+        }
+    return {
+        "ok": True,
+        "blockers": [],
+        "full_validation": full,
+        "fresh_process": fresh,
+    }
+
+
+def v11_production_switch_gate(
+    vault_dir: str | Path,
+    migration: dict[str, Any] | None,
+    prewarm: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind migration, published source/DB generation, and receipt hit exactly."""
+    from product_data import INDEX_VERIFICATION_VERSION
+    from index_integrity import INDEX_SCHEMA_VERSION
+
+    vault = vault_path(vault_dir).absolute()
+    staged = migration if isinstance(migration, dict) else {}
+    if isinstance(staged.get("index_staging"), dict):
+        staged = staged["index_staging"]
+    warm = prewarm if isinstance(prewarm, dict) else {}
+    full = warm.get("full_validation") if isinstance(warm.get("full_validation"), dict) else {}
+    fresh = warm.get("fresh_process") if isinstance(warm.get("fresh_process"), dict) else {}
+    blockers: list[str] = []
+    if (
+        not staged.get("ok")
+        or staged.get("quarantined") != 0
+        or not isinstance(staged.get("staging_sha256"), str)
+    ):
+        blockers.append("migration_staging_not_ready")
+    if (
+        not warm.get("ok")
+        or full.get("mode") != "generated"
+        or fresh.get("mode") != "receipt_hit"
+        or not full.get("ok")
+        or not fresh.get("ok")
+    ):
+        blockers.append("index_prewarm_not_ready")
+    full_identity = full.get("identity") if isinstance(full.get("identity"), dict) else {}
+    fresh_identity = fresh.get("identity") if isinstance(fresh.get("identity"), dict) else {}
+    if not full_identity or full_identity != fresh_identity:
+        blockers.append("index_receipt_identity_mismatch")
+    if (
+        full_identity.get("schema_version") != INDEX_SCHEMA_VERSION
+        or full_identity.get("validation_version") != INDEX_VERIFICATION_VERSION
+    ):
+        blockers.append("index_receipt_schema_invalid")
+    source_verified = _secure_file_size_and_sha256(vault / "index.jsonl")
+    if source_verified is None:
+        blockers.append("published_source_unsafe")
+    else:
+        source_stat = os.lstat(vault / "index.jsonl")
+        source_signature = [
+            source_stat.st_dev,
+            source_stat.st_ino,
+            source_stat.st_size,
+            source_stat.st_mtime_ns,
+            source_stat.st_ctime_ns,
+        ]
+        if (
+            source_verified[1] != staged.get("staging_sha256")
+            or source_verified[1] != full.get("source_sha256")
+            or source_verified[1] != fresh.get("source_sha256")
+        ):
+            blockers.append("published_source_generation_mismatch")
+        if full_identity.get("source_signature") != source_signature:
+            blockers.append("published_source_signature_mismatch")
+    database_signatures: list[list[int] | None] = []
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(vault / "search_index.db") + suffix)
+        if not os.path.lexists(path):
+            database_signatures.append(None)
+            continue
+        verified_file = _secure_file_size_and_sha256(path)
+        if verified_file is None:
+            blockers.append("published_database_unsafe")
+            database_signatures.append(None)
+            continue
+        metadata = os.lstat(path)
+        database_signatures.append(
+            [
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                metadata.st_ctime_ns,
+            ]
+        )
+    if (
+        not database_signatures
+        or database_signatures[0] is None
+        or full_identity.get("database_signature") != database_signatures
+    ):
+        blockers.append("published_database_generation_mismatch")
+    blockers = list(dict.fromkeys(blockers))
+    return {
+        "ok": not blockers,
+        "production_switch_allowed": not blockers,
+        "blockers": blockers,
+        "staging_sha256": staged.get("staging_sha256", ""),
+        "receipt_identity": full_identity if not blockers else {},
+    }
+
+
 def resolve_export_path(export_path: str | Path) -> Path:
     path = Path(export_path).expanduser()
     if path.is_file() and path.name == MANIFEST_NAME:
         return path.parent
     return path
+
+
+def _v11_projection_warnings(
+    export_dir: Path,
+    manifest: dict[str, Any],
+) -> list[str]:
+    schema_versions = manifest.get("schema_versions")
+    if schema_versions is None:
+        return []
+    if schema_versions == {"model": 0, "events": 0}:
+        return []
+    if schema_versions != {"model": 1, "events": 1}:
+        return ["v11_schema_versions_invalid"]
+    required = [
+        *V11_REQUIRED_EVENT_PATHS,
+        *V11_REQUIRED_CURRENT_PATHS,
+        "model/living-self/current.json",
+        "model/living-self/current.md",
+    ]
+    missing = [relative for relative in required if not (export_dir / relative).is_file()]
+    if missing:
+        return ["v11_required_path_missing: " + relative for relative in missing]
+    warnings: list[str] = []
+    try:
+        actual_heads = {
+            name: _read_event_head_without_lock(export_dir / relative)
+            for name, relative in V11_STREAM_PATHS.items()
+        }
+        if manifest.get("event_heads") != actual_heads:
+            warnings.append("v11_event_heads_mismatch")
+        expected_watermarks = {
+            name: actual_heads[name] for name in ("claims", "judgments", "contexts")
+        }
+        if manifest.get("current_watermarks") != expected_watermarks:
+            warnings.append("v11_current_watermarks_mismatch")
+
+        with tempfile.TemporaryDirectory(
+            prefix="immortal-v11-replay-",
+            dir=str(Path(tempfile.gettempdir()).resolve()),
+        ) as temp:
+            replay_vault = Path(temp) / "vault"
+            for directory in ("model/claims", "judgment", "contexts", "outcomes"):
+                source_dir = export_dir / directory
+                if source_dir.exists():
+                    shutil.copytree(source_dir, replay_vault / directory)
+            for relative in V11_REQUIRED_CURRENT_PATHS:
+                (replay_vault / relative).unlink(missing_ok=True)
+
+            from claim_store import ClaimStore
+            from context_store import ContextStore
+            from judgment_store import JudgmentStore
+            from outcome_store import OutcomeStore
+
+            ClaimStore(replay_vault)
+            JudgmentStore(replay_vault)
+            contexts = ContextStore(replay_vault)
+            OutcomeStore(replay_vault, context_store=contexts).list()
+            comparisons = {
+                "claims": ["model/claims/current.jsonl"],
+                "judgments": [
+                    "judgment/current.jsonl",
+                    "judgment/evaluations.jsonl",
+                ],
+                "contexts": ["contexts/current.jsonl"],
+            }
+            for name, paths in comparisons.items():
+                if any(
+                    (replay_vault / relative).read_bytes()
+                    != (export_dir / relative).read_bytes()
+                    for relative in paths
+                ):
+                    warnings.append("v11_projection_mismatch: " + name)
+    except Exception:
+        warnings.append("v11_event_replay_failed")
+    return list(dict.fromkeys(warnings))
+
+
+def _read_event_head_without_lock(path: Path) -> int:
+    from event_store import validate_event
+
+    descriptor = _open_absolute_nofollow(path)
+    head = 0
+    try:
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for line_number, raw in enumerate(handle, start=1):
+                if not raw.endswith(b"\n") or len(raw) > 1024 * 1024:
+                    raise ValueError("event stream framing is invalid")
+                value = json.loads(raw)
+                if not isinstance(value, dict):
+                    raise ValueError("event stream row is invalid")
+                validate_event(value)
+                if value.get("seq") != line_number:
+                    raise ValueError("event stream sequence is invalid")
+                head = line_number
+    finally:
+        os.close(descriptor)
+    return head
 
 
 def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, Any]:
@@ -724,6 +1677,9 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
         if extra:
             warnings.append(f"extra_files: {len(extra)}")
 
+    if not missing and not mismatched:
+        warnings.extend(_v11_projection_warnings(export_dir, manifest))
+
     # strict 模式 fail-closed：任何 warning（unsafe/duplicate/invalid/extra/manifest 自带）都不允许成功，
     # 且必须逐一校验过 manifest 声明的每个安全条目
     strict_ok = not warnings and checked_files == len(seen)
@@ -738,6 +1694,301 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
         "mismatched": mismatched,
         "warnings": warnings,
     }
+
+
+def _capture_export_generation(export_dir: Path) -> dict[str, Any] | None:
+    """Capture the exact manifest and declared files as one comparable generation."""
+    directory_identity = _secure_directory_identity(export_dir)
+    manifest_generation = _read_file_generation(
+        export_dir / MANIFEST_NAME,
+        max_bytes=16 * 1024 * 1024,
+        capture_body=True,
+    )
+    if directory_identity is None or manifest_generation is None:
+        return None
+    manifest_body, manifest_sha256, manifest_identity = manifest_generation
+    if manifest_body is None:
+        return None
+    try:
+        manifest = json.loads(manifest_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("items"), list):
+        return None
+    files: dict[str, dict[str, Any]] = {}
+    for item in manifest["items"]:
+        if not isinstance(item, dict):
+            return None
+        relative = item.get("relpath")
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or relative.startswith("/")
+            or ".." in Path(relative).parts
+            or relative in files
+        ):
+            return None
+        generation = _read_file_generation(export_dir / relative)
+        if generation is None:
+            return None
+        _body, sha256, identity = generation
+        files[relative] = {
+            "sha256": sha256,
+            "identity": identity,
+        }
+    return {
+        "directory_identity": directory_identity,
+        "manifest": manifest,
+        "manifest_sha256": manifest_sha256,
+        "manifest_identity": manifest_identity,
+        "files": files,
+    }
+
+
+def restore_export(
+    export_path: str | Path,
+    destination: str | Path,
+) -> dict[str, Any]:
+    """Restore through an anchored temporary tree, then atomically publish it."""
+    export_dir = resolve_export_path(export_path).absolute()
+    target = Path(destination).expanduser().absolute()
+    generation = _capture_export_generation(export_dir)
+    if generation is None:
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["export_generation_unsafe"],
+        }
+    check = restore_check(export_dir, strict=True)
+    if not check.get("ok"):
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["strict_restore_check_failed"],
+            "check": check,
+        }
+    if _capture_export_generation(export_dir) != generation:
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["export_generation_changed"],
+        }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not _secure_directory(target.parent):
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["restore_destination_unsafe"],
+        }
+    parent_fd = _open_absolute_nofollow(target.parent, directory=True)
+    parent_metadata = os.fstat(parent_fd)
+    temp_name = f".{target.name}.restore-{os.getpid()}-{time.time_ns()}"
+    temp_created = False
+    try:
+        try:
+            os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            os.close(parent_fd)
+            return {
+                "ok": False,
+                "destination": str(target),
+                "blockers": ["restore_destination_exists"],
+            }
+        os.mkdir(temp_name, mode=0o700, dir_fd=parent_fd)
+        temp_created = True
+        root_fd = os.open(
+            temp_name,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except Exception:
+        if temp_created:
+            try:
+                _remove_tree_at(parent_fd, temp_name)
+            except OSError:
+                pass
+        os.close(parent_fd)
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["restore_destination_unsafe"],
+        }
+    manifest = generation["manifest"]
+    copied = 0
+    temp_path = target.parent / temp_name
+    try:
+        for item in manifest["items"]:
+            relative = str(item["relpath"])
+            copied_generation = _copy_file_into_tree(
+                export_dir / relative,
+                root_fd,
+                Path(relative),
+            )
+            if copied_generation != generation["files"][relative]:
+                raise RuntimeError("export generation changed during copy")
+            copied += 1
+        copied_manifest = _copy_file_into_tree(
+            export_dir / MANIFEST_NAME,
+            root_fd,
+            Path(MANIFEST_NAME),
+        )
+        if copied_manifest != {
+            "sha256": generation["manifest_sha256"],
+            "identity": generation["manifest_identity"],
+        }:
+            raise RuntimeError("manifest generation changed during copy")
+        if _capture_export_generation(export_dir) != generation:
+            raise RuntimeError("export generation changed after copy")
+        os.fsync(root_fd)
+        root_metadata = os.fstat(root_fd)
+        if (
+            _secure_directory_identity(temp_path)
+            != (root_metadata.st_dev, root_metadata.st_ino)
+            or _secure_directory_identity(target.parent)
+            != (parent_metadata.st_dev, parent_metadata.st_ino)
+        ):
+            raise RuntimeError("restore destination identity changed")
+        restored_check = restore_check(temp_path, strict=True)
+        if not restored_check.get("ok"):
+            raise RuntimeError("restored files failed strict verification")
+        if (
+            _secure_directory_identity(temp_path)
+            != (root_metadata.st_dev, root_metadata.st_ino)
+            or _secure_directory_identity(target.parent)
+            != (parent_metadata.st_dev, parent_metadata.st_ino)
+        ):
+            raise RuntimeError("restore destination identity changed")
+        os.rename(
+            temp_name,
+            target.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    except Exception:
+        try:
+            _remove_tree_at(parent_fd, temp_name)
+        except OSError:
+            pass
+        return {
+            "ok": False,
+            "destination": str(target),
+            "blockers": ["restore_copy_or_verification_failed"],
+            "copied_files": copied,
+        }
+    finally:
+        os.close(root_fd)
+        os.close(parent_fd)
+    return {
+        "ok": True,
+        "destination": str(target),
+        "copied_files": copied,
+        "check": restored_check,
+    }
+
+
+def _copy_file_into_tree(
+    source: Path,
+    root_fd: int,
+    relative: Path,
+) -> dict[str, Any]:
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("unsafe restore path")
+    directory_fd = os.dup(root_fd)
+    try:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            child_fd = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            os.close(directory_fd)
+            directory_fd = child_fd
+        return _copy_file_to_dirfd(source, directory_fd, parts[-1])
+    finally:
+        os.close(directory_fd)
+
+
+def _copy_file_to_dirfd(
+    source: Path,
+    directory_fd: int,
+    name: str,
+) -> dict[str, Any]:
+    source_fd = _open_absolute_nofollow(source)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    destination_fd = -1
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("restore source is not a regular file")
+        digest = hashlib.sha256()
+        copied = 0
+        destination_fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("restore write made no progress")
+                view = view[written:]
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if before_identity != after_identity or copied != before.st_size:
+            raise OSError("restore source generation changed")
+        return {"sha256": digest.hexdigest(), "identity": before_identity}
+    finally:
+        os.close(source_fd)
+        if destination_fd >= 0:
+            os.close(destination_fd)
+
+
+def _remove_tree_at(parent_fd: int, name: str) -> None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    child_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        for child in os.listdir(child_fd):
+            _remove_tree_at(child_fd, child)
+    finally:
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 def get_migration_backup_status(
@@ -872,6 +2123,25 @@ def main() -> int:
     p_check.add_argument("export_path")
     p_check.add_argument("--strict", action="store_true")
 
+    p_restore = sub.add_parser("restore-export")
+    p_restore.add_argument("export_path")
+    p_restore.add_argument("destination")
+
+    p_stage_v11 = sub.add_parser("stage-v11-index")
+    p_stage_v11.add_argument("--vault-dir", required=True)
+    p_stage_v11.add_argument("--timezone-contract")
+    p_stage_v11.add_argument("--output-dir")
+
+    p_migrate_v11 = sub.add_parser("v11-migrate")
+    p_migrate_v11.add_argument("--vault-dir", required=True)
+    p_migrate_v11.add_argument("--timezone-contract")
+
+    p_living_self = sub.add_parser("living-self-build")
+    p_living_self.add_argument("--vault-dir", required=True)
+
+    p_prewarm = sub.add_parser("prewarm-index-receipt")
+    p_prewarm.add_argument("--vault-dir", required=True)
+
     args = parser.parse_args()
     if args.command == "create-export":
         try:
@@ -889,6 +2159,33 @@ def main() -> int:
         return 0 if status.get("ok") else 1
     if args.command == "restore-check":
         result = restore_check(args.export_path, args.strict)
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    if args.command == "restore-export":
+        result = restore_export(args.export_path, args.destination)
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    if args.command == "stage-v11-index":
+        result = stage_v11_index(
+            vault_path(args.vault_dir),
+            timezone_contract=args.timezone_contract,
+            output_dir=args.output_dir,
+        )
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    if args.command == "v11-migrate":
+        result = run_v11_migration(
+            vault_path(args.vault_dir),
+            timezone_contract=args.timezone_contract,
+        )
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    if args.command == "living-self-build":
+        result = build_living_self(vault_path(args.vault_dir))
+        print_json(result)
+        return 0 if result.get("ok") else 1
+    if args.command == "prewarm-index-receipt":
+        result = prewarm_index_verification(vault_path(args.vault_dir))
         print_json(result)
         return 0 if result.get("ok") else 1
     parser.error("unknown command")

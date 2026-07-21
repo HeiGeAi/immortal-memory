@@ -458,9 +458,23 @@ def profile_auto_review():
     return False
 
 
-def profile_attribution_audit():
+def profile_attribution_audit(vault_dir=None):
     log("=== 阶段 F5: 自动剥离长期画像污染 ===")
-    ok, out = run_script("profile_attribution_audit.py", "--apply", timeout=600)
+    args = ["--apply"]
+    if vault_dir is not None:
+        vault = Path(vault_dir).expanduser().absolute()
+        args.extend(
+            [
+                "--reviewed", str(vault / "reviewed/profile_memories.jsonl"),
+                "--reviewed-md", str(vault / "reviewed/profile_memories.md"),
+                "--distilled", str(vault / "feishu/distilled/profile_memories.jsonl"),
+                "--records", str(vault / "feishu/clean/records.jsonl"),
+                "--report-dir", str(vault / "quality"),
+                "--evidence-index", str(vault / "index.jsonl"),
+                "--trust-report", str(vault / "model/attribution/latest-report.json"),
+            ]
+        )
+    ok, out = run_script("profile_attribution_audit.py", *args, timeout=600)
     if ok:
         total = re.search(r"reviewed_total=(\d+)", out)
         kept = re.search(r"reviewed_kept=(\d+)", out)
@@ -473,6 +487,41 @@ def profile_attribution_audit():
         )
         return True
     log(f"长期画像归因审计失败: {out.strip()[:500]}")
+    return False
+
+
+def claims_migrate(vault_dir):
+    vault = Path(vault_dir).expanduser().absolute()
+    log("=== v1.1 阶段: 迁移 Claims 权威事件层 ===")
+    ok, out = run_script(
+        "immortal.py",
+        "claims-migrate",
+        "--vault-dir",
+        str(vault),
+        "--json",
+        timeout=1800,
+    )
+    if ok:
+        log("Claims 迁移完成")
+        return True
+    log(f"Claims 迁移失败: {out.strip()[:500]}")
+    return False
+
+
+def living_self_build(vault_dir):
+    vault = Path(vault_dir).expanduser().absolute()
+    log("=== v1.1 阶段: 构建 Living Self ===")
+    ok, out = run_script(
+        "export_restore.py",
+        "living-self-build",
+        "--vault-dir",
+        str(vault),
+        timeout=600,
+    )
+    if ok:
+        log("Living Self 已构建")
+        return True
+    log(f"Living Self 构建失败: {out.strip()[:500]}")
     return False
 
 
@@ -635,6 +684,53 @@ def cards_build():
         return True
     log(f"cards build failed: {out.strip()[:300]}")
     return False
+
+
+def evaluate_v11_production_switch(vault_dir, migration, prewarm) -> dict:
+    """Evaluate the final switch against the live vault at execution time."""
+    from export_restore import v11_production_switch_gate
+
+    return v11_production_switch_gate(vault_dir, migration, prewarm)
+
+
+def run_v11_model_stages(vault_dir, migration, prewarm) -> dict:
+    """Run the explicit migration-only dependency chain and stop fail-closed."""
+    vault = Path(vault_dir).expanduser().absolute()
+    switch_gate = evaluate_v11_production_switch(vault, migration, prewarm)
+    if (
+        not isinstance(switch_gate, dict)
+        or switch_gate.get("ok") is not True
+        or switch_gate.get("production_switch_allowed") is not True
+    ):
+        return {
+            "ok": False,
+            "completed": [],
+            "blockers": ["production_switch_gate_required"],
+            "switch_gate": switch_gate if isinstance(switch_gate, dict) else {},
+        }
+    if vault.resolve() != IMMORTAL_DIR.resolve():
+        return {
+            "ok": False,
+            "completed": [],
+            "blockers": ["v11_model_stages_require_live_vault"],
+        }
+    stages = [
+        ("profile-attribution-audit", lambda: profile_attribution_audit(vault)),
+        ("claims-migrate", lambda: claims_migrate(vault)),
+        ("living-self-build", lambda: living_self_build(vault)),
+        ("cards build", cards_build),
+        ("quality", quality_report),
+    ]
+    completed = []
+    for name, action in stages:
+        if not action():
+            return {
+                "ok": False,
+                "completed": completed,
+                "blockers": [name + "_failed"],
+            }
+        completed.append(name)
+    return {"ok": True, "completed": completed, "blockers": []}
 
 
 def daily_digest():
