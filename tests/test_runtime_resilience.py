@@ -55,6 +55,33 @@ class ProcessGroupTimeoutTest(unittest.TestCase):
 
 
 class AgentBridgeTimeoutTest(unittest.TestCase):
+    @unittest.skipUnless(Path("/var").is_symlink(), "macOS system alias behavior")
+    def test_safe_context_write_normalizes_macos_var_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved_root = Path(tmp).resolve()
+            try:
+                alias_root = Path("/var") / resolved_root.relative_to("/private/var")
+            except ValueError:
+                self.skipTest("temporary directory is not below /private/var")
+            target = alias_root / "nested" / "context.json"
+
+            agent_bridge._safe_write_text(target, "{}\n")
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "{}\n")
+
+    def test_safe_context_write_rejects_arbitrary_symlink_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual = root / "actual"
+            actual.mkdir()
+            linked = root / "linked"
+            linked.symlink_to(actual, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "safe directory"):
+                agent_bridge._safe_write_text(linked / "context.json", "{}\n")
+
+            self.assertFalse((actual / "context.json").exists())
+
     def test_context_timeout_writes_bounded_failure_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "context.md"
@@ -106,6 +133,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             approved_preview = {
                 "preview_id": "prv_one",
                 "preview_hash": "sha256:" + "1" * 64,
+                "task": "authoritative review task",
                 "mode": "reviewer",
                 "source_revision": {"claims_event_seq": 1},
                 "sections": {"verified_facts": []},
@@ -135,6 +163,9 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                         "availability_status": "active",
                         "source_revision": {"claims_event_seq": 1},
                         "content_hash": "sha256:" + "2" * 64,
+                        "task": "authoritative review task",
+                        "mode": "reviewer",
+                        "expires_at": "2026-07-22T00:00:00+00:00",
                         "context_json": str(canonical_json),
                         "context_md": str(canonical_md),
                     }
@@ -180,6 +211,8 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 )
                 args.preview_id = "prv_one"
                 args.preview_hash = "sha256:" + "1" * 64
+                args.query = "forged writer request label"
+                args.mode = "auto"
                 code = agent_bridge.command_context(args)
 
             self.assertEqual(preview_code, 0)
@@ -189,6 +222,12 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             self.assertEqual(payload["context_id"], "ctx_one")
             self.assertEqual(payload["preview_id"], "prv_one")
             self.assertEqual(payload["runtime"], "living_self_v1.1")
+            self.assertEqual(payload["query"], "authoritative review task")
+            self.assertEqual(payload["task"], "authoritative review task")
+            self.assertEqual(payload["mode"], "reviewer")
+            self.assertEqual(payload["request_label"], "forged writer request label")
+            compile_call = [item for item in calls if item[0] == "compile"][0]
+            self.assertEqual(compile_call[1]["resolved_mode"], "reviewer")
             self.assertEqual(
                 [item[0] for item in calls],
                 ["init", "preview", "init", "get", "compile"],
@@ -239,11 +278,14 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 json.dumps(
                     {
                         "runtime": "living_self_v1.1",
-                        "preview_id": "prv_one",
-                        "preview_hash": "sha256:" + "1" * 64,
-                        "context_id": "ctx_one",
-                        "content_hash": "sha256:" + "2" * 64,
+                        "preview_id": "prv_stale",
+                        "preview_hash": "sha256:" + "9" * 64,
+                        "context_id": "ctx_stale",
+                        "content_hash": "sha256:" + "9" * 64,
                         "source_revision": {"claims_event_seq": 1},
+                        "task": "stale global task",
+                        "mode": "writer",
+                        "lifecycle_status": "compiled",
                     }
                 ),
                 encoding="utf-8",
@@ -267,8 +309,25 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
 
             def bridge_success(cmd, **_kwargs):
                 output = Path(cmd[cmd.index("--output") + 1])
+                metadata = Path(cmd[cmd.index("--metadata-output") + 1])
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text("# safe authoritative context\n", encoding="utf-8")
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "runtime": "living_self_v1.1",
+                            "preview_id": "prv_one",
+                            "preview_hash": "sha256:" + "1" * 64,
+                            "context_id": "ctx_one",
+                            "content_hash": "sha256:" + "2" * 64,
+                            "source_revision": {"claims_event_seq": 1},
+                            "task": "approved business task",
+                            "mode": "business",
+                            "lifecycle_status": "compiled",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
             stdout = io.StringIO()
@@ -290,6 +349,64 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             combined = persisted + path_names + stdout.getvalue()
             for secret in (token, email, "/Users/alice"):
                 self.assertNotIn(secret, combined)
+            manifest = json.loads(latest_json.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["query"], "approved business task")
+            self.assertEqual(manifest["mode"], "business")
+            self.assertNotEqual(manifest["request_label"], manifest["query"])
+
+    def test_auto_preview_requires_explicit_non_auto_mode_for_approval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            latest_json = root / "latest-context.json"
+            preview = {
+                "preview_id": "prv_auto",
+                "preview_hash": "sha256:" + "3" * 64,
+                "task": "auto authority task",
+                "mode": "auto",
+                "source_revision": {"claims_event_seq": 1},
+                "sections": {"verified_facts": []},
+            }
+            compile_calls = []
+
+            class Store:
+                def get(self, _preview_id):
+                    return dict(preview)
+
+            class Compiler:
+                def __init__(self, _vault):
+                    self.context_store = Store()
+
+                def compile(self, **kwargs):
+                    compile_calls.append(kwargs)
+                    raise AssertionError("compile must not run without explicit mode")
+
+            args = argparse.Namespace(
+                query="mutable query must not choose mode",
+                since="2026-07-01",
+                with_recall=False,
+                timeout=1,
+                output="",
+                print=False,
+                force=False,
+                mode="auto",
+                preview_only=False,
+                preview_id="prv_auto",
+                preview_hash="sha256:" + "3" * 64,
+                exclude_item_id=[],
+                ttl_seconds=900,
+            )
+            preflight = {"context_status": "ready", "vault_status": "healthy"}
+            with mock.patch.object(agent_bridge, "ContextCompiler", Compiler), \
+                 mock.patch.object(agent_bridge, "IMMORTAL_DIR", root), \
+                 mock.patch.object(agent_bridge, "LATEST_CONTEXT_JSON", latest_json), \
+                 mock.patch.object(agent_bridge, "gather_preflight", return_value=preflight), \
+                 mock.patch.object(agent_bridge, "_authoritative_runtime_available", return_value=True):
+                code = agent_bridge.command_context(args)
+
+            self.assertEqual(code, 1)
+            self.assertEqual(compile_calls, [])
+            payload = json.loads(latest_json.read_text(encoding="utf-8"))
+            self.assertEqual(payload["error_code"], "unresolved_context_mode")
 
 
 if __name__ == "__main__":

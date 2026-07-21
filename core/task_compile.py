@@ -156,17 +156,18 @@ def command_compile(args: argparse.Namespace) -> int:
             args.ttl_seconds = 900
         return command_preview(args)
     raw_query = (args.query or "当前任务").strip()
-    query = redact_external_text(raw_query, max_chars=500)
-    mode = args.mode if args.mode in MODE_LABELS else "auto"
+    request_label = redact_external_text(raw_query, max_chars=500)
+    requested_mode = args.mode if args.mode in MODE_LABELS else "auto"
     generated = now_local()
     expires = generated + timedelta(hours=float(args.ttl_hours))
-    hash_part = hashlib.sha1(f"{query}|{generated.timestamp()}".encode("utf-8")).hexdigest()[:8]
-    session_id = f"{generated.strftime('%Y%m%d-%H%M%S')}-{slugify(query)}-{hash_part}"
+    hash_part = hashlib.sha1(f"{request_label}|{generated.timestamp()}".encode("utf-8")).hexdigest()[:8]
+    session_id = f"{generated.strftime('%Y%m%d-%H%M%S')}-{slugify(request_label)}-{hash_part}"
     session_dir = SESSIONS_DIR / session_id
     context_path = session_dir / "TASK_CONTEXT.md"
     prompt_path = session_dir / "SYSTEM_PROMPT.md"
     runbook_path = session_dir / "README.md"
     manifest_path = session_dir / "manifest.json"
+    bridge_result_path = session_dir / "bridge-result.json"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if args.cleanup_first:
@@ -185,6 +186,8 @@ def command_compile(args: argparse.Namespace) -> int:
         str(args.timeout),
         "--mode",
         args.mode,
+        "--metadata-output",
+        str(bridge_result_path),
     ]
     if getattr(args, "preview_id", ""):
         cmd.extend(["--preview-id", args.preview_id, "--preview-hash", args.preview_hash])
@@ -204,40 +207,46 @@ def command_compile(args: argparse.Namespace) -> int:
             stderr=(stderr + f"\ncontext bridge timed out after {args.timeout + 30}s").strip(),
         )
 
+    bridge_payload = read_json(bridge_result_path, {})
+    ready = bool(
+        result.returncode == 0
+        and bridge_payload.get("lifecycle_status") == "compiled"
+        and bridge_payload.get("context_id")
+        and bridge_payload.get("content_hash")
+        and context_path.is_file()
+        and context_path.stat().st_size > 0
+    )
+    if not ready:
+        shutil.rmtree(session_dir, ignore_errors=True)
+        if result.stdout:
+            print(redact_external_text(result.stdout, max_chars=24_000).rstrip())
+        if result.stderr:
+            print(
+                redact_external_text(result.stderr, max_chars=4000).rstrip(),
+                file=sys.stderr,
+            )
+        if result.returncode == 0:
+            print("context_not_ready: approved compile did not return a READY context", file=sys.stderr)
+        return int(result.returncode or 1)
+    authority_task = redact_external_text(bridge_payload.get("task"), max_chars=500)
+    authority_mode = str(bridge_payload.get("mode") or "")
+    if not authority_task or authority_mode not in MODE_LABELS or authority_mode == "auto":
+        shutil.rmtree(session_dir, ignore_errors=True)
+        print("context_not_ready: compiled authority task or mode is invalid", file=sys.stderr)
+        return 1
     owner = owner_display_name()
     context_text = context_path.read_text(encoding="utf-8", errors="ignore") if context_path.exists() else ""
-    if result.returncode != 0 and not context_text:
-        context_text = "\n".join(
-            [
-                "# Immortal Task Context",
-                "",
-                f"Generated: {iso(generated)}",
-                f"Query: {query}",
-                f"Exit code: {result.returncode}",
-                "",
-                "Context generation failed before a context file was written.",
-                "",
-                "STDOUT:",
-                redact_external_text(result.stdout, max_chars=24_000).strip(),
-                "",
-                "STDERR:",
-                redact_external_text(result.stderr, max_chars=4000).strip(),
-                "",
-            ]
-        )
-        context_path.write_text(context_text, encoding="utf-8")
-
-    prompt_path.write_text(build_system_prompt(owner, query, mode, context_path), encoding="utf-8")
-    runbook_path.write_text(build_runbook(session_dir, query), encoding="utf-8")
-
-    bridge_payload = read_json(BRIDGE_LATEST_JSON, {})
+    prompt_path.write_text(build_system_prompt(owner, authority_task, authority_mode, context_path), encoding="utf-8")
+    runbook_path.write_text(build_runbook(session_dir, authority_task), encoding="utf-8")
     manifest = {
         "version": 1,
         "kind": "task_session",
         "session_id": session_id,
-        "query": query,
-        "mode": mode,
-        "mode_label": MODE_LABELS.get(mode, mode),
+        "query": authority_task,
+        "mode": authority_mode,
+        "mode_label": MODE_LABELS.get(authority_mode, authority_mode),
+        "request_label": request_label,
+        "requested_mode": requested_mode,
         "owner": owner,
         "generated_at": iso(generated),
         "expires_at": iso(expires),
@@ -255,8 +264,9 @@ def command_compile(args: argparse.Namespace) -> int:
             "SYSTEM_PROMPT.md": file_info(prompt_path),
             "README.md": file_info(runbook_path),
             "manifest.json": {"path": str(manifest_path), "exists": True},
+            "bridge-result.json": file_info(bridge_result_path),
         },
-        "source_command": "agent_bridge context [TASK] --mode " + mode,
+        "source_command": "agent_bridge context [TASK] --mode " + requested_mode,
     }
     write_json(manifest_path, manifest)
     write_latest(session_dir, manifest, context_text)

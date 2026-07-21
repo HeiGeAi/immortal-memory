@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from zoneinfo import ZoneInfo
 from config import configured_vault_dir, owner_display_name
 from command_hints import cli_command
 from context_compiler import ContextCompiler, ContextCompilerError
+from event_store import safe_atomic_write_text
 from preflight import STATUS_DEGRADED, STATUS_UNAVAILABLE, gather_preflight, render_summary
 from redact_common import redact as redact_credentials
 
@@ -41,6 +43,23 @@ _PRIVATE_PATHS = (
 )
 
 
+def _canonical_system_alias_path(path: Path) -> Path:
+    """Normalize macOS system aliases without accepting arbitrary symlinks."""
+    absolute = Path(os.path.abspath(str(path.expanduser())))
+    for alias_text in ("/var", "/tmp", "/etc"):
+        alias = Path(alias_text)
+        try:
+            if alias.is_symlink() and (absolute == alias or alias in absolute.parents):
+                return alias.resolve(strict=True) / absolute.relative_to(alias)
+        except (OSError, ValueError):
+            continue
+    return absolute
+
+
+def _safe_write_text(path: Path, content: str) -> None:
+    safe_atomic_write_text(_canonical_system_alias_path(path), content)
+
+
 def redact_external_text(value: Any, max_chars: int = 4000) -> str:
     """Redact untrusted process/compiler text before persistence or display."""
     text = redact_credentials(str(value or ""))
@@ -57,6 +76,41 @@ def _redact_external_tree(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _redact_external_tree(item) for key, item in value.items()}
     return value
+
+
+def _metadata_path(args: argparse.Namespace) -> Path | None:
+    cached = getattr(args, "_validated_metadata_output", None)
+    if cached is not None:
+        return cached
+    raw = str(getattr(args, "metadata_output", "") or "").strip()
+    if not raw:
+        args._validated_metadata_output = None
+        return None
+    path = Path(raw).expanduser()
+    lexical = Path(os.path.abspath(str(path)))
+    if not path.is_absolute() or path != lexical or ".." in path.parts:
+        raise ContextCompilerError(
+            "invalid_metadata_output",
+            "metadata output must be a canonical absolute path",
+        )
+    normalized = _canonical_system_alias_path(lexical)
+    args._validated_metadata_output = normalized
+    return normalized
+
+
+def _write_context_metadata(
+    args: argparse.Namespace, payload: dict[str, Any]
+) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    scoped = _metadata_path(args)
+    if scoped is not None:
+        _safe_write_text(scoped, text)
+    if scoped != LATEST_CONTEXT_JSON:
+        _safe_write_text(LATEST_CONTEXT_JSON, text)
+
+
+def _metadata_display_path(args: argparse.Namespace) -> Path:
+    return _metadata_path(args) or LATEST_CONTEXT_JSON
 
 
 def now_local() -> str:
@@ -228,11 +282,11 @@ def _legacy_context(args: argparse.Namespace) -> int:
             "context_md": None,
             "preflight": _redact_external_tree(preflight),
         }
-        write_json(LATEST_CONTEXT_JSON, payload)
+        _write_context_metadata(args, payload)
         print(render_summary(preflight))
         print()
         print(f"context_status={STATUS_UNAVAILABLE}")
-        print(f"context_json={LATEST_CONTEXT_JSON}")
+        print(f"context_json={_metadata_display_path(args)}")
         print("Refusing to generate a context pack from an empty or demo-only vault. Use --force to override for debugging.")
         return 3
 
@@ -289,8 +343,7 @@ def _legacy_context(args: argparse.Namespace) -> int:
     header.extend(["", "---", ""])
     content = "\n".join(header) + body + "\n"
     output = Path(args.output).expanduser() if args.output else LATEST_CONTEXT_MD
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(content, encoding="utf-8")
+    _safe_write_text(output, content)
     payload = {
         "generated_at": now_local(),
         "query": safe_query,
@@ -305,9 +358,9 @@ def _legacy_context(args: argparse.Namespace) -> int:
             "entry": file_info(ENTRY_MD),
         },
     }
-    write_json(LATEST_CONTEXT_JSON, payload)
+    _write_context_metadata(args, payload)
     print(f"context_md={output}")
-    print(f"context_json={LATEST_CONTEXT_JSON}")
+    print(f"context_json={_metadata_display_path(args)}")
     print(f"context_status={context_status}")
     if context_status == STATUS_DEGRADED:
         print("WARNING: context is degraded; see the CONTEXT STATUS block inside the pack.")
@@ -347,8 +400,8 @@ def _write_authoritative_error(
     detail = redact_external_text(str(exc), 1000)
     output = Path(args.output).expanduser() if args.output else None
     if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
+        _safe_write_text(
+            output,
             "\n".join(
                 [
                     "# Immortal Task Context",
@@ -359,7 +412,6 @@ def _write_authoritative_error(
                     "",
                 ]
             ),
-            encoding="utf-8",
         )
     payload = {
         "generated_at": now_local(),
@@ -371,16 +423,21 @@ def _write_authoritative_error(
         "context_md": str(output) if output is not None else None,
         "preflight": _redact_external_tree(preflight),
     }
-    write_json(LATEST_CONTEXT_JSON, payload)
+    _write_context_metadata(args, payload)
     print("context_status=unavailable")
     print("error_code=" + code)
-    print("context_json=" + str(LATEST_CONTEXT_JSON))
+    print("context_json=" + str(_metadata_display_path(args)))
     return 1
 
 
 def command_context(args: argparse.Namespace) -> int:
     query = (args.query or "当前任务").strip()
     safe_query = redact_external_text(query, 500)
+    try:
+        _metadata_path(args)
+    except ContextCompilerError as exc:
+        print("error_code=" + exc.code)
+        return 2
     preflight = gather_preflight(query=query, since=args.since)
     if (
         preflight["context_status"] == STATUS_UNAVAILABLE
@@ -428,9 +485,14 @@ def command_context(args: argparse.Namespace) -> int:
             preview_id = str(preview["preview_id"])
             preview_hash = str(preview["preview_hash"])
         if not approval_supplied or getattr(args, "preview_only", False):
+            authority_task = str(preview["task"])
+            authority_mode = str(preview["mode"])
             payload = {
                 "generated_at": now_local(),
-                "query": safe_query,
+                "query": authority_task,
+                "task": authority_task,
+                "mode": authority_mode,
+                "request_label": safe_query,
                 "context_status": preflight["context_status"],
                 "runtime": "living_self_v1.1",
                 "lifecycle_status": "preview",
@@ -440,14 +502,35 @@ def command_context(args: argparse.Namespace) -> int:
                 "selection": preview.get("selection"),
                 "sections": preview.get("sections"),
                 "context_md": None,
+                "recommended_mode": (
+                    _resolve_mode("auto", query)
+                    if authority_mode == "auto"
+                    else authority_mode
+                ),
                 "preflight": _redact_external_tree(preflight),
             }
-            write_json(LATEST_CONTEXT_JSON, payload)
+            _write_context_metadata(args, payload)
             print("preview_id=" + preview_id)
             print("preview_hash=" + preview_hash)
-            print("context_json=" + str(LATEST_CONTEXT_JSON))
+            print("context_json=" + str(_metadata_display_path(args)))
             print("lifecycle_status=preview")
             return 0
+        preview_mode = str(preview["mode"])
+        requested_mode = str(mode)
+        if preview_mode == "auto":
+            if requested_mode == "auto":
+                raise ContextCompilerError(
+                    "unresolved_context_mode",
+                    "auto preview requires an explicit non-auto approved mode",
+                )
+            approved_mode = requested_mode
+        else:
+            if requested_mode not in {"auto", preview_mode}:
+                raise ContextCompilerError(
+                    "resolved_mode_conflict",
+                    "requested mode conflicts with the approved preview",
+                )
+            approved_mode = preview_mode
         nonce = uuid.uuid4().hex
         compiled = compiler.compile(
             preview_id=preview_id,
@@ -457,7 +540,7 @@ def command_context(args: argparse.Namespace) -> int:
             idempotency_key="idem_bridge_compile_" + nonce,
             actor=ACTOR,
             reason="Agent Bridge preview approved",
-            resolved_mode=_resolve_mode(str(preview["mode"]), query),
+            resolved_mode=approved_mode,
         )
     except (ContextCompilerError, OSError, ValueError) as exc:
         return _write_authoritative_error(args, preflight, exc)
@@ -466,11 +549,13 @@ def command_context(args: argparse.Namespace) -> int:
     content = canonical_md.read_text(encoding="utf-8")
     output = Path(args.output).expanduser() if args.output else canonical_md
     if output != canonical_md:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(content, encoding="utf-8")
+        _safe_write_text(output, content)
     payload = {
         "generated_at": now_local(),
-        "query": safe_query,
+        "query": compiled["task"],
+        "task": compiled["task"],
+        "mode": compiled["mode"],
+        "request_label": safe_query,
         "exit_code": 0,
         "context_status": preflight["context_status"],
         "runtime": "living_self_v1.1",
@@ -480,6 +565,7 @@ def command_context(args: argparse.Namespace) -> int:
         "preview_hash": preview_hash,
         "context_id": compiled["context_id"],
         "content_hash": compiled["content_hash"],
+        "expires_at": compiled["expires_at"],
         "source_revision": compiled["source_revision"],
         "context_json": compiled["context_json"],
         "context_md": compiled["context_md"],
@@ -491,10 +577,10 @@ def command_context(args: argparse.Namespace) -> int:
             "entry": file_info(ENTRY_MD),
         },
     }
-    write_json(LATEST_CONTEXT_JSON, payload)
+    _write_context_metadata(args, payload)
     print("context_id=" + str(compiled["context_id"]))
     print("context_md=" + str(output))
-    print("context_json=" + str(LATEST_CONTEXT_JSON))
+    print("context_json=" + str(_metadata_display_path(args)))
     print("context_status=" + str(preflight["context_status"]))
     if preflight["context_status"] == STATUS_DEGRADED:
         print("WARNING: context is degraded; source revision remains authoritative.")
@@ -521,6 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--preview-hash", default="")
     context.add_argument("--exclude-item-id", action="append", default=[])
     context.add_argument("--ttl-seconds", type=int, default=900)
+    context.add_argument("--metadata-output", default="")
     context.add_argument("--print", action="store_true", help="Also print the generated context to stdout")
     context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     context.set_defaults(func=command_context)
