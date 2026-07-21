@@ -618,7 +618,18 @@ class FactoryStore:
     def list_jobs(self) -> list[dict[str, Any]]:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
-            return [dict(item) for item in jobs[:JOB_HISTORY_LIMIT]]
+            return [self._public_job(item) for item in jobs[:JOB_HISTORY_LIMIT]]
+
+    @staticmethod
+    def _public_job(value: dict[str, Any]) -> dict[str, Any]:
+        result = dict(value)
+        for key in ("stdout", "stderr", "error", "summary"):
+            result[key] = sanitize_job_output(str(result.get(key) or ""))
+        result["commands"] = [
+            sanitize_job_output(str(command))
+            for command in (result.get("commands") or [])
+        ]
+        return result
 
     def snapshot(self) -> dict[str, Any]:
         state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
@@ -728,7 +739,7 @@ class FactoryStore:
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.lock:
             job = self.jobs.get(job_id)
-            return dict(job) if job else None
+            return self._public_job(job) if job else None
 
     def _update_job(self, job_id: str, **updates: Any) -> None:
         with self.lock:
@@ -992,9 +1003,10 @@ class FactoryStore:
         job = self.get_job(job_id)
         if not job:
             raise KeyError("job not found")
-        text = "\n".join(
+        raw_text = "\n".join(
             part for part in (str(job.get("stdout") or ""), str(job.get("stderr") or "")) if part
         )
+        text = sanitize_job_output(raw_text)
         safe_offset = max(0, int(offset))
         safe_limit = min(8000, max(1, int(limit)))
         return {

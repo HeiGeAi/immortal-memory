@@ -130,7 +130,7 @@ def test_system_evidence_uses_human_labels_and_local_times():
     assert 'memory_index: "记忆索引"' in system
     assert 'verified: "已经核验"' in system
     assert "formatTimestamp(content)" in system
-    assert "redactJobText" in system
+    assert "logs.text" in system
     assert "任务可能已经建立" in system
 
 

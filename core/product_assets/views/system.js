@@ -57,12 +57,6 @@ function node(tag, value = "", className = "") {
   return result;
 }
 
-function redactJobText(value) {
-  return String(value || "")
-    .replace(/(?:\/[\w.@%+~=-]+)+\/?/g, "[本机路径]")
-    .replace(/[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]*/g, "[本机路径]");
-}
-
 function flatten(value, prefix = "", result = []) {
   if (value && typeof value === "object") {
     Object.entries(value).forEach(([key, child]) => {
@@ -159,9 +153,9 @@ function openJob(jobId, trigger) {
     appendFact(details, "结束时间", formatTimestamp(job.finished_at));
     appendFact(details, "耗时", Number.isFinite(job.elapsed_seconds) ? `${job.elapsed_seconds} 秒` : "尚未结束");
     appendFact(details, "结果说明", job.summary);
-    appendFact(details, "失败原因", redactJobText(job.error || job.error_code));
+    appendFact(details, "失败原因", job.error || job.error_code);
     fragment.append(details, node("h3", "脱敏运行日志"));
-    const log = node("pre", redactJobText(logs.text) || "服务端尚未产生运行日志。", "context-markdown");
+    const log = node("pre", logs.text || "服务端尚未产生运行日志。", "context-markdown");
     fragment.append(log);
     body.replaceChildren(fragment);
   }).catch((error) => {
@@ -180,7 +174,7 @@ function jobCard(job) {
   card.append(node("p", `阶段：${currentStage(job)}`));
   card.append(node("p", `进度：${progressDescription(job)}`, "state-message"));
   if (job.summary) card.append(node("p", job.summary, "state-message"));
-  if (job.error || job.error_code) card.append(node("p", `失败原因：${redactJobText(job.error || job.error_code)}`, "error-text"));
+  if (job.error || job.error_code) card.append(node("p", `失败原因：${job.error || job.error_code}`, "error-text"));
   const actions = document.createElement("div");
   actions.className = "honest-actions";
   const detail = document.createElement("button");

@@ -15,6 +15,10 @@ from redact_common import redact
 _QUOTED_LOCAL_PATH = re.compile(
     r"(?P<quote>['\"])(?:/|~/|[A-Za-z]:\\)(?P<body>[^\r\n]*?)(?P=quote)"
 )
+_LOCAL_FILE_PATH = re.compile(
+    r"(?<![:/\w])(?:/|~/|[A-Za-z]:\\)(?:[^/\\\r\n]+[/\\])*"
+    r"[^/\\\r\n]*?\.[A-Za-z0-9]{1,12}"
+)
 _UNQUOTED_LOCAL_PATH = re.compile(
     r"(?<![:/\w])(?:/|~/|[A-Za-z]:\\)[^\s'\"<>|]+"
 )
@@ -22,6 +26,7 @@ _UNQUOTED_LOCAL_PATH = re.compile(
 
 def redact_local_paths(value: str) -> str:
     text = _QUOTED_LOCAL_PATH.sub("[本机路径]", str(value or ""))
+    text = _LOCAL_FILE_PATH.sub("[本机路径]", text)
     return _UNQUOTED_LOCAL_PATH.sub("[本机路径]", text)
 
 

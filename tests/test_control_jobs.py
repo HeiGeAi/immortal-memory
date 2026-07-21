@@ -85,13 +85,17 @@ def test_job_output_redacts_local_paths_but_preserves_urls_and_failure_meaning()
     output = sanitize_job_output(
         "$ python3 '/Users/name/含中文 目录/immortal.py' health\n"
         "failed at /var/folders/private/run.json with code 2\n"
+        "unquoted /Users/name/My Folder/run.json with code 3\n"
         "docs https://example.com/help\n"
     )
 
     assert "/Users/name" not in output
     assert "/var/folders" not in output
-    assert output.count("[本机路径]") == 2
+    assert "My Folder" not in output
+    assert "run.json" not in output
+    assert output.count("[本机路径]") == 3
     assert "with code 2" in output
+    assert "with code 3" in output
     assert "https://example.com/help" in output
 
 
