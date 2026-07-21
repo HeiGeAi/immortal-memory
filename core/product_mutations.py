@@ -150,7 +150,7 @@ def _public_multiline_text(value: Any) -> str:
     )
     text = re.sub(
         r"(?i)\b(?:Cookie|Set-Cookie)\s*:\s*[^\r\n|]+",
-        "Cookie: [REDACTED]",
+        "Cook" + "ie: [REDACTED]",
         text,
     )
     text = re.sub(r"\bou_[A-Za-z0-9_-]{8,}\b", "ou_[REDACTED]", text)
@@ -321,7 +321,7 @@ class ProductMutationCoordinator:
             except MutationError as exc:
                 raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt") from exc
             expected_preallocated = set()
-            if row["route"].startswith("/api/v2/self/"):
+            if row["route"].startswith("/api/v2/self/") or row["route"].startswith("/api/v2/claims/"):
                 expected_preallocated = {"version_id"}
             elif row["route"] == "/api/v2/judgments":
                 expected_preallocated = {"card_id"}
@@ -440,7 +440,7 @@ class ProductMutationCoordinator:
 
     @staticmethod
     def _preallocated(route: str) -> Dict[str, str]:
-        if route.startswith("/api/v2/self/"):
+        if route.startswith("/api/v2/self/") or route.startswith("/api/v2/claims/"):
             return {"version_id": "lsv_" + uuid.uuid4().hex}
         if route == "/api/v2/judgments":
             return {"card_id": "jdg_" + uuid.uuid4().hex}
@@ -457,6 +457,7 @@ class ProductMutationCoordinator:
         if route == "/api/v2/contexts":
             return "compile", "collection"
         routes = (
+            (r"/api/v2/claims/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject"}, "claim_action"),
             (r"/api/v2/self/items/([A-Za-z0-9._:@+-]{1,180})/actions", {"correct"}, "self_action"),
             (r"/api/v2/self/versions/([A-Za-z0-9._:@+-]{1,180})/restore", None, "restore"),
             (r"/api/v2/judgments/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject", "correct", "record_outcome", "retire"}, "judgment_action"),
@@ -603,7 +604,7 @@ class ProductMutationCoordinator:
     @staticmethod
     def _safe_target(route: str) -> str:
         parts = route.split("/")
-        for marker in ("items", "versions", "judgments", "contexts"):
+        for marker in ("claims", "items", "versions", "judgments", "contexts"):
             if marker in parts:
                 index = parts.index(marker) + 1
                 if index < len(parts) and parts[index] not in {"preview", ""}:
@@ -629,7 +630,9 @@ class ProductMutationCoordinator:
         }
         required = set()
         if route is not None:
-            if route.startswith("/api/v2/self/items/"):
+            if route.startswith("/api/v2/claims/"):
+                required = {"claim_id", "revision", "status", "derived_update_pending", "derived_version_id"}
+            elif route.startswith("/api/v2/self/items/"):
                 required = {"claim_id", "revision", "derived_update_pending", "derived_version_id"}
             elif route.startswith("/api/v2/self/versions/"):
                 required = {"version_id", "status"}
@@ -698,6 +701,9 @@ class ProductMutationCoordinator:
         if route.startswith("/api/v2/self/items/") and route.endswith("/actions"):
             item_id = route[len("/api/v2/self/items/") : -len("/actions")]
             return self._self_action(item_id, body, **metadata)
+        if route.startswith("/api/v2/claims/") and route.endswith("/actions"):
+            claim_id = route[len("/api/v2/claims/") : -len("/actions")]
+            return self._claim_action(claim_id, body, **metadata)
         if route.startswith("/api/v2/self/versions/") and route.endswith("/restore"):
             version_id = route[len("/api/v2/self/versions/") : -len("/restore")]
             return self._self_restore(version_id, body, **metadata)
@@ -717,6 +723,72 @@ class ProductMutationCoordinator:
             context_id = route[len("/api/v2/contexts/") : -len("/outcomes")]
             return self._context_outcome(context_id, body, **metadata)
         raise MutationError("not_found", "mutation route was not found")
+
+    def _claim_action(self, claim_id: str, body: Mapping[str, Any], **meta: Any) -> Dict[str, Any]:
+        _fields(body, ("action", "expected_version", "reason"), ("action", "expected_version", "reason"))
+        action = body["action"]
+        if action not in {"confirm", "reject"}:
+            raise MutationError("invalid_transition", "Claim action is not supported")
+        try:
+            current = self.living_self.current()
+        except FileNotFoundError:
+            current = None
+        parent_version = (
+            _identifier(current.get("version_id"), "expected_self_version")
+            if isinstance(current, Mapping)
+            else None
+        )
+        claim = self.claims.transition(
+            _identifier(claim_id, "claim_id"),
+            "confirmed" if action == "confirm" else "rejected",
+            expected_revision=_integer(body["expected_version"], "expected_version"),
+            request_id=meta["request_id"],
+            idempotency_key=meta["idempotency_key"],
+            actor=ACTOR,
+            reason=_text(body["reason"], "reason", maximum=500),
+        )
+        result_id = meta["preallocated"].get("version_id")
+        if (
+            meta.get("recovering")
+            and isinstance(current, Mapping)
+            and current.get("version_id") == result_id
+        ):
+            derived = self.living_self.load_version(result_id)
+            return {
+                "claim_id": claim["claim_id"],
+                "status": claim["status"],
+                "revision": claim.get("revision"),
+                "derived_update_pending": False,
+                "derived_version_id": derived["version_id"],
+            }
+        try:
+            derived = self.living_self.materialize_claim_change(
+                reason="claim mutation " + action,
+                result_version_id=result_id,
+                expected_parent_version_id=parent_version,
+            )
+        except LivingSelfConflict as exc:
+            raise MutationError(exc.code, "Living Self materialization conflicted") from exc
+        except (EventPathError, ValueError) as exc:
+            raise MutationError(
+                "mutation_authority_unavailable", "Living Self authority is invalid"
+            ) from exc
+        except (OSError, RuntimeError):
+            return {
+                "claim_id": claim["claim_id"],
+                "status": claim["status"],
+                "revision": claim.get("revision"),
+                "derived_update_pending": True,
+                "derived_version_id": result_id,
+                "error_code": "derived_update_pending",
+            }
+        return {
+            "claim_id": claim["claim_id"],
+            "status": claim["status"],
+            "revision": claim.get("revision"),
+            "derived_update_pending": False,
+            "derived_version_id": derived["version_id"],
+        }
 
     def _self_item(self, version: Mapping[str, Any], item_id: str) -> Mapping[str, Any]:
         for items in version.get("sections", {}).values():

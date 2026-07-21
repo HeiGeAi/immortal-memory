@@ -162,7 +162,21 @@ async function showContext(id, trigger, refresh) {
     if (detail.context_markdown) {
       const markdown = node("pre", detail.context_markdown, "context-markdown");
       markdown.setAttribute("aria-label", "实际交给 Agent 的 Context");
-      content.append(markdown);
+      const copy = node("button", "复制给 Agent", "secondary");
+      copy.type = "button";
+      const copyFeedback = node("p", "", "form-feedback");
+      copy.addEventListener("click", async () => {
+        pending(copy, true, "正在复制……", "复制给 Agent");
+        try {
+          await navigator.clipboard.writeText(detail.context_markdown);
+          copyFeedback.textContent = "已复制，尚未标记为已交给 Agent";
+          pending(copy, false, "正在复制……", "再次复制");
+        } catch (error) {
+          copyFeedback.textContent = "复制失败，请手动选择上方 Context";
+          pending(copy, false, "正在复制……", "再次尝试");
+        }
+      });
+      content.append(markdown, copy, copyFeedback);
     }
     if (detail.lifecycle_status === "compiled") {
       const consume = node("button", "标记为已交给 Agent");

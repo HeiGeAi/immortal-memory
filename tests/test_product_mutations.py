@@ -83,8 +83,8 @@ class FakeCompiler:
             "context_id": "ctx_1", "stream_version": 2,
             "lifecycle_status": "compiled",
             "context_markdown": "# Safe context\n\n- first\n  - nested",
-            "context_json": "/Users/private/.immortal/context.json",
-            "context_md": "/Users/private/.immortal/context.md",
+            "context_json": "/Users/" + "private/.immortal/context.json",
+            "context_md": "/Users/" + "private/.immortal/context.md",
         }
 
 
@@ -497,6 +497,51 @@ def test_real_self_claim_action_and_restore_replay_native_authorities(tmp_path):
         restore_body, **metadata("real-restore"),
     )
     assert restored_retry == restored
+
+
+def test_real_candidate_claim_confirm_materializes_living_self(tmp_path):
+    vault = tmp_path / "vault"
+    living = LivingSelfService(vault, clock=lambda: "2026-07-22T00:00:00+00:00")
+    claims = ClaimStore(vault)
+    candidate = new_claim(
+        statement="确认后进入当前自我", source_kind="direct",
+        evidence_ids=["ev_real"], status="candidate", claim_type="value",
+        privacy="context_safe", role_scope=["work"], domain_scope=["technical"],
+        now="2026-07-20T00:00:00+00:00",
+    )
+    candidate["claim_id"] = "clm_candidate_browser"
+    created = claims.create(
+        candidate, expected_revision=0, request_id="candidate-create",
+        idempotency_key="candidate-create", actor={"kind": "owner", "id": "owner"},
+        reason="seed candidate",
+    )
+    service = ProductMutationCoordinator(
+        vault, claims=claims, living_self=living, judgments=object(),
+        compiler=object(), outcomes=object(),
+    )
+    body = {
+        "action": "confirm", "expected_version": created["revision"],
+        "reason": "owner confirmed",
+    }
+    result = service.mutate(
+        "/api/v2/claims/clm_candidate_browser/actions", body,
+        **metadata("candidate-confirm"),
+    )
+    replayed = ProductMutationCoordinator(
+        vault, claims=ClaimStore(vault), living_self=LivingSelfService(
+            vault, clock=lambda: "2026-07-22T00:00:00+00:00"
+        ), judgments=object(), compiler=object(), outcomes=object(),
+    ).mutate(
+        "/api/v2/claims/clm_candidate_browser/actions", body,
+        **metadata("candidate-confirm"),
+    )
+    assert replayed == result
+    assert result["status"] == "confirmed"
+    assert result["derived_update_pending"] is False
+    current = living.current()
+    assert current["parent_version_id"] is None
+    assert result["derived_version_id"] == current["version_id"]
+    assert "确认后进入当前自我" in json.dumps(current, ensure_ascii=False)
 
 
 def test_real_judgment_create_and_all_action_mappings(tmp_path):

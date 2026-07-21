@@ -733,6 +733,21 @@ def test_trust_surfaces_bounded_evidence_gaps_privacy_and_candidates(tmp_path):
     assert "private-token" not in json.dumps(trust)
 
 
+def test_trust_does_not_mislabel_user_exclusion_as_privacy_policy(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    contexts = data.context_store.list()
+    for context in contexts:
+        context["privacy_policy"] = {
+            "excluded_count": 1,
+            "reasons": ["user_excluded"],
+        }
+    data.context_store.list = lambda: contexts
+
+    trust = data.trust()
+
+    assert trust["categories"]["privacy_exclusion"]["count"] == 0
+
+
 def test_system_delegates_to_existing_authoritative_probes(tmp_path):
     data, control, center = seeded_product_data(tmp_path)
     result = data.system()

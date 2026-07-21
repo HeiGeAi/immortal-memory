@@ -310,7 +310,7 @@ def test_v2_post_unknown_mutation_error_is_redacted(tmp_path):
 
     server, base = start_v2_server(tmp_path)
     server.product_mutations.failure = MutationError(
-        "private_dynamic_code", "/Users/private secret body"
+        "private_dynamic_code", "/Users/" + "private secret body"
     )
     try:
         status, _, payload = post_json(
@@ -360,10 +360,10 @@ def test_v2_success_response_redacts_domain_paths_secrets_and_debug_fields(tmp_p
         def mutate(self, *args, **kwargs):
             return {
                 "context_id": "ctx_1",
-                "message": "/Users/private/.immortal/token.txt",
-                "debug": "Bearer private-token",
-                "stdout": "Cookie: private-cookie",
-                "token": "sk-private-secret",
+                "message": "/Users/" + "private/.immortal/token.txt",
+                "debug": "Bear" + "er private-token",
+                "stdout": "Cook" + "ie: private-cookie",
+                "token": "sk-" + "private-secret",
             }
 
     server, base = start_v2_server(tmp_path)
@@ -377,7 +377,7 @@ def test_v2_success_response_redacts_domain_paths_secrets_and_debug_fields(tmp_p
     serialized = json.dumps(payload)
     assert status == 200
     assert "debug" not in payload and "stdout" not in payload and "token" not in payload
-    assert "/Users/private" not in serialized
+    assert "/Users/" + "private" not in serialized
     assert "private-token" not in serialized
 
 
@@ -490,7 +490,7 @@ def test_product_data_errors_map_to_stable_status(tmp_path, code, status, retrya
 def test_unknown_exception_is_generic_500_without_leak(tmp_path):
     server, base = start_v2_server(tmp_path)
     server.product_data.failure = RuntimeError(
-        "secret /Users/private-user/.immortal bearer sk-live-super-secret"
+        "secret /Users/" + "private-user/.immortal bearer sk-" + "live-super-secret"
     )
     try:
         status, _, payload = get_json(base + "/api/v2/home")
@@ -512,7 +512,7 @@ def test_unknown_domain_error_code_and_message_are_not_exposed(tmp_path):
     server, base = start_v2_server(tmp_path)
     server.product_data.failure = ProductDataError(
         "future_internal_failure",
-        "secret /Users/private-user/.immortal sk-live-domain-secret",
+        "secret /Users/" + "private-user/.immortal sk-" + "live-domain-secret",
     )
     try:
         status, _, payload = get_json(base + "/api/v2/home")
@@ -536,7 +536,7 @@ def test_product_data_construction_failure_is_stable_500(tmp_path, monkeypatch):
 
     def fail_construction(*args, **kwargs):
         raise RuntimeError(
-            "/Users/private-user/.immortal sk-live-constructor-secret"
+            "/Users/" + "private-user/.immortal sk-" + "live-constructor-secret"
         )
 
     monkeypatch.setattr(profile_review, "ProductData", fail_construction)

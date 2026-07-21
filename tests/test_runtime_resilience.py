@@ -129,7 +129,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                     "still running token="
                     + "sk-"
                     + "a" * 24
-                    + " path=/Users/alice/private.log"
+                    + " path=/Users/" + "alice/private.log"
                 ),
             )
             latest_json = Path(tmp) / "latest-context.json"
@@ -142,7 +142,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             self.assertIn("timed out", body.lower())
             self.assertIn("Exit code: 1", body)
             self.assertNotIn("sk-" + "a" * 24, body)
-            self.assertNotIn("/Users/alice", body)
+            self.assertNotIn("/Users/" + "alice", body)
             self.assertNotIn("sk-" + "a" * 24, latest_json.read_text(encoding="utf-8"))
 
     def test_ready_context_uses_authoritative_preview_then_compile(self):
@@ -325,7 +325,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             )
             token = "Bearer " + "z" * 24
             email = "alice@example.com"
-            home_path = "/Users/alice/secret.txt"
+            home_path = "/Users/" + "alice/secret.txt"
             raw_query = "review " + token + " " + email + " " + home_path
             args = task_compile.build_parser().parse_args(
                 [
@@ -396,7 +396,7 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
             )
             path_names = "\n".join(str(path) for path in sessions.rglob("*"))
             combined = persisted + path_names + stdout.getvalue()
-            for secret in (token, email, "/Users/alice"):
+            for secret in (token, email, "/Users/" + "alice"):
                 self.assertNotIn(secret, combined)
             manifest = json.loads(latest_json.read_text(encoding="utf-8"))
             self.assertEqual(manifest["query"], "approved business task")

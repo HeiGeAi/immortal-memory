@@ -372,3 +372,16 @@ def test_zip_symlink_member_is_rejected_and_target_scanned(tmp_path):
     assert secret_target not in dumped
     assert any(hit["rule"] == "aws_access_key" for hit in result["hits"])
     assert any(error["rule"] == "archive_non_regular_member" for error in result["errors"])
+
+
+def test_cli_scans_every_explicit_target(tmp_path, monkeypatch, capsys):
+    safe = tmp_path / "safe.txt"
+    unsafe = tmp_path / "unsafe.txt"
+    safe.write_text("safe", encoding="utf-8")
+    unsafe.write_text("AKIA" + "IOSFODNN7EXAMPLE", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["private_scan.py", str(safe), str(unsafe)])
+
+    assert private_scan.main() == 2
+    output = capsys.readouterr().out
+    assert "aws_access_key" in output
+    assert "IOSFODNN7EXAMPLE" not in output

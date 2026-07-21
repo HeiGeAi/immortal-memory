@@ -549,8 +549,6 @@ class ProductData:
                 claims=self.claim_store,
                 living_self=self.living_self,
                 judgments=self.judgment_store,
-                # Snapshot verification must not depend on the mutable evidence index.
-                evidence=object(),
                 context_store=self.context_store,
                 clock=self._clock,
             )
@@ -1523,6 +1521,7 @@ class ProductData:
                 "id": str(row.get("claim_id") or ""),
                 "summary": _compact_text(row.get("statement"), 240),
                 "status": _compact_text(row.get("status"), 40),
+                "revision": row.get("revision"),
             }
             for row in claims
             if row.get("status") == "candidate"
@@ -1533,6 +1532,7 @@ class ProductData:
                 "id": str(row.get("card_id") or ""),
                 "summary": _compact_text(row.get("title"), 240),
                 "status": _compact_text(row.get("status"), 40),
+                "revision": row.get("revision"),
             }
             for row in judgments
             if row.get("status") == "candidate"
@@ -1668,11 +1668,12 @@ class ProductData:
         for row in contexts:
             privacy = row.get("privacy_policy") if isinstance(row.get("privacy_policy"), Mapping) else {}
             count = int(privacy.get("excluded_count") or 0)
-            if count:
+            reasons = privacy.get("reasons") if isinstance(privacy.get("reasons"), list) else []
+            if count and "private" in reasons:
                 add(
                     "privacy_exclusion",
                     str(row.get("context_id") or row.get("preview_id") or ""),
-                    "上下文因隐私策略排除 %d 项" % count,
+                    "上下文包含按隐私策略排除的项目",
                     "info",
                 )
         try:

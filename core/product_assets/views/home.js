@@ -1,4 +1,5 @@
-import { api } from "../api.js";
+import { api, mutate, explainApiError, createMutationAttempt } from "../api.js";
+import { openDialog, closeDialog } from "../dialog.js";
 import { formatTimestamp } from "../format.js";
 
 function text(tag, value, className = "") {
@@ -6,6 +7,38 @@ function text(tag, value, className = "") {
   node.className = className;
   node.textContent = value;
   return node;
+}
+
+function reviewClaim(item, action, trigger, refresh) {
+  openDialog(action === "confirm" ? "确认这条理解" : "拒绝这条理解", (body) => {
+    const form = text("form", "", "action-form");
+    form.append(text("p", item.summary || item.id, "state-message"));
+    const label = text("label", "", "field-label");
+    label.append(text("span", "说明原因"));
+    const reason = document.createElement("textarea");
+    reason.name = "reason";
+    reason.required = true;
+    label.append(reason);
+    const submit = text("button", action === "confirm" ? "确认收录" : "确认拒绝");
+    submit.type = "submit";
+    const feedback = text("p", "", "form-feedback");
+    const attempt = createMutationAttempt();
+    form.append(label, submit, feedback);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      try {
+        const payload = { action, expected_version: item.revision, reason: reason.value };
+        await mutate(`/api/v2/claims/${encodeURIComponent(item.id)}/actions`, payload, attempt.options(payload));
+        closeDialog();
+        await refresh();
+      } catch (error) {
+        feedback.textContent = explainApiError(error);
+        submit.disabled = false;
+      }
+    });
+    body.append(form);
+  }, trigger);
 }
 
 export async function renderHome(root, { signal, isCurrent, navigate, updateHealth }) {
@@ -47,6 +80,26 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     fact("最近 Outcome", outcome.outcome_id ? "已记录" : "无", outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果");
     fact("系统连续性", health.status_label || health.status || "未知", `版本 ${health.version || "未知"} · 关注项 ${health.attention_count ?? "未知"}`);
     fragment.append(facts);
+    const claimConfirmations = confirmations.filter((item) => item.kind === "claim");
+    if (claimConfirmations.length) {
+      const review = text("section", "", "confirmation-list");
+      review.append(text("h2", "等待你确认的理解"), text("p", "只有你确认后，它才会进入 Living Self。", "state-message"));
+      claimConfirmations.forEach((item) => {
+        const card = text("article", "", "context-card confirmation-card");
+        card.append(text("p", item.summary || item.id));
+        const actions = text("div", "", "honest-actions");
+        const confirm = text("button", "确认收录");
+        confirm.type = "button";
+        confirm.addEventListener("click", () => reviewClaim(item, "confirm", confirm, () => navigate("home")));
+        const reject = text("button", "拒绝", "secondary");
+        reject.type = "button";
+        reject.addEventListener("click", () => reviewClaim(item, "reject", reject, () => navigate("home")));
+        actions.append(confirm, reject);
+        card.append(actions);
+        review.append(card);
+      });
+      fragment.append(review);
+    }
     const actions = document.createElement("div");
     actions.className = "honest-actions";
     const memoryButton = document.createElement("button");

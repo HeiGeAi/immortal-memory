@@ -178,6 +178,18 @@ def test_use_ui_has_preview_compile_consume_and_outcome_states():
     assert "window.confirm" not in page
     assert "window.prompt" not in page
     assert "innerHTML" not in page
+    assert "navigator.clipboard.writeText" in page
+    assert "已复制，尚未标记为已交给 Agent" in page
+    assert "标记为已交给 Agent" in page
+
+
+def test_home_ui_can_confirm_or_reject_candidate_claims():
+    home = (ASSETS / "views" / "home.js").read_text(encoding="utf-8")
+    assert "/api/v2/claims/" in home
+    assert "确认收录" in home
+    assert 'reviewClaim(item, "reject"' in home
+    assert "expected_version: item.revision" in home
+    assert "createMutationAttempt" in home
 
 
 def test_judgment_and_trust_are_real_and_coverage_honest():

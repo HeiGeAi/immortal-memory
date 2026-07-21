@@ -476,9 +476,9 @@ def scan_paths(
 
 
 def main() -> int:
-    root = Path(sys.argv[1] if len(sys.argv) > 1 else ".").resolve()
+    roots = [Path(value).resolve() for value in sys.argv[1:]] or [Path(".").resolve()]
     extra = [item.strip() for item in os.environ.get("IMMORTAL_PRIVATE_PATTERNS", "").split(",") if item.strip()]
-    result = scan_paths([root], extra)
+    result = scan_paths(roots, extra)
     findings = [*result["hits"], *result["errors"]]
     if findings:
         for finding in findings:

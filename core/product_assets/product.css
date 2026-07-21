@@ -124,8 +124,9 @@ dd { margin: 0; overflow-wrap: anywhere; }
   .shell { display: block; }
   .rail { position: static; width: 100%; height: auto; padding: 18px; border-right: 0; border-bottom: 1px solid var(--line); }
   .brand { margin-bottom: 14px; }
-  .rail nav { display: flex; overflow-x: auto; }
-  .nav-link { flex: 0 0 auto; gap: 12px; border-left: 0; border-bottom: 2px solid transparent; }
+  .rail nav { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; }
+  .nav-link { min-width: 0; justify-content: center; padding-inline: 6px; border-left: 0; border-bottom: 2px solid transparent; }
+  .nav-link small { display: none; }
   .nav-link[aria-current="page"] { border-bottom-color: var(--copper); }
   .rail-foot { display: none; }
   #main { padding: 22px 18px 52px; }

@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.0.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.1.0-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -27,12 +27,15 @@
 
 要让它说出像你会说的话、按你会做的判断去做事，只有一个办法：用**足够高密度的个人上下文**，把它从共识里硬拽出来。
 
-Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。它做四件事：
+Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。v1.1 用五个可追溯层完成这件事：
 
-1. **先把你正在丢失的数字痕迹接住。** 对话、文件、会议、聊天记录，先存下来，丢不了。
-2. **把这些原始痕迹蒸馏成可检索、有出处的记忆。** 每一条都能追回到源头。
-3. **任何本地 AI agent 干活之前，给它生成一份贴着当前任务的上下文包。**
-4. **需要重复某种行为时，直接编译出一个场景化的角色 agent。** 比如写稿审稿、商业顾问、项目操盘、会议分析。
+1. **Claim**：把原始痕迹变成带出处、作用域、归因和隐私标签的可纠正主张。
+2. **Living Self**：只用已确认 Claim 生成有版本的「当前自我」，旧版本永不原地覆盖。
+3. **Judgment**：保存情境、选择、结果和教训，不把一次选择夸大成永久原则。
+4. **Context**：按当前任务预览并编译有界上下文，用户能看到、排除和确认实际交给 Agent 的内容。
+5. **Outcome**：记录使用结果，让后续判断有真实反馈，而不是只有画像没有闭环。
+
+采集、检索和角色编译仍然存在，但它们围绕这五层工作。每次纠正都会保留旧 Claim，写入新的纠正事件，并生成新的 Living Self 版本，因此「系统现在怎么理解你」和「它为什么改变」都能追溯。
 
 ## 为什么不是再写一份长 prompt
 
@@ -114,6 +117,55 @@ immortal-memory agent-factory
 ```
 
 然后访问 http://127.0.0.1:8765/
+
+看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack；「信任」解释归因、隐私排除和纠正；「系统」展示采集、索引、备份、服务与版本健康。
+
+### 从 v1.0 做隔离迁移演练
+
+下面这组命令只完成隔离恢复和迁移演练，不会切换生产。不要直接在生产 vault 上试跑。先创建异盘备份并通过严格恢复校验，再把 v1.0 vault 恢复到独立 staging 目录。含无时区 Hermes 时间戳时，必须先准备经哈希绑定的私有时区合同，并把参数同时传给 staging 和 migration：
+
+```bash
+immortal-memory backup --vault-dir "$HOME/.immortal" --output-dir "/Volumes/IMMORTAL_BACKUP/immortal-v1.0"
+EXPORT_DIR="$(find "/Volumes/IMMORTAL_BACKUP/immortal-v1.0" -maxdepth 1 -type d -name 'immortal-export-*' | sort | tail -n 1)"
+immortal-memory restore-check "$EXPORT_DIR" --strict --json
+python3 core/export_restore.py restore-export "$EXPORT_DIR" "/tmp/immortal-v11-staging"
+TIMEZONE_CONTRACT="/absolute/path/to/hermes-timezone-contract.json"
+python3 core/export_restore.py stage-v11-index --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
+python3 core/export_restore.py v11-migrate --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
+```
+
+如果旧 `index.jsonl` 含无时区时间戳，`stage-v11-index` 会隔离无法证明时区的记录并拒绝生产切换。只有来源可信、权限为 `0600`、内容哈希匹配的 Hermes 时区合同才能通过 `--timezone-contract /absolute/path/to/contract.json` 提供证据。不要为了让门禁变绿而猜时区。
+
+这一步产生的 `index.staging.jsonl` 还不是已发布的 schema-v3 索引，不能紧接着把 staging 当成生产。正式切换必须走生产发布流程：从已合并 `main` 构建唯一 wheel，在隔离 vault 发布 staging source 并重建 schema-v3 SQLite，运行 `prewarm_index_verification`，再以 `v11_production_switch_gate` 绑定迁移报告、已发布 source、数据库 generation 和 receipt。只有 `production_switch_allowed=true` 才能运行模型阶段并安装同一 wheel 到真实环境；之后还要核对原始哈希、真实 API、浏览器、外置备份和 v1.0 回滚包。仓库目前故意没有提供绕过这些门禁的一键覆盖命令。
+
+v1.1 先派生、后切换，不改写 v1.0 原始文件。需要回滚时，停止 v1.1 服务，恢复 v1.0 安装包和 LaunchAgent，忽略 v1.1 新增派生目录，然后核对原始 vault 哈希并重新运行 v1.0 健康检查。
+
+### 生产健康与全新安装验收
+
+```bash
+immortal-memory daily-status
+immortal-memory backup-status --verify --max-age-hours 168 --json
+immortal-memory health --max-age-hours 72
+immortal-memory doctor
+immortal-memory preflight
+immortal-memory agent-context "release acceptance" --print
+```
+
+全新安装应在隔离的 `HOME` 中从 wheel 安装，执行 `init`、`train --smoke`、上述健康命令和一次 `agent-context`，确认没有借用旧机器的 vault 或配置。v1.0 的读取、健康检查、Agent Bridge 和旧 Control Center 在 v1.1 中保留一个版本周期；新目录是派生层，v1.0 可以安全忽略。
+
+```bash
+CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
+python3 -m venv "$CLEAN_HOME/venv"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.0-*.whl' | head -n 1)"
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" health --max-age-hours 72
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" preflight
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" agent-context "clean install acceptance" --print
+```
+
+空白 vault 尚未配置外置备份或每日调度时，`health` 和 `preflight` 应明确返回待配置项，不能假装健康；clean-install 验收关注命令可运行、状态诚实、数据只写入隔离 `HOME`。生产验收则要求前述健康命令全部通过。
 
 检索索引由每日采集编排中的 `index_db.py sync` 深度校验并同步。用户发起
 `recall` 时只读取已验证的 SQLite 索引和固定数量的水位元数据，不会临时扫描
@@ -206,12 +258,15 @@ There is a sharper problem underneath. A large model is wired to produce **confi
 
 To make it say what you would say and decide the way you would decide, there is only one move: push **high-density personal context** at it until it gets dragged out of the consensus prior.
 
-Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. It does four things:
+Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. v1.1 implements five traceable layers:
 
-1. **Catch your digital traces before they are lost.** Conversations, files, meetings, chat logs, all captured into a recoverable vault.
-2. **Distill raw traces into searchable, evidence-backed memory.** Every memory points back to its source.
-3. **Generate a task-local context pack** for any local agent before it starts work.
-4. **Compile scenario role agents** when you need a behavior on repeat: writing reviewer, business advisor, project operator, meeting analyst.
+1. **Claim** turns source traces into correctable assertions with evidence, scope, attribution, and privacy labels.
+2. **Living Self** builds a versioned current model from confirmed Claims without overwriting history.
+3. **Judgment** preserves situation, choice, result, and lesson without turning one decision into a universal rule.
+4. **Context** previews and compiles a bounded task pack so the user can inspect and exclude what an Agent will receive.
+5. **Outcome** records what happened after use, closing the loop with real feedback.
+
+Collection, retrieval, and role compilation remain, but now operate around these five layers. A correction preserves the old Claim, appends a correction event, and produces a new Living Self version, so every change remains explainable.
 
 ## Why not just write a longer prompt
 
@@ -274,6 +329,8 @@ immortal-memory agent-factory
 ```
 
 Then visit http://127.0.0.1:8765/
+
+The dashboard has seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. v1.0 reading paths, health checks, Agent Bridge, and the legacy Control Center remain compatible for one release cycle. See [Architecture](./docs/ARCHITECTURE.md), [Product](./docs/PRODUCT.md), and [Privacy](./docs/PRIVACY.md) for migration, rollback, health, and privacy contracts.
 
 ## How other agents use it
 

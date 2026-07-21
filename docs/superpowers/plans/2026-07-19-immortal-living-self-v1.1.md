@@ -3504,8 +3504,19 @@ Completion evidence recorded 2026-07-22:
 - Modify: `docs/PRIVACY.md`
 - Modify: `docs/ROADMAP.md`
 - Modify: `tests/test_version.py`
+- Modify: `core/product_assets/product.css`
+- Modify: `core/product_assets/views/home.js`
+- Modify: `core/product_assets/views/contexts.js`
+- Modify: `core/product_data.py`
+- Modify: `core/product_mutations.py`
+- Modify: `scripts/private_scan.py`
+- Modify: `tests/regression_p0.py`
+- Modify: `tests/test_private_scan_release_artifacts.py`
+- Modify: `tests/test_product_mutations.py`
+- Modify: `tests/test_product_ui_v2.py`
+- Modify: synthetic redaction fixtures in security tests
 
-- [ ] **Step 1: Add failing version and documentation tests**
+- [x] **Step 1: Add failing version and documentation tests**
 
 ```python
 def test_release_version_is_consistent():
@@ -3548,7 +3559,7 @@ It then:
 17. verifies CSP lacks `unsafe-inline` and responses use `Cache-Control: no-store`;
 18. records API response timing.
 
-- [ ] **Step 2: Run and confirm red**
+- [x] **Step 2: Run and confirm red**
 
 ```bash
 PYTHONPATH=core python3 -m pytest tests/test_version.py -q
@@ -3557,7 +3568,7 @@ python3 tests/browser_v11_acceptance.py
 
 Expected: version remains 1.0.0 and browser test exposes incomplete flows until Step 3.
 
-- [ ] **Step 3: Complete docs, browser flow, and version bump**
+- [x] **Step 3: Complete docs, browser flow, and version bump**
 
 Set:
 
@@ -3591,7 +3602,7 @@ initial JSON < 1MB
 
 If the test machine cannot sustain the target, capture actual timings and fix query/read-model behavior. Do not weaken thresholds without an evidence-backed spec amendment.
 
-- [ ] **Step 4: Run full pre-production verification**
+- [x] **Step 4: Run full pre-production verification**
 
 ```bash
 PYTHONPATH=core python3 -m pytest -q
@@ -3611,7 +3622,24 @@ Expected:
 - `private_scan=ok`;
 - no diff errors.
 
-- [ ] **Step 5: Commit**
+Final Task 19 evidence on 2026-07-22:
+
+- full pytest: 1220 passed in 72.03 seconds;
+- legacy P0: 8/8;
+- Living Self P0: 10/10;
+- real browser: seven modules, Claim confirm and correction, Living Self restore,
+  Context exclusion, copy without consume, explicit consume, Outcome, Trust changes,
+  service restart persistence, desktop, mobile, initial focus, focus trap, reduced
+  motion, CSP, and no-store all passed with zero console errors;
+- 470,000-row loopback HTTP P95 in milliseconds: home 2.061, memory list 1.692,
+  memory detail 0.915, self 1.131, Context preview 9.171;
+- recursive workspace, complete Git target list, and new browser file privacy scans:
+  `private_scan=ok`;
+- independent first review was Not Ready; all five P1 findings and four P2 findings
+  were repaired; a second review found the zero-baseline first Claim path, which
+  was also repaired. Third review: Ready, no remaining P0/P1.
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add \

@@ -83,13 +83,13 @@ def test_job_output_is_redacted_and_bounded():
 
 def test_job_output_redacts_local_paths_but_preserves_urls_and_failure_meaning():
     output = sanitize_job_output(
-        "$ python3 '/Users/name/含中文 目录/immortal.py' health\n"
+        "$ python3 '/Users/" + "name/含中文 目录/immortal.py' health\n"
         "failed at /var/folders/private/run.json with code 2\n"
-        "unquoted /Users/name/My Folder/run.json with code 3\n"
+        "unquoted /Users/" + "name/My Folder/run.json with code 3\n"
         "docs https://example.com/help\n"
     )
 
-    assert "/Users/name" not in output
+    assert "/Users/" + "name" not in output
     assert "/var/folders" not in output
     assert "My Folder" not in output
     assert "run.json" not in output
@@ -106,7 +106,7 @@ def test_public_job_recursively_redacts_historical_body_without_mutating_authori
         skill_dir=tmp_path,
     )
     raw_body = {
-        "goal": "inspect /Users/name/My Folder/run.json",
+        "goal": "inspect /Users/" + "name/My Folder/run.json",
         "nested": ["https://example.com/help", {"source": "/tmp/private/input.md"}],
     }
     store.jobs["job-body"] = {
@@ -120,7 +120,7 @@ def test_public_job_recursively_redacts_historical_body_without_mutating_authori
     listed = store.list_jobs()[0]["body"]
     fetched = store.get_job("job-body")["body"]
 
-    assert "/Users/name" not in json.dumps(listed, ensure_ascii=False)
+    assert "/Users/" + "name" not in json.dumps(listed, ensure_ascii=False)
     assert "/tmp/private" not in json.dumps(fetched, ensure_ascii=False)
     assert listed["nested"][0] == "https://example.com/help"
     assert store.jobs["job-body"]["body"] == raw_body

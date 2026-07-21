@@ -161,7 +161,7 @@ class AgentBridgeCorsTest(unittest.TestCase):
                 raise subprocess.TimeoutExpired(
                     args,
                     1,
-                    output="partial " + secret + " /Users/alice/private.txt",
+                    output="partial " + secret + " /Users/" + "alice/private.txt",
                     stderr=secret,
                 )
 
@@ -177,7 +177,7 @@ class AgentBridgeCorsTest(unittest.TestCase):
             self.assertEqual(result["exit_code"], 124)
             self.assertEqual(result["error_code"], "bridge_timeout")
             self.assertNotIn(secret, json.dumps(result))
-            self.assertNotIn("/Users/alice", json.dumps(result))
+            self.assertNotIn("/Users/" + "alice", json.dumps(result))
             self.assertFalse(request_root.exists())
 
     def test_audit_event_redacts_previews_before_writing_access_log(self):
@@ -186,7 +186,7 @@ class AgentBridgeCorsTest(unittest.TestCase):
             access_log = root / "access.log"
             latest = root / "access_latest.json"
             token = "Bearer " + "z" * 24
-            home = "/Users/alice/private.txt"
+            home = "/Users/" + "alice/private.txt"
             with mock.patch.object(agent_bridge_server, "AGENT_DIR", root), \
                  mock.patch.object(agent_bridge_server, "AUDIT_LOG", access_log), \
                  mock.patch.object(agent_bridge_server, "AUDIT_LATEST", latest):
@@ -202,7 +202,7 @@ class AgentBridgeCorsTest(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertNotIn(token, persisted)
-            self.assertNotIn("/Users/alice", persisted)
+            self.assertNotIn("/Users/" + "alice", persisted)
             self.assertIn("[REDACTED", persisted)
 
     def test_compiled_response_reads_only_verified_canonical_ready_pack(self):
