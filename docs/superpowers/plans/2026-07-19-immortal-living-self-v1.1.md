@@ -3190,6 +3190,13 @@ switch blocked. Never guess UTC or the host timezone silently. Tests must cover
 both an evidence-backed conversion and the fail-closed quarantine path, while
 proving that raw source bytes remain unchanged.
 
+The production migration must also prewarm the schema-v3 index verification
+receipt after the final staging database is published and before the dashboard
+is switched on. The receipt is valid only for the exact source, main database,
+WAL/SHM, schema, metadata generation, and validation version. Measure both the
+full first-generation verification and a fresh-process receipt hit. A missing,
+stale, corrupt, over-permissive, or symlinked receipt keeps the switch blocked.
+
 **Files:**
 - Modify: `core/export_restore.py`
 - Modify: `core/orchestrator.py`
