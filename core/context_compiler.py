@@ -1002,7 +1002,11 @@ class ContextCompiler:
             mode = resolved_mode
         elif resolved_mode is not None and resolved_mode != mode:
             raise ContextCompilerError(
-                "invalid_context_mode",
+                (
+                    "resolved_mode_conflict"
+                    if record["lifecycle_status"] == "compiled"
+                    else "invalid_context_mode"
+                ),
                 "resolved mode conflicts with the approved preview",
             )
         if (
@@ -1084,6 +1088,7 @@ class ContextCompiler:
             try:
                 compiled = self.context_store.begin_compile(
                     preview_id,
+                    approved_mode=mode,
                     preview_hash=preview_hash,
                     source_revision=record["source_revision"],
                     excluded_item_ids=excluded,
@@ -1099,6 +1104,7 @@ class ContextCompiler:
                 winner = self.context_store.get(preview_id)
                 if (
                     winner["lifecycle_status"] != "compiled"
+                    or winner["mode"] != mode
                     or winner["preview_hash"] != preview_hash
                     or winner["source_revision"] != record["source_revision"]
                     or winner["selection"]["excluded_item_ids"] != excluded

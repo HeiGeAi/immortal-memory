@@ -61,6 +61,7 @@ def create_preview(store, *, suffix="one", ttl_seconds=300, selected=("item_1",)
 def compile_preview(store, preview, *, suffix="one"):
     return store.begin_compile(
         preview["preview_id"],
+        approved_mode=preview["mode"],
         preview_hash=preview["preview_hash"],
         source_revision=preview["source_revision"],
         excluded_item_ids=[],
@@ -153,6 +154,7 @@ def test_compile_rejects_stale_or_invalid_preview_inputs(tmp_path, field):
     with pytest.raises(ContextStoreError) as failure:
         store.begin_compile(
             preview["preview_id"],
+            approved_mode=preview["mode"],
             expected_version=1,
             request_id="req_stale_" + field,
             idempotency_key="idem_stale_" + field,
@@ -235,6 +237,7 @@ def test_illegal_lifecycle_and_revision_conflicts_fail_closed(tmp_path):
     with pytest.raises(ContextStoreError) as revision:
         store.begin_compile(
             preview["preview_id"],
+            approved_mode=preview["mode"],
             preview_hash=preview["preview_hash"],
             source_revision=preview["source_revision"],
             excluded_item_ids=[],
@@ -300,6 +303,60 @@ def test_replay_rejects_record_that_does_not_match_authority_intent(tmp_path):
     event["payload"]["record"]["selection"]["selected_item_ids"].append("forged")
     store.events.path.write_text(
         json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    store.current_path.unlink()
+
+    with pytest.raises(EventCorruption) as failure:
+        ContextStore(tmp_path, clock=Clock())
+    assert failure.value.code == "invalid_context_event"
+
+
+@pytest.mark.parametrize("tamper", ["operation", "record"])
+def test_replay_rejects_compiled_resolved_mode_tampering(tmp_path, tamper):
+    from context_store import ContextStore
+    from event_store import EventCorruption
+
+    store = ContextStore(tmp_path, clock=Clock())
+    preview = store.create_preview(
+        task="评审技术方案",
+        mode="auto",
+        source_revision=SOURCE_REVISION,
+        sections=sections("item_1"),
+        privacy_policy={"excluded_count": 0, "reasons": []},
+        ttl_seconds=300,
+        expected_version=0,
+        request_id="req_auto_preview",
+        idempotency_key="idem_auto_preview",
+        actor=ACTOR,
+        reason="auto preview",
+    )
+    store.begin_compile(
+        preview["preview_id"],
+        approved_mode="reviewer",
+        preview_hash=preview["preview_hash"],
+        source_revision=preview["source_revision"],
+        excluded_item_ids=[],
+        expected_version=1,
+        request_id="req_auto_compile",
+        idempotency_key="idem_auto_compile",
+        actor=ACTOR,
+        reason="reviewer approved",
+    )
+    events = [
+        json.loads(line)
+        for line in store.events.path.read_text(encoding="utf-8").splitlines()
+    ]
+    if tamper == "operation":
+        events[1]["payload"]["operation"]["approved_mode"] = "writer"
+    else:
+        events[1]["payload"]["record"]["mode"] = "writer"
+    store.events.path.write_text(
+        "\n".join(
+            json.dumps(event, ensure_ascii=False, sort_keys=True)
+            for event in events
+        )
+        + "\n",
         encoding="utf-8",
     )
     store.current_path.unlink()

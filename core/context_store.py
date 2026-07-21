@@ -502,7 +502,12 @@ class ContextStore:
         base_fields = {"actor", "expected_version", "identifier", "method", "reason"}
         expected_fields = (
             base_fields
-            | {"preview_hash", "source_revision", "excluded_item_ids"}
+            | {
+                "approved_mode",
+                "preview_hash",
+                "source_revision",
+                "excluded_item_ids",
+            }
             if method == "begin_compile"
             else base_fields
         )
@@ -532,9 +537,16 @@ class ContextStore:
         record = cls._event_record(event)
         if method == "begin_compile":
             excluded = operation["excluded_item_ids"]
+            approved_mode = operation["approved_mode"]
             if (
                 operation["preview_hash"] != previous["preview_hash"]
                 or operation["source_revision"] != previous["source_revision"]
+                or approved_mode not in CONTEXT_MODES
+                or approved_mode == "auto"
+                or (
+                    previous["mode"] != "auto"
+                    and approved_mode != previous["mode"]
+                )
                 or not isinstance(excluded, list)
                 or excluded != sorted(excluded)
                 or not set(excluded).issubset(
@@ -549,6 +561,7 @@ class ContextStore:
             selection = dict(previous["selection"])
             selection["excluded_item_ids"] = excluded
             expected["selection"] = selection
+            expected["mode"] = approved_mode
             expected["context_id"] = record["context_id"]
             expected["compiled_at"] = event["occurred_at"]
         elif method == "consume":
@@ -1032,6 +1045,7 @@ class ContextStore:
         self,
         preview_id: str,
         *,
+        approved_mode: str,
         preview_hash: str,
         source_revision: Mapping[str, Any],
         excluded_item_ids: List[str],
@@ -1052,6 +1066,7 @@ class ContextStore:
             idempotency_key=idempotency_key,
             actor=actor,
             reason=reason,
+            approved_mode=approved_mode,
             preview_hash=preview_hash,
             source_revision=source_revision,
             excluded_item_ids=excluded_item_ids,
@@ -1116,6 +1131,7 @@ class ContextStore:
         idempotency_key: str,
         actor: Mapping[str, str],
         reason: str,
+        approved_mode: Optional[str] = None,
         preview_hash: Optional[str] = None,
         source_revision: Optional[Mapping[str, Any]] = None,
         excluded_item_ids: Optional[List[str]] = None,
@@ -1139,6 +1155,7 @@ class ContextStore:
             operation.update(
                 {
                     "preview_hash": preview_hash,
+                    "approved_mode": approved_mode,
                     "source_revision": dict(source_revision or {}),
                     "excluded_item_ids": list(excluded_item_ids or []),
                 }
@@ -1159,6 +1176,18 @@ class ContextStore:
         if method == "begin_compile":
             self._verify_preview_cache(current)
             try:
+                if (
+                    approved_mode not in CONTEXT_MODES
+                    or approved_mode == "auto"
+                    or (
+                        current["mode"] != "auto"
+                        and approved_mode != current["mode"]
+                    )
+                ):
+                    raise ContextStoreError(
+                        "resolved_mode_conflict",
+                        "approved mode does not match the reviewed preview",
+                    )
                 supplied_revision = _source_revision(source_revision)
                 excluded = sorted(_string_list(excluded_item_ids, "excluded_item_ids"))
             except ContextStoreError as exc:
@@ -1184,6 +1213,7 @@ class ContextStore:
             selection = dict(updated["selection"])
             selection["excluded_item_ids"] = excluded
             updated["selection"] = selection
+            updated["mode"] = str(approved_mode)
             updated["context_id"] = _identifier("ctx_")
             updated["compiled_at"] = now.isoformat()
         elif method == "consume":

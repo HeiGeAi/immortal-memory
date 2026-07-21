@@ -747,6 +747,72 @@ def test_auto_requires_resolution_and_markdown_has_exact_trust_labels(tmp_path):
     assert compiled["lifecycle_status"] == "compiled"
 
 
+def test_auto_resolved_mode_is_authoritative_across_publish_failure_and_retry(
+    tmp_path, monkeypatch
+):
+    from context_compiler import ContextCompilerError
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    auto = instance.preview(
+        "评审客户技术方案",
+        mode="auto",
+        role_scope=["work"],
+        domain_scope=["technical"],
+        request_id="req_auto_mode_binding",
+        idempotency_key="idem_auto_mode_binding",
+        actor=ACTOR,
+    )
+    original = instance._publish_pack
+    attempts = {"count": 0}
+
+    def fail_publication_once(pack, markdown):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("injected mode publication failure")
+        return original(pack, markdown)
+
+    monkeypatch.setattr(instance, "_publish_pack", fail_publication_once)
+    with pytest.raises(ContextCompilerError) as first:
+        compile_preview(
+            instance,
+            auto,
+            suffix="mode-first",
+            resolved_mode="reviewer",
+        )
+    assert first.value.code == "pack_publish_failed"
+    committed = instance.context_store.get(auto["preview_id"])
+    assert committed["mode"] == "reviewer"
+
+    with pytest.raises(ContextCompilerError) as changed:
+        compile_preview(
+            instance,
+            auto,
+            suffix="mode-changed",
+            resolved_mode="writer",
+        )
+    assert changed.value.code == "resolved_mode_conflict"
+
+    repaired = compile_preview(
+        instance,
+        auto,
+        suffix="mode-repair",
+        resolved_mode="reviewer",
+    )
+    before = Path(repaired["context_json"]).read_bytes()
+    with pytest.raises(ContextCompilerError) as overwrite:
+        compile_preview(
+            instance,
+            auto,
+            suffix="mode-overwrite",
+            resolved_mode="writer",
+        )
+    assert overwrite.value.code == "resolved_mode_conflict"
+    assert Path(repaired["context_json"]).read_bytes() == before
+
+
 def test_pack_staging_and_event_failures_are_not_distributable(tmp_path):
     from context_compiler import ContextCompilerError
 
