@@ -35,12 +35,14 @@ from judgment_store import JudgmentStore
 from living_self_service import LivingSelfConflict, LivingSelfService
 from outcome_store import OutcomeStore
 from product_data import _compact_text
+from redact_common import redact
 
 
 LEDGER_SCHEMA = 1
 MAX_LEDGER_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES = 512
 MAX_AUDIT = 1024
+MAX_PUBLIC_MULTILINE_CHARS = 256 * 1024
 ID_RE = re.compile(r"\A[A-Za-z0-9._:@+-]{1,180}\Z")
 HASH_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 ACTOR = {"kind": "owner", "id": "local-owner"}
@@ -104,6 +106,62 @@ def _valid_time(value: Any) -> bool:
     except ValueError:
         return False
     return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _strict_json(text: str) -> Any:
+    def unique_object(pairs: Sequence[Any]) -> Dict[str, Any]:
+        value: Dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(_value: str) -> Any:
+        raise ValueError("non-standard JSON constant")
+
+    return json.loads(
+        text,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
+def _public_multiline_text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise MutationError("mutation_failed", "mutation response is invalid")
+    text = redact(value)
+    text = re.sub(
+        r"-{5}BEGIN ([A-Z0-9 ]*PRIVATE KEY)-{5}.*?"
+        r"-{5}END \1-{5}",
+        "[REDACTED_PRIVATE_KEY]",
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"(?i)(https?://)[^/@\s|]+:[^@\s|]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{8,}",
+        "Bearer [REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:Cookie|Set-Cookie)\s*:\s*[^\r\n|]+",
+        "Cookie: [REDACTED]",
+        text,
+    )
+    text = re.sub(r"\bou_[A-Za-z0-9_-]{8,}\b", "ou_[REDACTED]", text)
+    text = re.sub(
+        r"(?<![A-Za-z0-9])/(?:Users|home)/[^\s|]+",
+        "/[HOME]/[REDACTED]",
+        text,
+    )
+    if len(text) > MAX_PUBLIC_MULTILINE_CHARS:
+        return text[: MAX_PUBLIC_MULTILINE_CHARS - 3] + "..."
+    return text
 
 
 def _identifier(value: Any, field: str) -> str:
@@ -219,8 +277,8 @@ class ProductMutationCoordinator:
         if len(text.encode("utf-8")) > MAX_LEDGER_BYTES:
             raise MutationError("mutation_authority_unavailable", "mutation ledger is too large")
         try:
-            value = json.loads(text)
-        except json.JSONDecodeError as exc:
+            value = _strict_json(text)
+        except (json.JSONDecodeError, ValueError) as exc:
             raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt") from exc
         if (
             not isinstance(value, dict)
@@ -273,11 +331,58 @@ class ProductMutationCoordinator:
                 prefix = "lsv_" if key == "version_id" else "jdg_"
                 if not isinstance(identifier, str) or not re.fullmatch(prefix + r"[0-9a-f]{32}", identifier):
                     raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt")
-            try:
-                if row["status"] == "completed" or row["result"]:
-                    self._safe_result(row["result"], route=row["route"])
-            except MutationError as exc:
-                raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt") from exc
+            status = row["status"]
+            error_code = row["error_code"]
+            completed_at = row["completed_at"]
+            result = row["result"]
+            if status == "pending":
+                valid_state = (
+                    completed_at is None
+                    and (
+                        (error_code is None and result == {})
+                        or (
+                            error_code == "derived_update_pending"
+                            and result != {}
+                        )
+                    )
+                )
+            elif status == "completed":
+                valid_state = completed_at is not None and error_code is None
+            else:
+                valid_state = (
+                    completed_at is not None
+                    and error_code not in {None, "derived_update_pending"}
+                    and result == {}
+                )
+            if not valid_state:
+                raise MutationError(
+                    "mutation_authority_unavailable", "mutation ledger is corrupt"
+                )
+            if result:
+                try:
+                    safe_result = self._safe_result(result, route=row["route"])
+                except MutationError as exc:
+                    raise MutationError(
+                        "mutation_authority_unavailable", "mutation ledger is corrupt"
+                    ) from exc
+                if status == "pending" and (
+                    safe_result.get("derived_update_pending") is not True
+                    or safe_result.get("error_code") != "derived_update_pending"
+                ):
+                    raise MutationError(
+                        "mutation_authority_unavailable", "mutation ledger is corrupt"
+                    )
+                if (
+                    status == "completed"
+                    and safe_result.get("derived_update_pending") is True
+                ):
+                    raise MutationError(
+                        "mutation_authority_unavailable", "mutation ledger is corrupt"
+                    )
+            elif status == "completed":
+                raise MutationError(
+                    "mutation_authority_unavailable", "mutation ledger is corrupt"
+                )
         for row in value["audit"]:
             if (
                 not isinstance(row, dict)
@@ -297,6 +402,17 @@ class ProductMutationCoordinator:
                 raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt") from exc
             if action != row["action"] or target != row["target"]:
                 raise MutationError("mutation_authority_unavailable", "mutation ledger is corrupt")
+            if (
+                (row["status"] == "pending" and row["error_code"] != "derived_update_pending")
+                or (row["status"] == "completed" and row["error_code"] is not None)
+                or (
+                    row["status"] == "failed"
+                    and row["error_code"] in {None, "derived_update_pending"}
+                )
+            ):
+                raise MutationError(
+                    "mutation_authority_unavailable", "mutation ledger is corrupt"
+                )
         return value
 
     def _write_ledger(self, ledger: Dict[str, Any]) -> None:
@@ -563,7 +679,10 @@ class ProductMutationCoordinator:
                     or lowered.endswith(("_path", "_command", "_args", "_token", "_cookie"))
                 ):
                     continue
-                public[name] = cls._public_result(value, depth + 1)
+                if lowered == "context_markdown":
+                    public[name] = _public_multiline_text(value)
+                else:
+                    public[name] = cls._public_result(value, depth + 1)
             return public
         if isinstance(result, list):
             return [cls._public_result(value, depth + 1) for value in result[:500]]

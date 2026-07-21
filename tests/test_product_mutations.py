@@ -81,7 +81,8 @@ class FakeCompiler:
     def compile(self, **kwargs):
         return {
             "context_id": "ctx_1", "stream_version": 2,
-            "lifecycle_status": "compiled", "context_markdown": "# Safe context",
+            "lifecycle_status": "compiled",
+            "context_markdown": "# Safe context\n\n- first\n  - nested",
             "context_json": "/Users/private/.immortal/context.json",
             "context_md": "/Users/private/.immortal/context.md",
         }
@@ -258,6 +259,43 @@ def test_derived_pending_is_recovered_instead_of_cached_completed(tmp_path):
     assert len(living.calls) == 2
 
 
+def test_pending_prepare_is_readable_and_recoverable_after_restart(tmp_path):
+    service, _claims, living = coordinator(tmp_path)
+    body = {
+        "action": "correct", "claim_id": "clm_1",
+        "expected_self_version": living.current()["version_id"],
+        "expected_version": 1, "reason": "test", "statement": "corrected",
+    }
+    original = service._dispatch
+
+    def crash_before_domain(*args, **kwargs):
+        raise RuntimeError("simulated crash after intent prepare")
+
+    service._dispatch = crash_before_domain
+    with pytest.raises(RuntimeError, match="intent prepare"):
+        service.mutate(
+            "/api/v2/self/items/self_1/actions",
+            body,
+            **metadata("prepared-restart"),
+        )
+    service._dispatch = original
+
+    restarted = ProductMutationCoordinator(
+        tmp_path,
+        claims=service.claims,
+        living_self=service.living_self,
+        judgments=object(),
+        compiler=object(),
+        outcomes=object(),
+    )
+    result = restarted.mutate(
+        "/api/v2/self/items/self_1/actions",
+        body,
+        **metadata("prepared-restart"),
+    )
+    assert result["derived_update_pending"] is False
+
+
 def test_untrusted_route_action_and_result_never_reach_ledger(tmp_path):
     service, _claims, living = coordinator(tmp_path)
     private = "private statement must never be audited"
@@ -300,6 +338,48 @@ def test_corrupt_completed_entry_is_not_trusted(tmp_path):
     with pytest.raises(MutationError) as caught:
         service.mutate(
             "/api/v2/self/items/self_1/actions", body, **metadata("corrupt-key")
+        )
+    assert caught.value.code == "mutation_authority_unavailable"
+
+
+@pytest.mark.parametrize("corruption", ("duplicate_key", "nan", "bad_state"))
+def test_ledger_rejects_ambiguous_json_and_invalid_state_combinations(
+    tmp_path, corruption
+):
+    service, _claims, living = coordinator(tmp_path)
+    body = {
+        "action": "correct", "claim_id": "clm_1",
+        "expected_self_version": living.current()["version_id"],
+        "expected_version": 1, "reason": "test", "statement": "corrected",
+    }
+    service.mutate(
+        "/api/v2/self/items/self_1/actions",
+        body,
+        **metadata("strict-ledger"),
+    )
+    path = tmp_path / "runtime" / "idempotency.json"
+    if corruption == "duplicate_key":
+        text = path.read_text()
+        text = text.replace(
+            '"schema_version":1',
+            '"schema_version":1,"schema_version":1',
+            1,
+        )
+        path.write_text(text)
+    else:
+        value = json.loads(path.read_text())
+        if corruption == "nan":
+            value["entries"][0]["result"]["revision"] = float("nan")
+        else:
+            value["entries"][0]["completed_at"] = None
+        path.write_text(json.dumps(value, allow_nan=True))
+    os.chmod(path, 0o600)
+
+    with pytest.raises(MutationError) as caught:
+        service.mutate(
+            "/api/v2/self/items/self_1/actions",
+            body,
+            **metadata("strict-ledger"),
         )
     assert caught.value.code == "mutation_authority_unavailable"
 
@@ -358,7 +438,7 @@ def test_context_completed_replay_preserves_public_response_without_paths(tmp_pa
         compiler=compiler, outcomes=object(),
     ).mutate("/api/v2/contexts", compile_body, **metadata("compile-restart"))
     assert replayed == compiled
-    assert replayed["context_markdown"] == "# Safe context"
+    assert replayed["context_markdown"] == "# Safe context\n\n- first\n  - nested"
     assert "context_json" not in replayed
     assert "context_md" not in replayed
 
