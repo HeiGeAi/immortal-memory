@@ -65,6 +65,7 @@ RECORD_FIELDS = {
     "outcome_recorded_at",
     "outcome_id",
     "outcome_hash",
+    "pack_snapshot_hash",
     "based_on_event_seq",
     "stream_version",
 }
@@ -347,6 +348,8 @@ class ContextStore:
                 )
             record["outcome_id"] = None
             record["outcome_hash"] = None
+        if "pack_snapshot_hash" not in record:
+            record["pack_snapshot_hash"] = None
         return record
 
     @staticmethod
@@ -430,6 +433,13 @@ class ContextStore:
                     raise ContextStoreError(
                         "invalid_outcome_link", "outcome linkage is invalid"
                     )
+            if (
+                record["pack_snapshot_hash"] is not None
+                and not _is_hash(record["pack_snapshot_hash"])
+            ):
+                raise ContextStoreError(
+                    "invalid_pack_snapshot", "pack snapshot hash is invalid"
+                )
         except ContextStoreError as exc:
             raise cls._corruption(event, str(exc)) from exc
         cls._validate_selection(record["selection"], event)
@@ -521,6 +531,7 @@ class ContextStore:
             "outcome_recorded_at": None,
             "outcome_id": None,
             "outcome_hash": None,
+            "pack_snapshot_hash": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -542,6 +553,8 @@ class ContextStore:
                 "source_revision",
                 "excluded_item_ids",
             }
+            if "pack_snapshot_hash" in operation:
+                expected_fields.add("pack_snapshot_hash")
         elif method == "mark_outcome_recorded":
             expected_fields = base_fields | {"outcome_id", "outcome_hash"}
         else:
@@ -599,6 +612,10 @@ class ContextStore:
             expected["mode"] = approved_mode
             expected["context_id"] = record["context_id"]
             expected["compiled_at"] = event["occurred_at"]
+            if "pack_snapshot_hash" in operation:
+                if not _is_hash(operation["pack_snapshot_hash"]):
+                    raise cls._corruption(event, "pack snapshot authority is invalid")
+                expected["pack_snapshot_hash"] = operation["pack_snapshot_hash"]
         elif method == "consume":
             expected["consumed_at"] = event["occurred_at"]
         elif method == "mark_outcome_recorded":
@@ -738,6 +755,33 @@ class ContextStore:
     def list(self) -> List[Dict[str, Any]]:
         current = self._ensure_current()
         return [self._dynamic(current[key]) for key in sorted(current)]
+
+    def outcome_linkage_authority(self, context_id: str) -> Dict[str, Any]:
+        """Return bounded audit metadata for the committed outcome transition."""
+        record = self.get(context_id)
+        if record["lifecycle_status"] != "outcome_recorded":
+            raise ContextStoreError(
+                "invalid_transition", "context does not have a committed outcome"
+            )
+        rows = self.events.read_stream(record["preview_id"])
+        matches = [
+            row for row in rows if row["event_type"] == "context.outcome_recorded"
+        ]
+        if len(matches) != 1:
+            raise ContextStoreError(
+                "invalid_context_event", "outcome linkage authority is ambiguous"
+            )
+        event = matches[0]
+        operation = event["payload"]["operation"]
+        return {
+            "actor": dict(event["actor"]),
+            "idempotency_key": event["idempotency_key"],
+            "occurred_at": event["occurred_at"],
+            "outcome_hash": operation["outcome_hash"],
+            "outcome_id": operation["outcome_id"],
+            "reason": operation["reason"],
+            "request_id": event["request_id"],
+        }
 
     @staticmethod
     def _metadata(
@@ -1070,6 +1114,7 @@ class ContextStore:
             "outcome_recorded_at": None,
             "outcome_id": None,
             "outcome_hash": None,
+            "pack_snapshot_hash": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -1102,6 +1147,7 @@ class ContextStore:
         idempotency_key: str,
         actor: Mapping[str, str],
         reason: str,
+        pack_snapshot_hash: str,
     ) -> Dict[str, Any]:
         return self._transition(
             preview_id,
@@ -1114,6 +1160,7 @@ class ContextStore:
             idempotency_key=idempotency_key,
             actor=actor,
             reason=reason,
+            pack_snapshot_hash=pack_snapshot_hash,
             approved_mode=approved_mode,
             preview_hash=preview_hash,
             source_revision=source_revision,
@@ -1189,6 +1236,7 @@ class ContextStore:
         excluded_item_ids: Optional[List[str]] = None,
         outcome_id: Optional[str] = None,
         outcome_hash: Optional[str] = None,
+        pack_snapshot_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         current = self.get(identifier)
         expected, request, idem, actor_value, why = self._metadata(
@@ -1212,6 +1260,7 @@ class ContextStore:
                     "approved_mode": approved_mode,
                     "source_revision": dict(source_revision or {}),
                     "excluded_item_ids": list(excluded_item_ids or []),
+                    "pack_snapshot_hash": pack_snapshot_hash,
                 }
             )
         elif method == "mark_outcome_recorded":
@@ -1251,6 +1300,10 @@ class ContextStore:
                     )
                 supplied_revision = _source_revision(source_revision)
                 excluded = sorted(_string_list(excluded_item_ids, "excluded_item_ids"))
+                if not _is_hash(pack_snapshot_hash):
+                    raise ContextStoreError(
+                        "invalid_pack_snapshot", "pack snapshot hash is invalid"
+                    )
             except ContextStoreError as exc:
                 raise ContextStoreError("stale_preview", str(exc)) from exc
             selected = set(current["selection"]["selected_item_ids"])
@@ -1287,6 +1340,7 @@ class ContextStore:
             updated["mode"] = str(approved_mode)
             updated["context_id"] = _identifier("ctx_")
             updated["compiled_at"] = now.isoformat()
+            updated["pack_snapshot_hash"] = pack_snapshot_hash
         elif method == "consume":
             updated["consumed_at"] = now.isoformat()
         else:

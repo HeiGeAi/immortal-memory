@@ -70,6 +70,7 @@ def compile_preview(store, preview, *, suffix="one"):
         idempotency_key="idem_compile_" + suffix,
         actor=ACTOR,
         reason="preview approved",
+        pack_snapshot_hash="sha256:" + "a" * 64,
     )
 
 
@@ -143,6 +144,7 @@ def test_compile_rejects_stale_or_invalid_preview_inputs(tmp_path, field):
         "preview_hash": preview["preview_hash"],
         "source_revision": preview["source_revision"],
         "excluded_item_ids": [],
+        "pack_snapshot_hash": "sha256:" + "a" * 64,
     }
     if field == "preview_hash":
         kwargs[field] = "sha256:" + "0" * 64
@@ -218,6 +220,9 @@ def test_legacy_compiled_and_consumed_events_replay_with_empty_outcome_link(tmp_
         event = json.loads(raw)
         event["payload"]["record"].pop("outcome_id")
         event["payload"]["record"].pop("outcome_hash")
+        event["payload"]["record"].pop("pack_snapshot_hash")
+        if event["event_type"] == "context.compiled":
+            event["payload"]["operation"].pop("pack_snapshot_hash")
         rows.append(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     store.events.path.write_text("\n".join(rows) + "\n", encoding="utf-8")
     store.current_path.unlink()
@@ -227,6 +232,7 @@ def test_legacy_compiled_and_consumed_events_replay_with_empty_outcome_link(tmp_
     assert replayed["lifecycle_status"] == "consumed"
     assert replayed["outcome_id"] is None
     assert replayed["outcome_hash"] is None
+    assert replayed["pack_snapshot_hash"] is None
 
 
 def test_expired_compiled_context_cannot_be_consumed(tmp_path):
@@ -278,6 +284,7 @@ def test_illegal_lifecycle_and_revision_conflicts_fail_closed(tmp_path):
             idempotency_key="idem_revision",
             actor=ACTOR,
             reason="wrong revision",
+            pack_snapshot_hash="sha256:" + "a" * 64,
         )
     assert revision.value.code == "version_conflict"
 
@@ -374,6 +381,7 @@ def test_replay_rejects_compiled_resolved_mode_tampering(tmp_path, tamper):
         idempotency_key="idem_auto_compile",
         actor=ACTOR,
         reason="reviewer approved",
+        pack_snapshot_hash="sha256:" + "a" * 64,
     )
     events = [
         json.loads(line)

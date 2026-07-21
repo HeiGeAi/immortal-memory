@@ -80,6 +80,25 @@ def _seed_compiled(vault, *, expires_at="2099-07-21T09:00:00+00:00"):
         actor=ACTOR,
         reason="创建预览",
     )
+    pack = new_context_pack(
+        task="验证任务",
+        mode="reviewer",
+        living_self_version=SOURCE_REVISION["living_self_version"],
+        lifecycle_status="compiled",
+        availability_status="active",
+        max_chars=24_000,
+        max_bytes=96_000,
+        claims_event_seq=1,
+        judgments_event_seq=1,
+        compiler_version="1.1.0",
+        policy_version=1,
+        preview_hash=preview["preview_hash"],
+        sections=sections,
+        now=preview["generated_at"],
+        expires_at=expires_at,
+    )
+    pack["provenance"] = ContextCompiler._provenance(sections)
+    pack = ContextCompiler._rehash_pack(pack)
     compiled = contexts.begin_compile(
         preview["preview_id"],
         approved_mode="reviewer",
@@ -91,23 +110,7 @@ def _seed_compiled(vault, *, expires_at="2099-07-21T09:00:00+00:00"):
         idempotency_key="idem_compile",
         actor=ACTOR,
         reason="批准预览",
-    )
-    pack = new_context_pack(
-        task="验证任务",
-        mode="reviewer",
-        living_self_version=SOURCE_REVISION["living_self_version"],
-        lifecycle_status="compiled",
-        availability_status="active",
-        max_chars=24_000,
-        max_bytes=256_000,
-        claims_event_seq=1,
-        judgments_event_seq=1,
-        compiler_version="1.1.0",
-        policy_version=1,
-        preview_hash=preview["preview_hash"],
-        sections=sections,
-        now=preview["generated_at"],
-        expires_at=expires_at,
+        pack_snapshot_hash=ContextCompiler._snapshot_hash(pack),
     )
     pack["context_id"] = compiled["context_id"]
     pack = ContextCompiler._rehash_pack(pack)
@@ -303,6 +306,92 @@ def test_same_key_different_intent_conflicts_without_second_event(tmp_path):
     assert store.events.watermark() == 1
 
 
+def test_wrong_context_version_never_appends_and_correct_retry_can_commit(tmp_path):
+    from outcome_store import OutcomeStoreError
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+
+    with pytest.raises(OutcomeStoreError) as failure:
+        _record(
+            store,
+            compiled,
+            expected_version=999,
+            idempotency_key="idem_wrong_version",
+        )
+    assert failure.value.code == "version_conflict"
+    assert not store.events.exists()
+
+    committed = _record(
+        store,
+        compiled,
+        idempotency_key="idem_correct_version",
+    )
+    assert store.get(compiled["context_id"])["outcome_id"] == committed["outcome_id"]
+
+
+def test_historical_wrong_version_orphan_does_not_block_correct_intent(tmp_path):
+    from model_types import new_event, new_outcome_event
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    orphan = new_outcome_event(
+        context_id=compiled["context_id"],
+        adopted="no",
+        result="negative",
+        summary="历史错误版本孤儿",
+        now="2099-07-21T08:00:00+00:00",
+    )
+    orphan_operation = store._operation(
+        context_id=compiled["context_id"],
+        adopted="no",
+        result="negative",
+        summary="历史错误版本孤儿",
+        confirmed_refs=[],
+        challenged_refs=[],
+        expected_version=999,
+        actor=ACTOR,
+        reason="旧实现先写事件",
+    )
+    store.events.append(
+        new_event(
+            event_type="outcome.recorded",
+            stream_id=compiled["context_id"],
+            stream_version=1,
+            request_id="req_historical_orphan",
+            idempotency_key=store._public_key("idem_historical_orphan"),
+            actor=ACTOR,
+            expected_version=0,
+            payload={"operation": orphan_operation, "outcome": orphan},
+            previous_status=None,
+            now=orphan["created_at"],
+        )
+    )
+
+    committed = _record(
+        store,
+        compiled,
+        idempotency_key="idem_correct_after_orphan",
+    )
+
+    assert committed["outcome_id"] != orphan["outcome_id"]
+    assert store.get(compiled["context_id"])["outcome_id"] == committed["outcome_id"]
+    assert store.events.watermark() == 2
+
+
+def test_consume_and_outcome_can_reuse_public_idempotency_key(tmp_path):
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled, key="shared")
+
+    committed = _record(store, compiled, idempotency_key="shared")
+
+    assert store.get(compiled["context_id"])["outcome_id"] == committed["outcome_id"]
+    assert store.events.watermark() == 1
+
+
 def test_concurrent_same_key_converges_to_one_committed_outcome(tmp_path):
     from outcome_store import OutcomeStore
 
@@ -388,6 +477,54 @@ def test_context_linkage_without_matching_event_fails_closed(tmp_path):
     with pytest.raises(OutcomeStoreError) as failure:
         store.get(compiled["context_id"])
     assert failure.value.code == "outcome_event_corruption"
+
+
+def test_context_linkage_digest_covers_event_actor_reason_and_request(tmp_path):
+    from outcome_store import OutcomeStoreError
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    _record(store, compiled)
+    event = json.loads(store.events.path.read_text(encoding="utf-8"))
+    changed_actor = {"kind": "system", "id": "attacker"}
+    event["actor"] = changed_actor
+    event["payload"]["operation"]["actor"] = changed_actor
+    event["payload"]["operation"]["reason"] = "rewritten audit reason"
+    event["request_id"] = "req_rewritten"
+    store.events.path.write_text(
+        json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(OutcomeStoreError) as failure:
+        store.get(compiled["context_id"])
+    assert failure.value.code == "outcome_uncommitted"
+
+
+def test_cross_stream_audit_rejects_rewritten_context_actor_and_reason(tmp_path):
+    from outcome_store import OutcomeStoreError
+
+    contexts, compiled, _pack = _seed_compiled(tmp_path)
+    store = _outcome_store(tmp_path, contexts)
+    _consume(store, compiled)
+    _record(store, compiled)
+    rows = contexts.events.path.read_text(encoding="utf-8").splitlines()
+    event = json.loads(rows[-1])
+    changed_actor = {"kind": "system", "id": "attacker"}
+    event["actor"] = changed_actor
+    event["payload"]["operation"]["actor"] = changed_actor
+    event["payload"]["operation"]["reason"] = "rewritten context audit"
+    event["payload"]["reason"] = "rewritten context audit"
+    rows[-1] = json.dumps(
+        event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    contexts.events.path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    with pytest.raises(OutcomeStoreError) as failure:
+        store.get(compiled["context_id"])
+    assert failure.value.code == "outcome_link_conflict"
 
 
 def test_context_link_without_outcome_event_is_not_exposed(tmp_path):

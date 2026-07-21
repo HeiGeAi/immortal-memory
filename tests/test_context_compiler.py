@@ -625,6 +625,67 @@ def test_consumed_snapshot_verifier_does_not_relax_agent_delivery_gate(tmp_path)
     assert delivery.value.code == "stale_context"
 
 
+def test_consumed_snapshot_remains_verifiable_after_preview_cache_cleanup(tmp_path):
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    result = preview(instance)
+    compiled = compile_preview(instance, result)
+    instance.context_store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_consume_cleanup",
+        idempotency_key="idem_consume_cleanup",
+        actor=ACTOR,
+        reason="Agent receipt",
+    )
+    (instance.context_store.previews_dir / (result["preview_id"] + ".json")).unlink()
+
+    snapshot = instance.load_outcome_snapshot(compiled["context_id"])
+
+    assert snapshot["content_hash"] == compiled["content_hash"]
+
+
+def test_legacy_consumed_snapshot_uses_preview_authority_fallback(tmp_path):
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    instance.context_store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_consume_legacy_anchor",
+        idempotency_key="idem_consume_legacy_anchor",
+        actor=ACTOR,
+        reason="Agent receipt",
+    )
+    rows = []
+    for raw in instance.context_store.events.path.read_text(
+        encoding="utf-8"
+    ).splitlines():
+        event = json.loads(raw)
+        event["payload"]["record"].pop("pack_snapshot_hash")
+        if event["event_type"] == "context.compiled":
+            event["payload"]["operation"].pop("pack_snapshot_hash")
+        rows.append(
+            json.dumps(
+                event,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    instance.context_store.events.path.write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+
+    snapshot = instance.load_outcome_snapshot(compiled["context_id"])
+
+    assert snapshot["content_hash"] == compiled["content_hash"]
+
+
 def test_outcome_snapshot_rejects_valid_republished_pack_with_unapproved_item(tmp_path):
     from context_compiler import ContextCompilerError
 
@@ -651,6 +712,54 @@ def test_outcome_snapshot_rejects_valid_republished_pack_with_unapproved_item(tm
         for section, items in tampered["sections"].items()
     }
     tampered["sections"]["verified_facts"][0]["id"] = "clm_evil"
+    tampered = instance._rehash_pack(tampered)
+    instance._publish_pack(tampered, instance._render_markdown(tampered))
+
+    with pytest.raises(ContextCompilerError) as failure:
+        instance.load_outcome_snapshot(compiled["context_id"])
+    assert failure.value.code == "context_not_ready"
+
+
+def test_outcome_snapshot_rejects_rehashed_revision_and_summary_rewrite(tmp_path):
+    from context_compiler import ContextCompilerError, _serialized_size
+
+    instance = compiler(
+        tmp_path,
+        claims=[claim("clm_fact", "客户技术方案需要可回滚")],
+    )
+    compiled = compile_preview(instance, preview(instance))
+    instance.context_store.consume(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_consume_rewrite",
+        idempotency_key="idem_consume_rewrite",
+        actor=ACTOR,
+        reason="Agent receipt",
+    )
+    tampered = {
+        key: value
+        for key, value in compiled.items()
+        if key
+        not in {
+            "context_json",
+            "context_md",
+            "context_markdown",
+            "context_markdown_hash",
+        }
+    }
+    tampered["sections"] = {
+        section: [dict(item) for item in items]
+        for section, items in tampered["sections"].items()
+    }
+    item = tampered["sections"]["verified_facts"][0]
+    item["revision"] += 1
+    item["summary"] = "攻击者改写后的内容"
+    used_chars, used_bytes = _serialized_size(tampered["sections"])
+    tampered["budget"] = {
+        **tampered["budget"],
+        "used_chars": used_chars,
+        "used_bytes": used_bytes,
+    }
     tampered = instance._rehash_pack(tampered)
     instance._publish_pack(tampered, instance._render_markdown(tampered))
 

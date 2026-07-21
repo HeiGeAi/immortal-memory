@@ -235,8 +235,9 @@ class OutcomeStore:
         try:
             if (
                 event["event_type"] != "outcome.recorded"
-                or event["expected_version"] != 0
-                or event["stream_version"] != 1
+                or not isinstance(event["stream_version"], int)
+                or event["stream_version"] < 1
+                or event["expected_version"] != event["stream_version"] - 1
                 or event["previous_status"] is not None
                 or set(event["payload"]) != {"operation", "outcome"}
             ):
@@ -316,11 +317,57 @@ class OutcomeStore:
         for row in rows:
             outcome, operation = self._decode_event(row)
             decoded.append({"event": row, "outcome": outcome, "operation": operation})
-        if len(decoded) > 1:
-            raise OutcomeStoreError(
-                "outcome_event_corruption", "a Context has multiple outcome events"
-            )
         return decoded
+
+    @staticmethod
+    def _event_hash(event: Mapping[str, Any]) -> str:
+        return _hash(event)
+
+    @classmethod
+    def _binding_metadata(
+        cls, event: Mapping[str, Any], outcome_id: str
+    ) -> Tuple[str, str, str]:
+        event_hash = cls._event_hash(event)
+        digest = hashlib.sha256(
+            (event_hash + ":" + outcome_id).encode("utf-8")
+        ).hexdigest()
+        return (
+            event_hash,
+            "req_outcome_bind_" + digest[:32],
+            "outcome-bind:v1:" + digest,
+        )
+
+    def _verify_binding(
+        self,
+        context: Mapping[str, Any],
+        row: Mapping[str, Any],
+    ) -> None:
+        outcome = row["outcome"]
+        event_hash, bind_request, bind_key = self._binding_metadata(
+            row["event"], outcome["outcome_id"]
+        )
+        try:
+            authority = self.contexts.outcome_linkage_authority(
+                outcome["context_id"]
+            )
+        except ContextStoreError as exc:
+            raise OutcomeStoreError(exc.code, str(exc)) from exc
+        if (
+            context["lifecycle_status"] != "outcome_recorded"
+            or context["outcome_id"] != outcome["outcome_id"]
+            or context["outcome_hash"] != event_hash
+            or authority["outcome_id"] != outcome["outcome_id"]
+            or authority["outcome_hash"] != event_hash
+            or authority["actor"] != row["operation"]["actor"]
+            or authority["reason"] != row["operation"]["reason"]
+            or authority["request_id"] != bind_request
+            or authority["idempotency_key"]
+            != self.contexts._public_key(bind_key)
+            or authority["occurred_at"] != context["outcome_recorded_at"]
+        ):
+            raise OutcomeStoreError(
+                "outcome_link_conflict", "cross-stream outcome authority does not match"
+            )
 
     def _find_idempotent(
         self, idempotency_key: str, operation: Mapping[str, Any]
@@ -415,50 +462,62 @@ class OutcomeStore:
             actor=actor_value,
             reason=safe_reason,
         )
-        prior = self._find_idempotent(idem, operation)
         current = self.context(context_id)
-        if prior is None:
-            if current["lifecycle_status"] != "consumed":
-                prior = self._find_idempotent(idem, operation)
-                if prior is None:
-                    raise OutcomeStoreError(
-                        "invalid_transition", "context must be consumed before outcome"
-                    )
-        if prior is None:
-            existing = self._events_for_context(context_id)
-            if existing:
-                prior = self._find_idempotent(idem, operation)
-                if prior is None:
-                    raise OutcomeStoreError(
-                        "outcome_conflict", "context already has an outcome event"
-                    )
-        if prior is None:
+        prior = self._find_idempotent(idem, operation)
+        if current["lifecycle_status"] == "outcome_recorded":
+            if prior is None:
+                raise OutcomeStoreError(
+                    "outcome_conflict", "context already has a committed outcome"
+                )
+            self._verify_binding(current, prior)
             try:
-                pack = self.compiler.load_outcome_snapshot(context_id)
+                self.compiler.load_outcome_snapshot(context_id)
             except ContextCompilerError as exc:
                 raise OutcomeStoreError(exc.code, str(exc)) from exc
-            try:
-                provisional = new_outcome_event(
-                    context_id=context_id,
-                    adopted=adopted,
-                    result=result,
-                    summary=safe_summary,
-                    confirmed_refs=confirmed,
-                    challenged_refs=challenged,
-                    now=self._now(),
+            return dict(prior["outcome"])
+        if current["lifecycle_status"] != "consumed":
+            raise OutcomeStoreError(
+                "invalid_transition", "context must be consumed before outcome"
+            )
+        if current["stream_version"] != expected:
+            raise OutcomeStoreError("version_conflict", "context version changed")
+        try:
+            pack = self.compiler.load_outcome_snapshot(context_id)
+        except ContextCompilerError as exc:
+            raise OutcomeStoreError(exc.code, str(exc)) from exc
+        self._validate_refs(pack, confirmed, challenged)
+        try:
+            provisional = new_outcome_event(
+                context_id=context_id,
+                adopted=adopted,
+                result=result,
+                summary=safe_summary,
+                confirmed_refs=confirmed,
+                challenged_refs=challenged,
+                now=self._now(),
+            )
+            validate_outcome_event(provisional)
+        except ModelValidationError as exc:
+            raise OutcomeStoreError(exc.code, str(exc)) from exc
+        existing = self._events_for_context(context_id)
+        if prior is None:
+            if any(
+                row["operation"]["context_expected_version"] == expected
+                for row in existing
+            ):
+                raise OutcomeStoreError(
+                    "outcome_conflict",
+                    "context has an unresolved outcome with a valid version",
                 )
-                validate_outcome_event(provisional)
-            except ModelValidationError as exc:
-                raise OutcomeStoreError(exc.code, str(exc)) from exc
-            self._validate_refs(pack, confirmed, challenged)
+            outcome_stream_version = len(existing) + 1
             envelope = new_event(
                 event_type="outcome.recorded",
                 stream_id=context_id,
-                stream_version=1,
+                stream_version=outcome_stream_version,
                 request_id=request,
                 idempotency_key=self._public_key(idem),
                 actor=actor_value,
-                expected_version=0,
+                expected_version=outcome_stream_version - 1,
                 payload={"operation": operation, "outcome": provisional},
                 previous_status=None,
                 now=provisional["created_at"],
@@ -470,6 +529,10 @@ class OutcomeStore:
                     prior = self._find_idempotent(idem, operation)
                     if prior is None:
                         raise OutcomeStoreError(exc.code, str(exc)) from exc
+                elif exc.code == "version_conflict":
+                    raise OutcomeStoreError(
+                        "outcome_conflict", "a concurrent outcome won"
+                    ) from exc
                 else:
                     raise OutcomeStoreError(exc.code, str(exc)) from exc
             else:
@@ -481,15 +544,17 @@ class OutcomeStore:
                 }
         assert prior is not None
         outcome = prior["outcome"]
-        outcome_hash = _hash(outcome)
+        outcome_hash, bind_request, bind_key = self._binding_metadata(
+            prior["event"], outcome["outcome_id"]
+        )
         current = self.context(context_id)
         if current["lifecycle_status"] == "consumed":
             try:
                 self.contexts.mark_outcome_recorded(
                     context_id,
                     expected_version=expected,
-                    request_id=request,
-                    idempotency_key=idem,
+                    request_id=bind_request,
+                    idempotency_key=bind_key,
                     actor=actor_value,
                     reason=safe_reason,
                     outcome_id=outcome["outcome_id"],
@@ -498,14 +563,7 @@ class OutcomeStore:
             except ContextStoreError as exc:
                 raise OutcomeStoreError(exc.code, str(exc)) from exc
         committed = self.context(context_id)
-        if (
-            committed["lifecycle_status"] != "outcome_recorded"
-            or committed["outcome_id"] != outcome["outcome_id"]
-            or committed["outcome_hash"] != outcome_hash
-        ):
-            raise OutcomeStoreError(
-                "outcome_link_conflict", "Context outcome linkage does not match"
-            )
+        self._verify_binding(committed, prior)
         try:
             self.compiler.load_outcome_snapshot(context_id)
         except ContextCompilerError as exc:
@@ -514,23 +572,41 @@ class OutcomeStore:
 
     def get(self, context_id: str) -> Dict[str, Any]:
         rows = self._events_for_context(context_id)
+        context = self.context(context_id)
         if not rows:
-            context = self.context(context_id)
             if context["lifecycle_status"] == "outcome_recorded":
                 raise OutcomeStoreError(
                     "outcome_link_missing", "Context links to a missing outcome event"
                 )
             raise OutcomeStoreError("outcome_not_found", "outcome was not found")
-        outcome = rows[0]["outcome"]
-        context = self.context(context_id)
-        if (
-            context["lifecycle_status"] != "outcome_recorded"
-            or context["outcome_id"] != outcome["outcome_id"]
-            or context["outcome_hash"] != _hash(outcome)
-        ):
+        if context["lifecycle_status"] != "outcome_recorded":
             raise OutcomeStoreError(
                 "outcome_uncommitted", "outcome linkage is incomplete or mismatched"
             )
+        linked = [
+            row
+            for row in rows
+            if row["outcome"]["outcome_id"] == context["outcome_id"]
+            and self._event_hash(row["event"]) == context["outcome_hash"]
+        ]
+        if not linked:
+            if any(
+                row["outcome"]["outcome_id"] == context["outcome_id"]
+                for row in rows
+            ):
+                raise OutcomeStoreError(
+                    "outcome_uncommitted",
+                    "outcome event authority does not match Context linkage",
+                )
+            raise OutcomeStoreError(
+                "outcome_link_missing", "Context links to a missing outcome event"
+            )
+        if len(linked) != 1:
+            raise OutcomeStoreError(
+                "outcome_event_corruption", "Context linkage is ambiguous"
+            )
+        self._verify_binding(context, linked[0])
+        outcome = linked[0]["outcome"]
         try:
             self.compiler.load_outcome_snapshot(context_id)
         except ContextCompilerError as exc:
@@ -550,9 +626,7 @@ class OutcomeStore:
             outcome, _operation = self._decode_event(row)
             context_id = outcome["context_id"]
             if context_id in seen:
-                raise OutcomeStoreError(
-                    "outcome_event_corruption", "a Context has multiple outcomes"
-                )
+                continue
             seen.add(context_id)
             try:
                 result.append(self.get(context_id))

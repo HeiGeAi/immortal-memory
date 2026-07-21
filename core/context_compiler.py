@@ -225,6 +225,21 @@ class ContextCompiler:
         return value
 
     @staticmethod
+    def _snapshot_hash(pack: Mapping[str, Any]) -> str:
+        authority = {
+            key: value
+            for key, value in pack.items()
+            if key not in {"context_id", "content_hash"}
+        }
+        encoded = json.dumps(
+            authority,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
     def _provenance(
         sections: Mapping[str, List[Mapping[str, Any]]]
     ) -> Dict[str, List[str]]:
@@ -1074,6 +1089,7 @@ class ContextCompiler:
             excluded_item_ids=excluded,
             context_id="ctx_pending",
         )
+        pack_snapshot_hash = self._snapshot_hash(template)
         try:
             stage_path = self._stage_pack(
                 preview_id=preview_id,
@@ -1097,6 +1113,7 @@ class ContextCompiler:
                     idempotency_key=idempotency_key,
                     actor=actor,
                     reason=_safe_summary(reason),
+                    pack_snapshot_hash=pack_snapshot_hash,
                 )
             except ContextStoreError as exc:
                 if exc.code != "version_conflict":
@@ -1108,6 +1125,7 @@ class ContextCompiler:
                     or winner["preview_hash"] != preview_hash
                     or winner["source_revision"] != record["source_revision"]
                     or winner["selection"]["excluded_item_ids"] != excluded
+                    or winner["pack_snapshot_hash"] != pack_snapshot_hash
                 ):
                     raise ContextCompilerError(exc.code, str(exc)) from exc
                 compiled = winner
@@ -1223,6 +1241,49 @@ class ContextCompiler:
         if actual_sections != expected_sections:
             raise ContextCompilerError(
                 "context_not_ready", "compiled pack items do not match approval"
+            )
+        if record["pack_snapshot_hash"] is not None:
+            authority_matches = (
+                self._snapshot_hash(pack) == record["pack_snapshot_hash"]
+            )
+        else:
+            try:
+                preview_body = self.context_store.load_preview_body(
+                    record["preview_id"], record["preview_hash"]
+                )
+            except ContextStoreError as exc:
+                raise ContextCompilerError(
+                    "context_not_ready", "compiled pack authority is unavailable"
+                ) from exc
+            expected_bodies = {
+                section: [
+                    dict(item)
+                    for item in preview_body["sections"][section]
+                    if item["id"] not in excluded
+                ]
+                for section in CONTEXT_SECTIONS
+            }
+            expected_privacy = dict(record["privacy_policy"])
+            expected_privacy["excluded_count"] = (
+                int(expected_privacy["excluded_count"]) + len(excluded)
+            )
+            expected_privacy["reasons"] = sorted(
+                set(expected_privacy["reasons"])
+                | ({"user_excluded"} if excluded else set())
+            )
+            authority_matches = (
+                pack["sections"] == expected_bodies
+                and pack["provenance"] == self._provenance(expected_bodies)
+                and pack["privacy_policy"] == expected_privacy
+                and pack["budget"]["max_chars"]
+                == preview_body["compile_policy"]["max_chars"]
+                and pack["budget"]["max_bytes"]
+                == preview_body["compile_policy"]["max_bytes"]
+            )
+        if not authority_matches:
+            raise ContextCompilerError(
+                "context_not_ready",
+                "compiled pack content does not match immutable preview authority",
             )
         return {
             **pack,
