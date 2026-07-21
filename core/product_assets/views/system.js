@@ -1,4 +1,28 @@
 import { api } from "../api.js";
+import { formatTimestamp } from "../format.js";
+
+const LABELS = {
+  status: "状态",
+  status_label: "状态说明",
+  version: "当前版本",
+  attention: "需要关注",
+  memory_index: "记忆索引",
+  living_self: "自我档案",
+  context_compile: "上下文生成",
+  active: "已启用来源",
+  last_collection: "最近采集",
+  last_verified: "最近核验",
+  event_stream: "事件连续性",
+  index_integrity: "索引完整性",
+};
+
+const VALUES = {
+  healthy: "连续性正常",
+  ready: "可以使用",
+  verified: "已经核验",
+  unknown: "暂时未知",
+  unavailable: "当前不可用",
+};
 
 function node(tag, value = "", className = "") {
   const result = document.createElement(tag);
@@ -9,9 +33,15 @@ function node(tag, value = "", className = "") {
 
 function flatten(value, prefix = "", result = []) {
   if (value && typeof value === "object") {
-    Object.entries(value).forEach(([key, child]) => flatten(child, prefix ? `${prefix} · ${key}` : key, result));
+    Object.entries(value).forEach(([key, child]) => {
+      const label = LABELS[key] || key.replaceAll("_", " ");
+      flatten(child, prefix ? `${prefix} · ${label}` : label, result);
+    });
   } else {
-    result.push([prefix, value === null || value === undefined ? "未知" : String(value)]);
+    let content = value === null || value === undefined ? "未知" : String(value);
+    if (VALUES[content]) content = VALUES[content];
+    if (/^\d{4}-\d{2}-\d{2}T/.test(content)) content = formatTimestamp(content);
+    result.push([prefix, content]);
   }
   return result.slice(0, 80);
 }

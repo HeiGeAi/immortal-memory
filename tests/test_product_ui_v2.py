@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+import pytest
+import profile_review
 from control_center import ControlCenter
 from control_http import SECURITY_HEADERS
 from product_ui import PRODUCT_ASSETS, product_page_html
@@ -107,9 +111,64 @@ def test_styles_are_archive_specific_accessible_and_static():
         "@media (prefers-reduced-motion: reduce)",
         ":focus-visible",
         "min-height: 44px",
+        "text-wrap: balance",
     ):
         assert token in css
     assert "@keyframes" not in css
+
+
+def test_memory_coverage_is_never_presented_as_certain_when_incomplete():
+    memories = (ASSETS / "views" / "memories.js").read_text(encoding="utf-8")
+    assert "coverage_complete !== false" in memories
+    assert "空结果不等于没有相关记忆" in memories
+    assert "不能据此判断相关记忆不存在" in memories
+
+
+def test_system_evidence_uses_human_labels_and_local_times():
+    system = (ASSETS / "views" / "system.js").read_text(encoding="utf-8")
+    assert 'memory_index: "记忆索引"' in system
+    assert 'verified: "已经核验"' in system
+    assert "formatTimestamp(content)" in system
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_timestamp_formatter_honors_explicit_timezone_and_dst():
+    module = (ASSETS / "format.js").as_uri()
+    script = (
+        f'import {{ formatTimestamp }} from "{module}";'
+        'console.log(formatTimestamp("2026-01-15T00:00:00Z", '
+        '{locale:"zh-CN",timeZone:"Asia/Shanghai"}));'
+        'console.log(formatTimestamp("2026-07-15T12:00:00Z", '
+        '{locale:"zh-CN",timeZone:"America/New_York"}));'
+    )
+    result = subprocess.run(
+        ["node", "--input-type=module", "--eval", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    first, second = result.stdout.strip().splitlines()
+    assert "08:00" in first
+    assert "08:00" in second
+
+
+def test_sensitive_legacy_html_routes_are_no_store(tmp_path, monkeypatch):
+    dashboard = tmp_path / "dashboard.html"
+    dashboard.write_text("<html><body>private snapshot</body></html>")
+    agent_entry = tmp_path / "latest-context.md"
+    agent_entry.write_text("private agent context")
+    monkeypatch.setattr(profile_review, "DEFAULT_DASHBOARD", dashboard)
+    monkeypatch.setattr(profile_review, "DEFAULT_AGENT_ENTRY", agent_entry)
+    server, base = _start_server(tmp_path)
+    try:
+        for route in ("/snapshot", "/agent-entry"):
+            status, headers, body = _get(base + route)
+            assert status == 200
+            assert headers["Cache-Control"] == "no-store"
+            assert body
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_product_routes_redirect_and_assets_are_strict(tmp_path):

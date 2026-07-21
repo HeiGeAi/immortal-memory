@@ -60,7 +60,7 @@ a:focus-visible, button:focus-visible, input:focus-visible, [tabindex]:focus-vis
 .route-status { color: var(--bone-faint); }
 .view { max-width: 1280px; padding-top: clamp(38px, 7vw, 92px); }
 h1, h2 { font-family: var(--display); font-weight: 500; }
-h1 { max-width: 900px; margin: 10px 0 20px; font-size: clamp(40px, 6vw, 84px); line-height: .98; letter-spacing: -.035em; }
+h1 { max-width: 900px; margin: 10px 0 20px; font-size: clamp(40px, 6vw, 84px); line-height: .98; letter-spacing: -.035em; text-wrap: balance; }
 .lede { max-width: 720px; color: var(--bone-soft); font-size: 17px; }
 .archive-hero { padding-bottom: 42px; border-bottom: 1px solid var(--line); }
 .fact-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); margin: 32px 0; }
@@ -92,6 +92,7 @@ dt { color: var(--bone-faint); font: 10px var(--mono); overflow-wrap: anywhere; 
 dd { margin: 0; overflow-wrap: anywhere; }
 .state-message, .state-panel { color: var(--bone-soft); }
 .state-panel { padding: 28px; border: 1px solid var(--line); background: var(--ink-raised); }
+.coverage-warning { margin: 18px 0 0; padding: 14px 16px; border: 1px solid var(--line); border-left: 3px solid var(--cinnabar); color: var(--bone-soft); background: var(--ink-raised); }
 .error-state { border-left: 3px solid var(--cinnabar); }
 .error-text { color: #e07a63; }
 .drawer { position: fixed; z-index: 10; inset: 0 0 0 auto; width: min(620px, 92vw); padding: 26px; border-left: 1px solid var(--copper); background: #0b100d; box-shadow: -24px 0 80px rgba(0,0,0,.55); overflow: auto; }

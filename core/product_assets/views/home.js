@@ -1,4 +1,5 @@
 import { api } from "../api.js";
+import { formatTimestamp } from "../format.js";
 
 function text(tag, value, className = "") {
   const node = document.createElement(tag);
@@ -39,7 +40,7 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
       card.append(text("span", label, "fact-label"), text("strong", value, "fact-value"), text("small", note, "fact-note"));
       facts.append(card);
     };
-    fact("今日记忆", String(remembered.length), newest.timestamp ? `${newest.timestamp} · ${newest.source || "来源未知"}` : "今天尚无索引记录");
+    fact("今日记忆", String(remembered.length), newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录");
     fact("理解变化", String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)), `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`);
     fact("待确认", String(confirmations.length), confirmations[0]?.summary || "没有待确认项目");
     fact("最近 Context", context.context_id ? "已使用" : "无", context.task || context.goal || context.context_id || "暂无已使用 Context");

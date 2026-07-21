@@ -1,11 +1,26 @@
 import { api } from "../api.js";
 import { openDialog } from "../dialog.js";
+import { formatTimestamp } from "../format.js";
 
 function node(tag, value = "", className = "") {
   const result = document.createElement(tag);
   result.className = className;
   result.textContent = value;
   return result;
+}
+
+function coverageWarning(page, filters) {
+  if (page.coverage_complete !== false) return null;
+  const labels = { person: "人物", project: "项目", topic: "主题" };
+  const incomplete = Object.keys(labels).filter(
+    (key) => filters[key] && page.coverage?.[key]?.complete !== true
+  );
+  const dimensions = incomplete.map((key) => labels[key]).join("、") || "当前筛选维度";
+  return node(
+    "p",
+    `${dimensions}的索引覆盖尚不完整。以下结果只代表已覆盖范围，空结果不等于没有相关记忆。`,
+    "coverage-warning",
+  );
 }
 
 function labeledInput(name, label, value, type = "text") {
@@ -52,7 +67,7 @@ function memoryCard(item) {
   article.className = "memory-card";
   const time = document.createElement("time");
   time.dateTime = item.timestamp || "";
-  time.textContent = item.timestamp || "时间未知";
+  time.textContent = formatTimestamp(item.timestamp);
   const source = node("span", item.source || "来源未知", "source-mark");
   const meta = document.createElement("div");
   meta.className = "memory-meta";
@@ -107,9 +122,14 @@ export async function renderMemories(root, { route, signal, isCurrent, navigate 
     const first = await api(`/api/v2/memories?${query.toString()}`, { signal });
     if (!isCurrent()) return;
     results.replaceChildren();
+    const warning = coverageWarning(first, filters);
+    if (warning) results.append(warning);
     const items = Array.isArray(first.items) ? first.items : [];
     if (!items.length) {
-      results.append(node("p", "当前筛选没有找到记忆。换一个范围，档案本身不会被改动。", "state-panel empty-state"));
+      const message = first.coverage_complete === false
+        ? "当前已覆盖范围内没有找到结果，不能据此判断相关记忆不存在。"
+        : "当前筛选没有找到记忆。换一个范围，档案本身不会被改动。";
+      results.append(node("p", message, "state-panel empty-state"));
       return;
     }
     items.forEach((item) => results.append(memoryCard(item)));

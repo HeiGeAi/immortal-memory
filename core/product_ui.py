@@ -14,6 +14,7 @@ PRODUCT_ASSETS = {
     "app.js": "text/javascript; charset=utf-8",
     "router.js": "text/javascript; charset=utf-8",
     "dialog.js": "text/javascript; charset=utf-8",
+    "format.js": "text/javascript; charset=utf-8",
     "views/home.js": "text/javascript; charset=utf-8",
     "views/memories.js": "text/javascript; charset=utf-8",
     "views/system.js": "text/javascript; charset=utf-8",
