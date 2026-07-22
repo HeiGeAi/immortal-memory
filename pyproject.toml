@@ -1,39 +1,10 @@
-[build-system]
-requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "immortal-memory"
-version = "1.1.1"
+version = "1.1.0"
 description = "Local-first personal memory layer for AI agents"
 requires-python = ">=3.9"
-license = "MIT"
+license = {text = "MIT"}
 authors = [{name = "Immortal Memory Contributors"}]
-
-[project.urls]
-Homepage = "https://github.com/HeiGeAi/immortal-memory"
-Repository = "https://github.com/HeiGeAi/immortal-memory"
-
-[project.scripts]
-immortal-memory = "immortal_memory.cli:main"
-
-[tool.setuptools]
-packages = ["immortal_memory"]
-include-package-data = true
-
-[tool.setuptools.package-dir]
-immortal_memory = "core"
-
-[tool.setuptools.package-data]
-immortal_memory = [
-  "VERSION",
-  "*.json",
-  "*.md",
-  "agents/*.yaml",
-  "product_assets/*.css",
-  "product_assets/*.js",
-  "product_assets/views/*.js",
-]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

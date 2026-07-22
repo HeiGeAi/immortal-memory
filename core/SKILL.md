@@ -21,7 +21,7 @@ workflows only; it should not contain private user data.
 Initialize the local owner profile:
 
 ```bash
-immortal-memory init \
+python3 ~/.codex/skills/immortal/immortal.py init \
   --owner-display-name "Your Name" \
   --alias "Your Alias" \
   --primary-account "Main Account"
@@ -30,76 +30,58 @@ immortal-memory init \
 Run a safe smoke training pass:
 
 ```bash
-immortal-memory train --smoke --build-role --goal "写稿审稿流程" --mode writer
+python3 ~/.codex/skills/immortal/immortal.py train --smoke --build-role --goal "写稿审稿流程" --mode writer
 ```
 
 Generate the stable handoff entry for other agents:
 
 ```bash
-immortal-memory agent-entry
+python3 ~/.codex/skills/immortal/immortal.py agent-entry
 cat ~/.immortal/agent/ENTRY.md
 ```
 
 Install the daily automation after the smoke pass:
 
 ```bash
-immortal-memory daily-install
-immortal-memory daily-status
+python3 ~/.codex/skills/immortal/immortal.py daily-install
+python3 ~/.codex/skills/immortal/immortal.py daily-status
 ```
 
 Open the local control surface:
 
 ```bash
-immortal-memory profile-review --host 127.0.0.1 --port 8765
+python3 ~/.codex/skills/immortal/immortal.py dashboard
 ```
 
 Then open `http://127.0.0.1:8765/`.
 
-The root page is the evidence-driven Immortal Memory dashboard. It provides
-seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. Home
-shows current value and blocking health; Memory traces evidence; Self shows the
-versioned Living Self; Judgment preserves decisions and outcomes; Use previews
-and compiles the exact Context Pack; Trust exposes attribution and privacy
-boundaries; System reports collection, verified index, backup, scheduler,
-service, and version state. The legacy static snapshot is retired and returns
-HTTP 410 at `/snapshot`.
-
 ## Core Commands
 
 ```bash
-immortal-memory doctor
-immortal-memory health
-immortal-memory run
-immortal-memory train
-immortal-memory daily-install
-immortal-memory agent-entry
-immortal-memory task-compile "task" --mode auto
-immortal-memory agent-context "task" --print
-immortal-memory agent-factory
-immortal-memory goal
-immortal-memory recall "topic"
-immortal-memory context "task"
-immortal-memory task-compile "target task" --mode auto
-immortal-memory role-distill "stable repeated workflow" --mode auto --install-skill
-immortal-memory backup-status
-immortal-memory export
-immortal-memory restore-guide
-immortal-memory migration-preflight --require-external-backup --json
-immortal-memory claims-migrate --json
+python3 ~/.codex/skills/immortal/immortal.py doctor
+python3 ~/.codex/skills/immortal/immortal.py health
+python3 ~/.codex/skills/immortal/immortal.py run
+python3 ~/.codex/skills/immortal/immortal.py train
+python3 ~/.codex/skills/immortal/immortal.py daily-install
+python3 ~/.codex/skills/immortal/immortal.py agent-entry
+python3 ~/.codex/skills/immortal/immortal.py task-compile "task" --mode auto
+python3 ~/.codex/skills/immortal/immortal.py agent-context "task" --print
+python3 ~/.codex/skills/immortal/immortal.py dashboard
+python3 ~/.codex/skills/immortal/immortal.py agent-factory  # compatibility alias
+python3 ~/.codex/skills/immortal/immortal.py goal
+python3 ~/.codex/skills/immortal/immortal.py recall "topic"
+python3 ~/.codex/skills/immortal/immortal.py context "task"
+python3 ~/.codex/skills/immortal/immortal.py task-compile "target task" --mode auto
+python3 ~/.codex/skills/immortal/immortal.py role-distill "stable repeated workflow" --mode auto --install-skill
+python3 ~/.codex/skills/immortal/immortal.py backup-status
+python3 ~/.codex/skills/immortal/immortal.py export
+python3 ~/.codex/skills/immortal/immortal.py restore-guide
+python3 ~/.codex/skills/immortal/immortal.py web-collect
+python3 ~/.codex/skills/immortal/immortal.py web-save "https://example.com" --note "why this matters"
+python3 ~/.codex/skills/immortal/immortal.py web-status
+python3 ~/.codex/skills/immortal/immortal.py obsidian-sync
+python3 ~/.codex/skills/immortal/immortal.py obsidian-status
 ```
-
-## v1.0 command migration
-
-`immortal package` is retired. Public releases must be built from a clean Git
-checkout, scanned as source and built artifacts, and distributed as the signed
-release wheel and source archive. Never build a public package from a live
-runtime or by replacing personal strings.
-
-The old `immortal project` command was a personal Obsidian workflow rather than
-a portable product authority. It is not part of the public wheel. Install a
-separately reviewed local extension and use `immortal-project` when that
-workflow is required. The public runtime never loads arbitrary Python from the
-private vault.
 
 ## Feishu / Lark
 
@@ -107,11 +89,11 @@ For a real Feishu collection, bind the expected account first. Do not collect a
 large workspace until the account guard is correct.
 
 ```bash
-immortal-memory init \
+python3 ~/.codex/skills/immortal/immortal.py init \
   --feishu-expected-user-name "Your Feishu Name" \
   --feishu-reject-user-name "Wrong Account Name"
 
-immortal-memory train \
+python3 ~/.codex/skills/immortal/immortal.py train \
   --with-feishu \
   --feishu-days 7 \
   --feishu-max-chats 5 \
@@ -121,9 +103,9 @@ immortal-memory train \
 For cloud document mirroring:
 
 ```bash
-immortal-memory feishu-mirror --mode inventory --include-wiki --include-drive-search
-immortal-memory feishu-mirror --mode download --actions fetch_doc,export_markdown --max-jobs 20 --delay 0.5
-immortal-memory feishu-mirror-status
+python3 ~/.codex/skills/immortal/immortal.py feishu-mirror --mode inventory --include-wiki --include-drive-search
+python3 ~/.codex/skills/immortal/immortal.py feishu-mirror --mode download --actions fetch_doc,export_markdown --max-jobs 20 --delay 0.5
+python3 ~/.codex/skills/immortal/immortal.py feishu-mirror-status
 ```
 
 ## Operating Rules

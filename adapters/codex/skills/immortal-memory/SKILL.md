@@ -38,7 +38,7 @@ python3 ~/.local/share/immortal-memory/core/immortal.py health
 python3 ~/.local/share/immortal-memory/core/immortal.py agent-entry
 python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<task>" --print
 python3 ~/.local/share/immortal-memory/core/immortal.py recall "<topic>"
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-factory
+python3 ~/.local/share/immortal-memory/core/immortal.py dashboard
 ```
 
 ## Safety

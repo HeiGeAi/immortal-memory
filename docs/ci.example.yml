@@ -11,23 +11,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.9", "3.10", "3.11"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test dependency
-        run: python3 -m pip install pytest
       - name: Scan for private data
         run: python3 scripts/private_scan.py .
       - name: Compile Python sources
         run: python3 -m py_compile install.py $(find core scripts -name '*.py')
       - name: Run smoke test
         run: bash scripts/smoke_test.sh
-      - name: Run full regression suite
-        run: PYTHONPATH=core python3 -m pytest -q
-      - name: Run production-readiness scenarios
-        run: python3 tests/regression_p0.py
-      - name: Living Self P0 regression
-        run: python3 tests/regression_living_self_p0.py

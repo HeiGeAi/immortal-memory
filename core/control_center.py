@@ -110,28 +110,14 @@ def default_scheduler_probe() -> dict[str, Any]:
                 errors.append(result.stderr.strip()[:120])
             continue
         state = "unknown"
-        last_exit_code: Optional[int] = None
         for line in result.stdout.splitlines():
             if "state =" in line:
                 state = line.split("=", 1)[-1].strip()
-            if "last exit code =" in line:
-                try:
-                    last_exit_code = int(line.split("=", 1)[-1].strip())
-                except ValueError:
-                    pass
-        evidence = f"launchctl print gui/{uid}/{label}"
-        if last_exit_code is not None:
-            evidence = f"{evidence}; last_exit_code={last_exit_code}"
-        if last_exit_code not in (None, 0):
-            return {
-                "status": "attention",
-                "detail": f"LaunchAgent 已加载，但最近一次退出码 {last_exit_code}，请查看运行记录确认影响范围",
-                "evidence": evidence,
-            }
+                break
         return {
             "status": "healthy",
             "detail": f"LaunchAgent 已加载，当前状态 {state}",
-            "evidence": evidence,
+            "evidence": f"launchctl print gui/{uid}/{label}",
         }
     return {
         "status": "attention",
@@ -214,64 +200,6 @@ class ControlCenter:
             observed_at=str(finished),
         )
 
-    def _feedback_signal(self, now: datetime) -> dict[str, Any]:
-        report = _read_json(self.immortal_dir / "feedback" / "latest.json")
-        if not report:
-            return _signal(
-                "feedback",
-                "自动反馈",
-                "unknown",
-                "尚未生成自动反馈报告",
-                source="feedback/latest.json",
-            )
-
-        generated_at = str(report.get("generated_at") or "")
-        age = _age_hours(generated_at, now)
-        pipeline_status = str(report.get("status") or "unknown").strip().lower()
-        notification = report.get("notification") if isinstance(report.get("notification"), dict) else {}
-        notification_status = str(notification.get("status") or "unknown").strip().lower()
-        run_status = report.get("run_status")
-        evidence = f"pipeline={pipeline_status}; notification={notification_status}"
-        if isinstance(run_status, int):
-            evidence = f"{evidence}; run_status={run_status}"
-
-        if age is None:
-            status = "unknown"
-            detail = "自动反馈报告缺少可解析的生成时间"
-        elif age > 30:
-            status = "attention"
-            detail = f"自动反馈距今 {age:.1f} 小时，证据已陈旧"
-        elif pipeline_status == "failed":
-            status = "failed"
-            detail = "自动反馈报告显示运行失败"
-        elif notification_status == "failed":
-            status = "attention"
-            detail = "主流程已结束，但本机通知未送达"
-        elif pipeline_status == "partial":
-            status = "attention"
-            detail = "自动反馈为部分成功，请查看来源和运行记录"
-        elif pipeline_status == "attention":
-            status = "attention"
-            detail = "自动反馈提示需要关注"
-        elif pipeline_status == "ok" and notification_status in {"sent", "skipped"}:
-            status = "healthy"
-            detail = "自动反馈正常，本机通知状态已记录"
-        elif pipeline_status == "ok":
-            status = "attention"
-            detail = "自动反馈正常，但通知投递状态不可核验"
-        else:
-            status = "unknown"
-            detail = "自动反馈状态无法识别"
-        return _signal(
-            "feedback",
-            "自动反馈",
-            status,
-            detail,
-            source="feedback/latest.json",
-            observed_at=generated_at,
-            evidence=evidence,
-        )
-
     def _backup_signal(self, state: dict[str, Any], now: datetime) -> dict[str, Any]:
         export_value = state.get("last_portable_export_dir")
         if not export_value:
@@ -283,6 +211,7 @@ class ControlCenter:
                 source="orchestrator_state.json",
             )
         export_dir = Path(str(export_value)).expanduser()
+        manifest_source = self._backup_manifest_source(export_dir)
         manifest = _read_json(export_dir / "manifest.json")
         if not manifest:
             return _signal(
@@ -290,7 +219,7 @@ class ControlCenter:
                 "备份可信度",
                 "failed",
                 "最新备份缺少有效 manifest",
-                source=str(export_dir / "manifest.json"),
+                source=manifest_source,
             )
         generated_at = manifest.get("generated_at") or state.get("last_portable_export")
         age = _age_hours(generated_at, now)
@@ -328,10 +257,18 @@ class ControlCenter:
             "备份可信度",
             status,
             detail,
-            source=str(export_dir / "manifest.json"),
+            source=manifest_source,
             observed_at=str(generated_at or ""),
             evidence=f"restore_check={state.get('last_portable_restore_check_status') or 'unknown'}",
         )
+
+    def _backup_manifest_source(self, export_dir: Path) -> str:
+        """Return a useful evidence location without exposing a home directory."""
+        try:
+            relative = export_dir.resolve().relative_to(self.immortal_dir.resolve())
+        except (OSError, ValueError):
+            return f"portable-export/{export_dir.name}/manifest.json"
+        return f"{relative.as_posix()}/manifest.json"
 
     def _layers(self) -> list[dict[str, Any]]:
         definitions = [
@@ -374,7 +311,7 @@ class ControlCenter:
             "每日调度器",
             str(scheduler["status"]),
             str(scheduler["detail"]),
-            source=str(scheduler.get("source") or "launchctl"),
+            source="launchctl",
             evidence=str(scheduler.get("evidence") or ""),
         )
         service_signal = _signal(
@@ -394,15 +331,7 @@ class ControlCenter:
             observed_at=run_signal["observed_at"],
         )
         backup_signal = self._backup_signal(state, now)
-        feedback_signal = self._feedback_signal(now)
-        proofs = [
-            service_signal,
-            scheduler_signal,
-            run_signal,
-            result_signal,
-            feedback_signal,
-            backup_signal,
-        ]
+        proofs = [service_signal, scheduler_signal, run_signal, result_signal, backup_signal]
 
         if current.get("status") == "running":
             overall = "running"
@@ -442,7 +371,6 @@ class ControlCenter:
             "version": self._version(),
             "proofs": proofs,
             "scheduler": scheduler_signal,
-            "feedback": feedback_signal,
             "current_run": current,
             "history": self.telemetry.read_history(limit=20),
             "metrics": {

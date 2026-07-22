@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import export_restore
 from redact_common import redact
 
 
@@ -30,6 +29,8 @@ MODULE_IDS = (
 
 
 class ControlData:
+    MEMORY_HIDDEN_HINT = "正文默认隐藏。选择记录后可在本机确认显示。"
+
     def __init__(
         self,
         immortal_dir: Path,
@@ -37,15 +38,11 @@ class ControlData:
         skill_dir: Path | None = None,
         listen_address: str = "127.0.0.1",
         listen_port: int = 8765,
-        actions_enabled: bool = True,
-        action_reason: str = "",
     ) -> None:
         self.immortal_dir = Path(immortal_dir)
         self.skill_dir = Path(skill_dir) if skill_dir else Path(__file__).resolve().parent
         self.listen_address = listen_address
         self.listen_port = int(listen_port)
-        self.actions_enabled = bool(actions_enabled)
-        self.action_reason = str(action_reason or "")
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def capabilities(self) -> dict[str, Any]:
@@ -73,9 +70,7 @@ class ControlData:
                 }
                 for module_id in MODULE_IDS
             ],
-            "actions": ["run", "health", "backup_verify", "profile_refresh"] if self.actions_enabled else [],
-            "actions_available": self.actions_enabled,
-            "action_reason": self.action_reason if not self.actions_enabled else "",
+            "actions": ["run", "health", "backup_verify", "profile_refresh"],
         }
 
     def readiness(self) -> tuple[int, dict[str, Any]]:
@@ -216,18 +211,17 @@ class ControlData:
             return None
         connection.close()
         items = []
-        for rec_id, timestamp, row_source, _role, _project, content in rows:
-            summary = " ".join(str(content or "").split())
-            if len(summary) > 180:
-                summary = summary[:177].rstrip() + "..."
+        for rec_id, timestamp, row_source, _role, _project, _content in rows:
             items.append(
                 {
                     "id": str(rec_id or ""),
                     "timestamp": str(timestamp or ""),
                     "source": str(row_source or ""),
-                    "kind": "",
+                    "kind": str(_role or ""),
                     "sensitivity": "internal",
-                    "summary": redact(summary),
+                    "content_state": "hidden",
+                    "reveal_required": True,
+                    "reveal_hint": self.MEMORY_HIDDEN_HINT,
                 }
             )
         return {
@@ -242,7 +236,12 @@ class ControlData:
             "query_mode": "fts" if use_fts else ("like" if q else "index"),
         }
 
-    def _sqlite_memory_detail(self, memory_id: str) -> dict[str, Any] | None:
+    def _sqlite_memory_detail(
+        self,
+        memory_id: str,
+        *,
+        reveal: bool,
+    ) -> dict[str, Any] | None:
         connection = self._sqlite_connection()
         if connection is None:
             return None
@@ -259,16 +258,21 @@ class ControlData:
         if not row:
             raise KeyError("memory not found")
         rec_id, timestamp, source, role, project, content = row
-        return {
+        base = {
             "id": str(rec_id or ""),
             "timestamp": str(timestamp or ""),
             "source": str(source or ""),
-            "kind": "",
+            "kind": str(role or ""),
             "sensitivity": "internal",
             "project": str(project or ""),
             "role": str(role or ""),
-            "content": redact(str(content or "")),
+            "content_state": "revealed" if reveal else "hidden",
+            "reveal_required": not reveal,
+            "reveal_hint": self.MEMORY_HIDDEN_HINT,
         }
+        if reveal:
+            base["content"] = redact(str(content or ""))
+        return base
 
     def memories(self, query: dict[str, list[str]]) -> dict[str, Any]:
         allowed = {"q", "source", "kind", "since", "until", "limit", "offset"}
@@ -319,9 +323,6 @@ class ControlData:
                 )
             ).casefold():
                 continue
-            summary = " ".join(content.split())
-            if len(summary) > 180:
-                summary = summary[:177].rstrip() + "..."
             matched.append(
                 {
                     "id": self._memory_id(record),
@@ -329,7 +330,9 @@ class ControlData:
                     "source": record_source,
                     "kind": record_kind,
                     "sensitivity": str(record.get("sensitivity") or "internal"),
-                    "summary": redact(summary),
+                    "content_state": "hidden",
+                    "reveal_required": True,
+                    "reveal_hint": self.MEMORY_HIDDEN_HINT,
                 }
             )
         matched.sort(key=lambda item: (item["timestamp"], item["id"]), reverse=True)
@@ -345,17 +348,17 @@ class ControlData:
             "query_mode": "scan",
         }
 
-    def memory_detail(self, memory_id: str) -> dict[str, Any]:
+    def memory_detail(self, memory_id: str, *, reveal: bool = False) -> dict[str, Any]:
         requested = str(memory_id or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9._:@+-]{1,180}", requested):
             raise ValueError("invalid memory id")
-        indexed = self._sqlite_memory_detail(requested)
+        indexed = self._sqlite_memory_detail(requested, reveal=reveal)
         if indexed is not None:
             return indexed
         for record in self._iter_memories() or []:
             if self._memory_id(record) != requested:
                 continue
-            return {
+            base = {
                 "id": requested,
                 "timestamp": str(record.get("timestamp") or ""),
                 "source": str(record.get("source") or ""),
@@ -363,7 +366,14 @@ class ControlData:
                 "sensitivity": str(record.get("sensitivity") or "internal"),
                 "project": str(record.get("project") or ""),
                 "role": str(record.get("role") or ""),
-                "content": redact(str(record.get("content") or "")),
+                "content_state": "revealed" if reveal else "hidden",
+                "reveal_required": not reveal,
+                "reveal_hint": self.MEMORY_HIDDEN_HINT,
+            }
+            if reveal:
+                base["content"] = redact(str(record.get("content") or ""))
+            return {
+                **base,
             }
         raise KeyError("memory not found")
 
@@ -552,109 +562,6 @@ class ControlData:
             },
         }
 
-    def _cloud_recovery(self) -> dict[str, str]:
-        """Map private recovery proof to the tiny safe System-view contract."""
-        unavailable = {
-            "status": "unknown",
-            "provider": "",
-            "last_verified_at": "",
-            "verification": "",
-            "source_binding": "missing",
-            "reason_code": "cloud_recovery_status_unavailable",
-            "action": "在终端完成加密上传与恢复演练",
-        }
-        allowed_reasons = {
-            "cloud_not_configured",
-            "cloud_recovery_drill_pending",
-            "cloud_upload_receipt_invalid",
-            "cloud_drill_receipt_missing_or_unsafe",
-            "cloud_drill_receipt_invalid",
-            "cloud_source_index_unreadable",
-            "cloud_source_index_hash_mismatch",
-            "cloud_vault_unsafe",
-            "cloud_recovery_validator_unavailable",
-        }
-        try:
-            evidence = export_restore.get_feishu_recovery_backup_status(
-                self.immortal_dir
-            )
-        except Exception:
-            return unavailable
-        if not isinstance(evidence, dict):
-            return unavailable
-
-        warnings = evidence.get("warnings")
-        raw_reason = str(warnings[0]) if isinstance(warnings, list) and warnings else ""
-        reason = raw_reason if raw_reason in allowed_reasons else ""
-        raw_timestamp = str(evidence.get("generated_at") or "")
-        try:
-            parsed_timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
-            timestamp = raw_timestamp if parsed_timestamp.tzinfo is not None else ""
-        except ValueError:
-            timestamp = ""
-        verification = evidence.get("verification")
-        verification_mode = (
-            str(verification.get("mode") or "")
-            if isinstance(verification, dict)
-            else ""
-        )
-        if verification_mode != "remote-download-sha256+decrypt-restore":
-            verification_mode = ""
-        recovery_drill = evidence.get("recovery_drill")
-        source_binding = evidence.get("source_binding")
-        is_verified = bool(
-            evidence.get("ok") is True
-            and evidence.get("provider") == "feishu_drive"
-            and isinstance(verification, dict)
-            and verification.get("ok") is True
-            and verification_mode
-            and isinstance(recovery_drill, dict)
-            and recovery_drill.get("ok") is True
-            and recovery_drill.get("mode") == "decrypt-restore"
-            and isinstance(source_binding, dict)
-            and source_binding.get("ok") is True
-        )
-        if is_verified:
-            return {
-                "status": "verified",
-                "provider": "Feishu Drive",
-                "last_verified_at": timestamp,
-                "verification": verification_mode,
-                "source_binding": "matched",
-                "reason_code": "",
-                "action": "无需操作",
-            }
-
-        binding_state = (
-            "mismatch" if reason == "cloud_source_index_hash_mismatch" else "missing"
-        )
-        if reason == "cloud_not_configured":
-            return {
-                **unavailable,
-                "reason_code": reason,
-            }
-        if reason == "cloud_recovery_drill_pending":
-            return {
-                "status": "attention",
-                "provider": "Feishu Drive",
-                "last_verified_at": timestamp,
-                "verification": verification_mode,
-                "source_binding": binding_state,
-                "reason_code": reason,
-                "action": "在终端执行恢复演练",
-            }
-        return {
-            "status": "attention",
-            "provider": "Feishu Drive"
-            if evidence.get("provider") == "feishu_drive"
-            else "",
-            "last_verified_at": timestamp,
-            "verification": verification_mode,
-            "source_binding": binding_state,
-            "reason_code": reason or "cloud_recovery_status_unavailable",
-            "action": "在终端核对证据并重新恢复演练",
-        }
-
     def backups(self) -> dict[str, Any]:
         state = self._read_json(self.immortal_dir / "orchestrator_state.json")
         manifests: list[Path] = []
@@ -726,7 +633,6 @@ class ControlData:
             )
         return {
             "items": items,
-            "cloud_recovery": self._cloud_recovery(),
             "actions": [{"id": "verify", "label": "校验最新备份"}],
             "restore_available": False,
             "delete_available": False,

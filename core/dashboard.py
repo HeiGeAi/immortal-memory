@@ -21,7 +21,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from export_restore import get_backup_status
-from command_hints import cli_command
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -44,6 +43,10 @@ RELATIONSHIP_INDEX_FILE = IMMORTAL_DIR / "relationships" / "relationship_index.j
 QUALITY_FILE = IMMORTAL_DIR / "quality" / "latest.json"
 DIGEST_FILE = IMMORTAL_DIR / "digests" / "latest.json"
 FEEDBACK_FILE = IMMORTAL_DIR / "feedback" / "latest.json"
+WEB_STATE_FILE = IMMORTAL_DIR / "web" / "state.json"
+WEB_INDEX_FILE = IMMORTAL_DIR / "web" / "index.jsonl"
+WEB_PAGES_DIR = IMMORTAL_DIR / "web" / "pages"
+OBSIDIAN_STATUS_FILE = IMMORTAL_DIR / "obsidian" / "status.json"
 DASHBOARD_EXCLUDED_SAMPLE_TERMS = {"错误账号"}
 
 
@@ -192,7 +195,7 @@ def load_agent_entry():
     return (
         "# Immortal Agent Entry\n\n"
         "Agent 接入文件还未生成。运行：\n\n"
-        f"`{cli_command('agent-entry')}`\n"
+        "`python3 ~/.codex/skills/immortal/immortal.py agent-entry`\n"
     )
 
 
@@ -257,8 +260,8 @@ def load_feishu_metrics():
         "proposal_path": str(FEISHU_PROFILE_MERGE),
         "reviewed_path": str(REVIEWED_PROFILE_MD),
         "review_url": "http://127.0.0.1:8765/",
-        "review_command": cli_command("profile-auto-review"),
-        "audit_command": cli_command("profile-review", "--open"),
+        "review_command": "python3 ~/.codex/skills/immortal/immortal.py profile-auto-review",
+        "audit_command": "python3 ~/.codex/skills/immortal/immortal.py profile-review --open",
         "proposal_size_kb": FEISHU_PROFILE_MERGE.stat().st_size / 1024 if FEISHU_PROFILE_MERGE.exists() else 0,
         "proposal_preview": "\n".join(preview_lines),
         "reviewed_preview": reviewed_preview,
@@ -416,6 +419,69 @@ def load_feedback():
     return data if isinstance(data, dict) else {}
 
 
+def load_web_status():
+    state = read_json(WEB_STATE_FILE)
+    if not isinstance(state, dict):
+        state = {}
+    totals = state.get("totals") if isinstance(state.get("totals"), dict) else {}
+    page_count = 0
+    if WEB_PAGES_DIR.exists():
+        page_count = sum(1 for path in WEB_PAGES_DIR.rglob("*.md") if path.is_file())
+    recent_pages = []
+    if WEB_INDEX_FILE.exists():
+        rows = []
+        try:
+            for line in WEB_INDEX_FILE.open("r", encoding="utf-8", errors="ignore"):
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            rows = []
+        recent_pages = [row for row in rows[-8:] if isinstance(row, dict)]
+    return {
+        "status": str(state.get("status") or "missing"),
+        "generated_at": str(state.get("generated_at") or ""),
+        "records_written": int(totals.get("records_written") or 0),
+        "records_planned": int(totals.get("records_planned") or 0),
+        "total_web_history_records": int(totals.get("total_web_history_records") or 0),
+        "total_web_page_records": int(totals.get("total_web_page_records") or 0),
+        "visits_filtered": int(totals.get("visits_filtered") or 0),
+        "errors": int(totals.get("errors") or 0),
+        "latest_visit_at": str(totals.get("latest_visit_at") or ""),
+        "page_count": page_count,
+        "recent_pages": recent_pages,
+        "state_path": str(WEB_STATE_FILE),
+    }
+
+
+def load_obsidian_status():
+    data = read_json(OBSIDIAN_STATUS_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        "status": str(data.get("status") or "missing"),
+        "generated_at": str(data.get("generated_at") or ""),
+        "vault_path": str(data.get("vault_path") or ""),
+        "broken_links_count": int(data.get("broken_links_count") or 0),
+        "conflicts": data.get("conflicts") if isinstance(data.get("conflicts"), list) else [],
+        "status_path": str(OBSIDIAN_STATUS_FILE),
+    }
+
+
+def count_quarantine_items() -> int:
+    candidates = [
+        IMMORTAL_DIR / "quarantine",
+        IMMORTAL_DIR / "reviewed" / "quarantine",
+        IMMORTAL_DIR / "quality" / "quarantine",
+    ]
+    total = 0
+    for root in candidates:
+        if root.exists():
+            total += sum(1 for path in root.rglob("*") if path.is_file())
+    return total
+
+
 def format_digest_time(value: str) -> str:
     if not value:
         return "-"
@@ -517,7 +583,7 @@ def render_quality_panel(quality: dict[str, Any]) -> str:
         status = "missing"
         score = 0
         issue_count = 0
-        recommendation = "质量层还没有生成，自动任务下一轮会补齐；也可以由 Codex 手动运行 immortal-memory quality。"
+        recommendation = "质量层还没有生成，自动任务下一轮会补齐；也可以由 Codex 手动运行 immortal.py quality。"
         issues_html = '<div class="digest-empty">暂无质量报告</div>'
         observations_html = ""
         identity_metrics = {}
@@ -585,7 +651,7 @@ def render_feedback_panel(feedback: dict[str, Any]) -> str:
             <div class="digest-head">
                 <div>
                     <h3>运行反馈</h3>
-                    <p>还没有生成反馈报告。自动任务下一轮会生成，也可以运行 immortal-memory feedback。</p>
+                    <p>还没有生成反馈报告。自动任务下一轮会生成，也可以运行 immortal.py feedback。</p>
                 </div>
                 <div class="digest-badge quality-status-missing">MISSING</div>
             </div>
@@ -639,7 +705,93 @@ def render_feedback_panel(feedback: dict[str, Any]) -> str:
             <div class="panel-header">提醒</div>
             <div class="panel-body"><ul class="digest-attention">{attention_html}</ul></div>
         </div>
-        <div class="cmd-tip">{html.escape(cli_command('feedback', '--notify'))}</div>
+        <div class="cmd-tip">python3 ~/.codex/skills/immortal/immortal.py feedback --notify</div>
+    </div>
+    """
+
+
+def render_management_panel(
+    *,
+    web: dict[str, Any],
+    obsidian: dict[str, Any],
+    feishu: dict[str, Any],
+    quality: dict[str, Any],
+    state: dict[str, Any],
+) -> str:
+    issue_count = int(quality.get("issue_count") or 0) if isinstance(quality, dict) else 0
+    pending_review = int(feishu.get("pending_review") or 0)
+    quarantine_count = count_quarantine_items()
+    web_status = html.escape(str(web.get("status") or "missing"))
+    obsidian_state = html.escape(str(obsidian.get("status") or "missing"))
+    recent_pages = web.get("recent_pages") if isinstance(web.get("recent_pages"), list) else []
+    recent_html = "\n".join(
+        f"<li>{html.escape(str(item.get('saved_at') or '')[:16])}｜"
+        f"{html.escape(str(item.get('title') or item.get('domain') or '网页'))}｜"
+        f"{html.escape(str(item.get('domain') or ''))}</li>"
+        for item in reversed(recent_pages)
+        if isinstance(item, dict)
+    ) or "<li>暂无正文快照。</li>"
+    errors = state.get("errors") if isinstance(state.get("errors"), list) else []
+    errors_html = "\n".join(f"<li>{html.escape(str(item))}</li>" for item in errors[:8]) or "<li>暂无后台错误。</li>"
+    return f"""
+    <div class="quality-panel">
+        <div class="digest-head">
+            <div>
+                <h3>记忆管理工作台</h3>
+                <p>这里集中看网页收录、待审记忆、低质量内容、敏感隔离和 Obsidian 链接健康。事实仓库仍然是本地 `~/.immortal`。</p>
+            </div>
+            <div class="digest-badge quality-status-{web_status}">MANAGE</div>
+        </div>
+        <div class="digest-grid">
+            <div class="digest-card">
+                <div class="k">网页收录</div>
+                <div class="v">{int(web.get('total_web_history_records') or web.get('records_written') or 0):,}</div>
+                <div class="t">{web_status}，本轮 {int(web.get('records_written') or 0):,}，过滤 {int(web.get('visits_filtered') or 0):,}，错误 {int(web.get('errors') or 0):,}</div>
+            </div>
+            <div class="digest-card">
+                <div class="k">网页正文快照</div>
+                <div class="v">{int(web.get('total_web_page_records') or web.get('page_count') or 0):,}</div>
+                <div class="t">最近扫描 {html.escape(format_digest_time(str(web.get('generated_at') or '')))}</div>
+            </div>
+            <div class="digest-card">
+                <div class="k">待审记忆</div>
+                <div class="v">{pending_review:,}</div>
+                <div class="t">来自 Feishu review layer</div>
+            </div>
+            <div class="digest-card">
+                <div class="k">低质量内容</div>
+                <div class="v">{issue_count:,}</div>
+                <div class="t">{html.escape(str(quality.get('recommendation') or '暂无异常') if isinstance(quality, dict) else '暂无异常')}</div>
+            </div>
+            <div class="digest-card">
+                <div class="k">敏感隔离</div>
+                <div class="v">{quarantine_count:,}</div>
+                <div class="t">隔离目录文件数</div>
+            </div>
+            <div class="digest-card">
+                <div class="k">Obsidian 链接</div>
+                <div class="v">{int(obsidian.get('broken_links_count') or 0):,}</div>
+                <div class="t">{obsidian_state}｜{html.escape(str(obsidian.get('vault_path') or 'missing'))}</div>
+            </div>
+        </div>
+        <div class="digest-columns">
+            <div class="panel">
+                <div class="panel-header">最近网页正文</div>
+                <div class="panel-body"><ul class="digest-attention">{recent_html}</ul></div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">后台错误</div>
+                <div class="panel-body"><ul class="digest-attention">{errors_html}</ul></div>
+            </div>
+        </div>
+        <div class="lifeline-actions" style="margin-top:16px">
+            <div><b>网页扫描</b><code>python3 ~/.codex/skills/immortal/immortal.py web-collect</code></div>
+            <div><b>手动保存网页</b><code>python3 ~/.codex/skills/immortal/immortal.py web-save "https://example.com" --note "为什么要留"</code></div>
+            <div><b>网页状态</b><code>python3 ~/.codex/skills/immortal/immortal.py web-status</code></div>
+            <div><b>Obsidian 同步</b><code>python3 ~/.codex/skills/immortal/immortal.py obsidian-sync</code></div>
+            <div><b>Obsidian 状态</b><code>python3 ~/.codex/skills/immortal/immortal.py obsidian-status</code></div>
+            <div><b>质量报告</b><code>python3 ~/.codex/skills/immortal/immortal.py quality</code></div>
+        </div>
     </div>
     """
 
@@ -665,14 +817,6 @@ def render_lifeline_panel(
     recent_collect = str((digest.get("summary") or {}).get("recent_collect_time_local") or last_collect)
     backup_info = backup_display(backup)
     status_text = "正常" if not errors and digest_status == "ok" and quality_status in {"ok", "attention"} and backup_info["ok"] else "需要关注"
-    doctor_command = html.escape(cli_command("doctor"))
-    health_command = html.escape(cli_command("health"))
-    export_command = html.escape(cli_command("export"))
-    restore_command = html.escape(
-        cli_command("restore-check", str(backup_info["path"] or "<export-path>"))
-    )
-    run_command = html.escape(cli_command("run"))
-    context_command = html.escape(cli_command("context", "当前任务"))
     return f"""
     <section class="lifeline-hero">
         <div>
@@ -721,12 +865,12 @@ def render_lifeline_panel(
     <div class="lifeline-actions">
         <a class="factory-action" href="#agent"><b>Agent 接入</b><code>给 Claude Code / Codex / 其他本地 Agent 的统一入口</code></a>
         <a class="factory-action" href="#factory"><b>任务上下文生成器</b><code>主看板内打开按钮式采集、清洗、短期上下文编译工作流</code></a>
-        <div><b>体检</b><code>{doctor_command}</code></div>
-        <div><b>新鲜度</b><code>{health_command}</code></div>
-        <div><b>立即备份</b><code>{export_command}</code></div>
-        <div><b>恢复校验</b><code>{restore_command}</code></div>
-        <div><b>立即采集</b><code>{run_command}</code></div>
-        <div><b>召回上下文</b><code>{context_command}</code></div>
+        <div><b>体检</b><code>python3 ~/.codex/skills/immortal/immortal.py doctor</code></div>
+        <div><b>新鲜度</b><code>python3 ~/.codex/skills/immortal/immortal.py health</code></div>
+        <div><b>立即备份</b><code>python3 ~/.codex/skills/immortal/immortal.py export</code></div>
+        <div><b>恢复校验</b><code>python3 ~/.codex/skills/immortal/immortal.py restore-check "{html.escape(str(backup_info['path'] or '<export-path>'))}"</code></div>
+        <div><b>立即采集</b><code>python3 ~/.codex/skills/immortal/immortal.py run</code></div>
+        <div><b>召回上下文</b><code>python3 ~/.codex/skills/immortal/immortal.py context "当前任务"</code></div>
     </div>
     """
 
@@ -785,6 +929,8 @@ def generate_html():
     digest = load_digest()
     quality = load_quality()
     feedback = load_feedback()
+    web_status = load_web_status()
+    obsidian_status = load_obsidian_status()
     backup = get_backup_status(IMMORTAL_DIR)
 
     if not stats:
@@ -844,6 +990,13 @@ def generate_html():
     relationship_summary_html = render_relationship_summary(relationship_index)
     quality_panel_html = render_quality_panel(quality)
     feedback_panel_html = render_feedback_panel(feedback)
+    management_panel_html = render_management_panel(
+        web=web_status,
+        obsidian=obsidian_status,
+        feishu=feishu,
+        quality=quality,
+        state=state,
+    )
     lifeline_panel_html = render_lifeline_panel(
         total=total,
         last_collect=last_collect,
@@ -880,18 +1033,11 @@ def generate_html():
         if LATEST_AGENT_CONTEXT_FILE.exists()
         else "missing"
     )
-    agent_context_command = cli_command("agent-context", "<当前任务>", "--print")
     agent_handoff_prompt = (
         "请先读取 ~/.immortal/agent/ENTRY.md，然后针对当前任务运行："
-        f"{agent_context_command}，"
+        "python3 ~/.codex/skills/immortal/immortal.py agent-context \"<当前任务>\" --print，"
         "把返回内容作为理解用户本人的长期上下文。"
     )
-    people_command = html.escape(cli_command("people"))
-    relationships_command = html.escape(cli_command("relationships"))
-    agent_entry_command = html.escape(cli_command("agent-entry"))
-    agent_context_html_command = html.escape(cli_command("agent-context", "当前任务", "--print"))
-    recall_topic_command = html.escape(cli_command("recall", "主题"))
-    recall_keyword_command = html.escape(cli_command("recall", "你的关键词"))
 
     html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2495,6 +2641,7 @@ body > * {{ position: relative; z-index: 1; }}
 	<div class="tabs">
 	    <div class="tab active" data-tab="lifeline">防丢失</div>
 	    <div class="tab" data-tab="feedback">运行反馈</div>
+	    <div class="tab" data-tab="manage">记忆管理</div>
 	    <div class="tab" data-tab="feishu">自动沉淀</div>
 	    <div class="tab" data-tab="search">搜索</div>
 	    <div class="tab" data-tab="summaries">每日摘要</div>
@@ -2519,6 +2666,11 @@ body > * {{ position: relative; z-index: 1; }}
 	<!-- Feedback Tab -->
 	<div class="section" id="feedback">
 	    {feedback_panel_html}
+	</div>
+
+	<!-- Manage Tab -->
+	<div class="section" id="manage">
+	    {management_panel_html}
 	</div>
 	
 	<!-- People Tab -->
@@ -2748,8 +2900,8 @@ body > * {{ position: relative; z-index: 1; }}
                     <div class="feishu-path">自动识别文件：{html.escape(feishu['proposal_path'])}</div>
                     <div class="review-actions">
                         <span class="review-command">{html.escape(feishu['review_command'])}</span>
-                        <span class="review-command">{people_command}</span>
-                        <span class="review-command">{relationships_command}</span>
+                        <span class="review-command">python3 ~/.codex/skills/immortal/immortal.py people</span>
+                        <span class="review-command">python3 ~/.codex/skills/immortal/immortal.py relationships</span>
                     </div>
                     <div class="feishu-grid" style="margin:0">
                         <div class="feishu-card"><div class="k">待归因素材</div><div class="n">{feishu['candidate_memories']:,}</div></div>
@@ -2792,9 +2944,9 @@ body > * {{ position: relative; z-index: 1; }}
                 <textarea class="handoff-copy" readonly>{html.escape(agent_handoff_prompt)}</textarea>
             </div>
             <div class="agent-command-list">
-                <code>{agent_entry_command}</code>
-                <code>{agent_context_html_command}</code>
-                <code>{recall_topic_command}</code>
+                <code>python3 ~/.codex/skills/immortal/immortal.py agent-entry</code>
+                <code>python3 ~/.codex/skills/immortal/immortal.py agent-context "当前任务" --print</code>
+                <code>python3 ~/.codex/skills/immortal/immortal.py recall "主题"</code>
             </div>
         </div>
         <div class="agent-card">
@@ -2829,7 +2981,7 @@ body > * {{ position: relative; z-index: 1; }}
         <input type="text" class="search-input" id="search-input" placeholder="在记忆中搜索…（如：飞书、写作、招聘）">
     </div>
     <div class="search-hint">前端搜索基于采样数据（每日 10 条用户发言）。要全量搜索 {total:,} 条记录，请运行下方命令：</div>
-    <div class="cmd-tip">{recall_keyword_command}</div>
+    <div class="cmd-tip">python3 ~/.codex/skills/immortal/immortal.py recall "你的关键词"</div>
     <div class="search-results" id="search-results" style="margin-top:16px"></div>
 </div>
 

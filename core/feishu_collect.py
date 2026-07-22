@@ -29,8 +29,6 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redact_common
-from index_writer import append_jsonl_records
-from maintenance_gate import writer_access
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -447,7 +445,7 @@ def new_record(
     }
 
 
-def _write_records_locked(records: list[dict[str, Any]]) -> None:
+def write_records(records: list[dict[str, Any]]) -> None:
     if not records:
         return
     ensure_dirs()
@@ -457,27 +455,14 @@ def _write_records_locked(records: list[dict[str, Any]]) -> None:
 
     for day, items in sorted(buckets.items()):
         daily_file = DAILY_DIR / f"{day}.jsonl"
-        clean_items = []
-        with open(daily_file, "a", encoding="utf-8") as daily:
+        with open(daily_file, "a", encoding="utf-8") as daily, open(INDEX_FILE, "a", encoding="utf-8") as index:
             for item in items:
                 # 落盘前：去内部字段 + 递归脱敏（含 metadata 嵌套、文件名、去重键）
                 clean = {k: v for k, v in item.items() if not k.startswith("_")}
                 clean = redact_common.redact_tree(clean)
                 line = json.dumps(clean, ensure_ascii=False)
                 daily.write(line + "\n")
-                clean_items.append(clean)
-        append_jsonl_records(
-            INDEX_FILE,
-            clean_items,
-            maintenance_held=True,
-        )
-
-
-def write_records(records: list[dict[str, Any]]) -> None:
-    if not records:
-        return
-    with writer_access(IMMORTAL_DIR):
-        _write_records_locked(records)
+                index.write(line + "\n")
 
 
 class Collector:

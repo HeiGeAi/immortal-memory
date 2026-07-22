@@ -19,7 +19,6 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 from config import feishu_daily_sources, feishu_guard_args
 from process_utils import run_process
 from runtime_telemetry import RuntimeTelemetry
@@ -38,55 +37,6 @@ STABLE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 RUNTIME_TELEMETRY = RuntimeTelemetry(IMMORTAL_DIR / "runtime")
 _ACTIVE_STAGE = ""
 _STAGE_ERROR_COUNT = 0
-
-REQUIRED_FAILURES = {
-    "collect failed",
-    "search index sync failed",
-    "claims migration failed",
-    "context compile failed",
-    "cards build failed",
-    "portable export failed",
-    "portable restore-check failed",
-}
-REQUIRED_FAILURE_PREFIXES = (
-    "required core script missing",
-    "index integrity failed",
-    "migration failed",
-    "export verify failed",
-)
-
-REQUIRED_CORE_SCRIPTS = (
-    "immortal.py",
-    "collect.py",
-    "summary.py",
-    "distill.py",
-    "profile.py",
-    "profile_nuwa.py",
-    "profile_attribution_audit.py",
-    "people_index.py",
-    "index_db.py",
-    "relationship_index.py",
-    "quality_report.py",
-    "export_restore.py",
-    "agent_bridge.py",
-    "cleanup.py",
-)
-
-OPTIONAL_CONNECTOR_SCRIPTS = (
-    "web_capture.py",
-    "feishu_collect.py",
-    "feishu_clean.py",
-    "feishu_distill.py",
-    "profile_auto_review.py",
-    "feishu_drive_mirror.py",
-    "obsidian_sync.py",
-    "getnote_sync.py",
-)
-
-INACTIVE_COMPATIBILITY_SCRIPTS = (
-    "daily_digest.py",
-    "product_brief.py",
-)
 
 DISTILL_INTERVAL_DAYS = 1  # 每天蒸馏一次（数据变化大的话有意义）
 CLEANUP_INTERVAL_DAYS = 7  # 每周清理一次磁盘
@@ -203,28 +153,6 @@ def telemetry_finish_active(errors: list) -> None:
 def telemetry_heartbeat_loop(stop_event: threading.Event, interval: float = 30.0) -> None:
     while not stop_event.wait(interval):
         RUNTIME_TELEMETRY.heartbeat()
-
-
-def orchestration_status(errors: list[str]) -> tuple[str, int]:
-    normalized = {str(item).strip() for item in errors}
-    if normalized.intersection(REQUIRED_FAILURES) or any(
-        error.startswith(prefix)
-        for error in normalized
-        for prefix in REQUIRED_FAILURE_PREFIXES
-    ):
-        return "failed", 1
-    if normalized:
-        return "attention", 0
-    return "success", 0
-
-
-def preflight_required_scripts(skill_dir: Optional[Path] = None) -> list[str]:
-    root = Path(skill_dir) if skill_dir is not None else SKILL_DIR
-    return [
-        name
-        for name in REQUIRED_CORE_SCRIPTS
-        if not (root / name).is_file()
-    ]
 
 
 def child_env() -> dict:
@@ -458,23 +386,9 @@ def profile_auto_review():
     return False
 
 
-def profile_attribution_audit(vault_dir=None):
+def profile_attribution_audit():
     log("=== 阶段 F5: 自动剥离长期画像污染 ===")
-    args = ["--apply"]
-    if vault_dir is not None:
-        vault = Path(vault_dir).expanduser().absolute()
-        args.extend(
-            [
-                "--reviewed", str(vault / "reviewed/profile_memories.jsonl"),
-                "--reviewed-md", str(vault / "reviewed/profile_memories.md"),
-                "--distilled", str(vault / "feishu/distilled/profile_memories.jsonl"),
-                "--records", str(vault / "feishu/clean/records.jsonl"),
-                "--report-dir", str(vault / "quality"),
-                "--evidence-index", str(vault / "index.jsonl"),
-                "--trust-report", str(vault / "model/attribution/latest-report.json"),
-            ]
-        )
-    ok, out = run_script("profile_attribution_audit.py", *args, timeout=600)
+    ok, out = run_script("profile_attribution_audit.py", "--apply", timeout=600)
     if ok:
         total = re.search(r"reviewed_total=(\d+)", out)
         kept = re.search(r"reviewed_kept=(\d+)", out)
@@ -487,41 +401,6 @@ def profile_attribution_audit(vault_dir=None):
         )
         return True
     log(f"长期画像归因审计失败: {out.strip()[:500]}")
-    return False
-
-
-def claims_migrate(vault_dir):
-    vault = Path(vault_dir).expanduser().absolute()
-    log("=== v1.1 阶段: 迁移 Claims 权威事件层 ===")
-    ok, out = run_script(
-        "immortal.py",
-        "claims-migrate",
-        "--vault-dir",
-        str(vault),
-        "--json",
-        timeout=1800,
-    )
-    if ok:
-        log("Claims 迁移完成")
-        return True
-    log(f"Claims 迁移失败: {out.strip()[:500]}")
-    return False
-
-
-def living_self_build(vault_dir):
-    vault = Path(vault_dir).expanduser().absolute()
-    log("=== v1.1 阶段: 构建 Living Self ===")
-    ok, out = run_script(
-        "export_restore.py",
-        "living-self-build",
-        "--vault-dir",
-        str(vault),
-        timeout=600,
-    )
-    if ok:
-        log("Living Self 已构建")
-        return True
-    log(f"Living Self 构建失败: {out.strip()[:500]}")
     return False
 
 
@@ -586,7 +465,8 @@ def summarize():
 
 # update_timeline() / update_dashboard() 已删除（2026-06-17）：
 # timeline/dashboard 早于 2026-06-14 停用，这两个包装函数在 run_main 里零调用，
-# 是误导性死代码。timeline.py/dashboard.py 本体保留（train/CLI/profile_review 仍承重）。
+# 是误导性死代码。timeline.py/dashboard.py 本体保留作显式兼容导出，
+# 但不再由常规编排或真实 Control Center 承重。
 
 
 def distill():
@@ -677,60 +557,13 @@ def quality_report():
 
 def cards_build():
     log("=== 阶段 5H: 构建判断力卡片盒（纠正即记忆）===")
-    ok, out = run_script("immortal.py", "cards", "build", timeout=180)
+    ok, out = run_script("cards.py", "build", timeout=180)
     if ok:
         line = out.strip().splitlines()[-1] if out.strip() else "done"
         log(f"判断力卡片盒已更新: {line[:240]}")
         return True
     log(f"cards build failed: {out.strip()[:300]}")
     return False
-
-
-def evaluate_v11_production_switch(vault_dir, migration, prewarm) -> dict:
-    """Evaluate the final switch against the live vault at execution time."""
-    from export_restore import v11_production_switch_gate
-
-    return v11_production_switch_gate(vault_dir, migration, prewarm)
-
-
-def run_v11_model_stages(vault_dir, migration, prewarm) -> dict:
-    """Run the explicit migration-only dependency chain and stop fail-closed."""
-    vault = Path(vault_dir).expanduser().absolute()
-    switch_gate = evaluate_v11_production_switch(vault, migration, prewarm)
-    if (
-        not isinstance(switch_gate, dict)
-        or switch_gate.get("ok") is not True
-        or switch_gate.get("production_switch_allowed") is not True
-    ):
-        return {
-            "ok": False,
-            "completed": [],
-            "blockers": ["production_switch_gate_required"],
-            "switch_gate": switch_gate if isinstance(switch_gate, dict) else {},
-        }
-    if vault.resolve() != IMMORTAL_DIR.resolve():
-        return {
-            "ok": False,
-            "completed": [],
-            "blockers": ["v11_model_stages_require_live_vault"],
-        }
-    stages = [
-        ("profile-attribution-audit", lambda: profile_attribution_audit(vault)),
-        ("claims-migrate", lambda: claims_migrate(vault)),
-        ("living-self-build", lambda: living_self_build(vault)),
-        ("cards build", cards_build),
-        ("quality", quality_report),
-    ]
-    completed = []
-    for name, action in stages:
-        if not action():
-            return {
-                "ok": False,
-                "completed": completed,
-                "blockers": [name + "_failed"],
-            }
-        completed.append(name)
-    return {"ok": True, "completed": completed, "blockers": []}
 
 
 def daily_digest():
@@ -1003,7 +836,7 @@ def release_lock():
 
 def main():
     if not acquire_lock():
-        return 0
+        return
     global _ACTIVE_STAGE, _STAGE_ERROR_COUNT
     _ACTIVE_STAGE = ""
     _STAGE_ERROR_COUNT = 0
@@ -1031,13 +864,11 @@ def main():
             results=results if isinstance(results, dict) else {},
             error="；".join(str(item) for item in (errors or [])),
         )
-        return int(outcome.get("exit_code") or (1 if status == "failed" else 0))
     except ControlJobCanceled as exc:
         if _ACTIVE_STAGE:
             RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="canceled", error=str(exc))
             _ACTIVE_STAGE = ""
         RUNTIME_TELEMETRY.finish_run(status="canceled", error=str(exc))
-        return 2
     except Exception as exc:
         if _ACTIVE_STAGE:
             RUNTIME_TELEMETRY.finish_stage(_ACTIVE_STAGE, status="failed", error=str(exc))
@@ -1051,18 +882,6 @@ def main():
 
 
 def run_main():
-    missing_scripts = preflight_required_scripts()
-    if missing_scripts:
-        return {
-            "status": "failed",
-            "exit_code": 1,
-            "errors": [
-                f"required core script missing: {name}"
-                for name in missing_scripts
-            ],
-            "results": {},
-        }
-
     state = load_state()
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
@@ -1208,9 +1027,6 @@ def run_main():
     if search_index_sync():
         state["last_search_index_sync"] = now_iso
     else:
-        # Boundary: Task A records this required-stage failure in state and
-        # telemetry. Making the scheduler process exit nonzero belongs to the
-        # separate Preflight Task B and is intentionally not claimed here.
         errors.append("search index sync failed")
 
     people_index_ok = people_index()
@@ -1343,10 +1159,8 @@ def run_main():
     if errors:
         log(f"  警告: 错误: {', '.join(errors)}")
     log("")
-    status, exit_code = orchestration_status(errors)
     return {
-        "status": status,
-        "exit_code": exit_code,
+        "status": "attention" if errors else "success",
         "errors": errors,
         "results": {
             "new_records": collect_info.get("total_new", 0),
@@ -1366,4 +1180,4 @@ def run_main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

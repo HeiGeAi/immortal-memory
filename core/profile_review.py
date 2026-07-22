@@ -20,41 +20,20 @@ import time
 import webbrowser
 import uuid
 import shutil
-from dataclasses import dataclass
 from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from control_center import ControlCenter
 from control_center_ui import control_center_page_html
 from control_data import ControlData
-from control_http import (
-    LEGACY_SECURITY_HEADERS,
-    SECURITY_HEADERS,
-    error_page,
-    error_payload,
-    is_allowed_host,
-)
+from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
-from pipeline_capabilities import missing_pipeline_stages
-from product_data import ProductData
-from product_http import (
-    ProductHttpError,
-    error_body,
-    is_v2_get_target,
-    is_v2_post_target,
-    read_product_json,
-    require_write_metadata,
-    route_product_get,
-    route_product_post,
-)
-from product_mutations import ProductMutationCoordinator
-from product_ui import PRODUCT_ASSETS, PRODUCT_ASSET_ROOT, product_page_html
 
 
 HOME = Path.home()
@@ -101,28 +80,6 @@ ROLE_MODES = {
     "shadow",
     "custom",
 }
-
-
-def normalized_path(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(str(path))))
-
-
-def vault_default_path(value: Path, default: Path, relative: Path, vault: Path) -> Path:
-    """Keep explicit custom review files intact while scoping defaults to a vault."""
-    return vault / relative if Path(value) == default else Path(value)
-
-
-@dataclass(frozen=True)
-class StageCommand:
-    stage_id: str
-    argv: tuple[str, ...]
-    timeout: int
-
-
-class FullPipelineUnavailable(RuntimeError):
-    def __init__(self, missing_stages: tuple[str, ...]):
-        self.missing_stages = missing_stages
-        super().__init__("v1.1 full pipeline unavailable: " + ", ".join(missing_stages))
 
 
 def now_local() -> str:
@@ -546,11 +503,10 @@ def file_status(path: Path) -> dict[str, Any]:
     }
 
 
-def latest_session_dirs(sessions_dir: Path | None = None) -> list[Path]:
-    root = Path(sessions_dir) if sessions_dir is not None else DEFAULT_SESSIONS_DIR
-    if not root.exists():
+def latest_session_dirs() -> list[Path]:
+    if not DEFAULT_SESSIONS_DIR.exists():
         return []
-    dirs = [path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").exists()]
+    dirs = [path for path in DEFAULT_SESSIONS_DIR.iterdir() if path.is_dir() and (path / "manifest.json").exists()]
     dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return dirs
 
@@ -581,14 +537,6 @@ def session_summary(path: Path) -> dict[str, Any]:
 
 
 class FactoryStore:
-    FULL_PIPELINE_STAGES = (
-        "run",
-        "claims-migrate",
-        "profile-attribution-audit",
-        "living-self-build",
-        "cards-build",
-        "context-preview",
-    )
     def __init__(
         self,
         history_path: Path = DEFAULT_CONTROL_JOBS,
@@ -596,13 +544,11 @@ class FactoryStore:
         immortal_dir: Path = IMMORTAL_DIR,
         skill_dir: Path = SKILL_DIR,
         runner: Any = run_process,
-        allow_commands: bool = True,
     ) -> None:
         self.history_path = Path(history_path)
         self.immortal_dir = Path(immortal_dir)
         self.skill_dir = Path(skill_dir)
         self.runner = runner
-        self.allow_commands = bool(allow_commands)
         self.lock = threading.Lock()
         saved = read_json(self.history_path, [])
         saved_jobs = saved if isinstance(saved, list) else []
@@ -630,45 +576,16 @@ class FactoryStore:
     def list_jobs(self) -> list[dict[str, Any]]:
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
-            return [self._public_job(item) for item in jobs[:JOB_HISTORY_LIMIT]]
-
-    @staticmethod
-    def _public_job(value: dict[str, Any]) -> dict[str, Any]:
-        result = dict(value)
-        for key in ("stdout", "stderr", "error", "summary"):
-            result[key] = sanitize_job_output(str(result.get(key) or ""))
-        result["commands"] = [
-            sanitize_job_output(str(command))
-            for command in (result.get("commands") or [])
-        ]
-        result["body"] = FactoryStore._sanitize_public_value(
-            result.get("body") or {}
-        )
-        return result
-
-    @staticmethod
-    def _sanitize_public_value(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {
-                str(key): FactoryStore._sanitize_public_value(child)
-                for key, child in value.items()
-            }
-        if isinstance(value, list):
-            return [FactoryStore._sanitize_public_value(child) for child in value]
-        if isinstance(value, tuple):
-            return [FactoryStore._sanitize_public_value(child) for child in value]
-        if isinstance(value, str):
-            return sanitize_job_output(value)
-        return value
+            return [dict(item) for item in jobs[:JOB_HISTORY_LIMIT]]
 
     def snapshot(self) -> dict[str, Any]:
-        state = read_json(self.immortal_dir / "orchestrator_state.json", {})
-        quality = read_json(self.immortal_dir / "quality" / "latest.json", {})
-        digest = read_json(self.immortal_dir / "digests" / "latest.json", {})
-        feishu_clean = read_json(self.immortal_dir / "feishu" / "clean" / "coverage.json", {})
-        feishu_distilled = read_json(self.immortal_dir / "feishu" / "distilled" / "coverage.json", {})
-        people = read_json(self.immortal_dir / "people" / "people_index.json", {})
-        roles = [session_summary(path) for path in latest_session_dirs(self.immortal_dir / "sessions")[:18]]
+        state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
+        quality = read_json(IMMORTAL_DIR / "quality" / "latest.json", {})
+        digest = read_json(IMMORTAL_DIR / "digests" / "latest.json", {})
+        feishu_clean = read_json(IMMORTAL_DIR / "feishu" / "clean" / "coverage.json", {})
+        feishu_distilled = read_json(IMMORTAL_DIR / "feishu" / "distilled" / "coverage.json", {})
+        people = read_json(IMMORTAL_DIR / "people" / "people_index.json", {})
+        roles = [session_summary(path) for path in latest_session_dirs()[:18]]
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return {
@@ -696,41 +613,33 @@ class FactoryStore:
             },
             "digest_status": ((digest.get("errors") or {}).get("status") if isinstance(digest, dict) else None),
             "layers": {
-                "index": file_status(self.immortal_dir / "index.jsonl"),
-                "profile": file_status(self.immortal_dir / "profile.json"),
-                "profile_nuwa": file_status(self.immortal_dir / "profile_nuwa.json"),
+                "index": file_status(IMMORTAL_DIR / "index.jsonl"),
+                "profile": file_status(IMMORTAL_DIR / "profile.json"),
+                "profile_nuwa": file_status(IMMORTAL_DIR / "profile_nuwa.json"),
                 "people": {
-                    **file_status(self.immortal_dir / "people" / "people_index.json"),
+                    **file_status(IMMORTAL_DIR / "people" / "people_index.json"),
                     "count": len(people.get("people") or []) if isinstance(people.get("people"), list) else 0,
                 },
                 "feishu_clean": {
-                    **file_status(self.immortal_dir / "feishu" / "clean" / "coverage.json"),
+                    **file_status(IMMORTAL_DIR / "feishu" / "clean" / "coverage.json"),
                     "records": (feishu_clean.get("counters") or {}).get("records_written")
                     or (feishu_clean.get("counters") or {}).get("clean_records")
                     or 0,
                 },
                 "feishu_distilled": {
-                    **file_status(self.immortal_dir / "feishu" / "distilled" / "coverage.json"),
+                    **file_status(IMMORTAL_DIR / "feishu" / "distilled" / "coverage.json"),
                     "memories": (feishu_distilled.get("counters") or {}).get("memories_written") or 0,
                     "profile_memories": (feishu_distilled.get("counters") or {}).get("profile_memories_written") or 0,
                 },
             },
-            "execution": {
-                "commands_allowed": self.allow_commands,
-                "reason": "" if self.allow_commands else "隔离 vault 的受控命令已禁用，避免误触正式数据。",
-            },
             "roles": roles,
             "jobs": jobs[:JOB_HISTORY_LIMIT],
-            "commands": (
-                {
-                    "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
-                    "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
-                    "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
-                    "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
-                }
-                if self.allow_commands
-                else {}
-            ),
+            "commands": {
+                "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
+                "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
+                "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
+                "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
+            },
         }
 
     def start_job(self, kind: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -747,8 +656,6 @@ class FactoryStore:
             "profile_refresh",
         }:
             raise ValueError("unknown factory job kind")
-        if not self.allow_commands:
-            raise JobConflict("隔离 vault 的受控命令已禁用，避免误触正式数据。")
         if kind in {"run", "collect", "full"} and self._orchestrator_is_active():
             raise JobConflict("Immortal 编排器已经运行")
         job_id = uuid.uuid4().hex[:12]
@@ -779,11 +686,6 @@ class FactoryStore:
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self.lock:
             job = self.jobs.get(job_id)
-            return self._public_job(job) if job else None
-
-    def _raw_job(self, job_id: str) -> dict[str, Any] | None:
-        with self.lock:
-            job = self.jobs.get(job_id)
             return dict(job) if job else None
 
     def _update_job(self, job_id: str, **updates: Any) -> None:
@@ -809,14 +711,10 @@ class FactoryStore:
         self._update_job(job_id, status="running", started_at=now_local())
         try:
             commands = self._commands_for(kind, body)
-            self._update_job(
-                job_id,
-                commands=[self._display_cmd(command) for command in commands],
-            )
+            self._update_job(job_id, commands=[self._display_cmd(cmd) for cmd, _timeout in commands])
             last_code = 0
             attention = False
-            completed_stage_ids: list[str] = []
-            for command in commands:
+            for cmd, timeout in commands:
                 current = self.get_job(job_id) or {}
                 if current.get("status") == "cancel_requested":
                     self._update_job(
@@ -826,15 +724,12 @@ class FactoryStore:
                         summary="任务已在安全阶段边界停止。",
                     )
                     return
-                self._append_output(
-                    job_id,
-                    stdout=f"$ {self._display_cmd(command)}\n",
-                )
+                self._append_output(job_id, stdout=f"$ {self._display_cmd(cmd)}\n")
                 result = self.runner(
-                    list(command.argv),
+                    cmd,
                     capture_output=True,
                     text=True,
-                    timeout=command.timeout,
+                    timeout=timeout,
                     cwd=str(self.skill_dir),
                     env={
                         **os.environ,
@@ -855,18 +750,10 @@ class FactoryStore:
                     )
                     return
                 if result.returncode != 0:
-                    if result.returncode == 2 and command.stage_id in {
-                        "profile-nuwa",
-                        "role-distill",
-                        "task-compile",
-                    }:
+                    if result.returncode == 2 and any(part in {"profile-nuwa", "role-distill", "agent-build", "task-compile", "agent-session"} for part in cmd):
                         attention = True
                         continue
-                    raise RuntimeError(
-                        f"command failed with code {result.returncode}: "
-                        f"{self._display_cmd(command)}"
-                    )
-                completed_stage_ids.append(command.stage_id)
+                    raise RuntimeError(f"command failed with code {result.returncode}: {self._display_cmd(cmd)}")
             if kind in {"run", "collect", "full"}:
                 after_run = run_evidence_marker(self.immortal_dir / "runtime" / "current_run.json")
                 if not after_run or after_run == before_run or after_run[3] != "success":
@@ -882,20 +769,7 @@ class FactoryStore:
                 job_id,
                 status="attention" if attention else "success",
                 returncode=2 if attention else last_code,
-                summary=self._success_summary(
-                    kind,
-                    body,
-                    tuple(completed_stage_ids),
-                ),
-            )
-        except FullPipelineUnavailable as exc:
-            self._update_job(
-                job_id,
-                status="failed",
-                error_code="capability_unavailable",
-                error=sanitize_job_output(str(exc)),
-                summary="完整闭环尚不可用，缺少阶段：" + "、".join(exc.missing_stages),
-                returncode=1,
+                summary=self._success_summary(kind, body),
             )
         except Exception as exc:
             self._update_job(
@@ -909,73 +783,33 @@ class FactoryStore:
             self._update_job(job_id, finished_at=now_local(), elapsed_seconds=round(time.time() - started, 2))
             self._cancel_marker(job_id).unlink(missing_ok=True)
 
-    def _commands_for(self, kind: str, body: dict[str, Any]) -> list[StageCommand]:
+    def _commands_for(self, kind: str, body: dict[str, Any]) -> list[tuple[list[str], int]]:
         python = sys.executable
         immortal = str(self.skill_dir / "immortal.py")
         if kind == "collect":
-            return [
-                StageCommand(
-                    "run",
-                    (python, immortal, "run"),
-                    COMMAND_TIMEOUTS["collect"],
-                )
-            ]
+            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
         if kind == "clean":
             return [
-                StageCommand("feishu-clean", (python, immortal, "feishu-clean"), COMMAND_TIMEOUTS["clean"]),
-                StageCommand("feishu-distill", (python, immortal, "feishu-distill"), COMMAND_TIMEOUTS["distill"]),
-                StageCommand(
-                    "profile-auto-review",
-                    (python, immortal, "profile-auto-review", "--reconsider-rejected"),
-                    COMMAND_TIMEOUTS["profile_auto_review"],
-                ),
-                StageCommand("profile", (python, immortal, "profile"), COMMAND_TIMEOUTS["profile"]),
-                StageCommand("profile-nuwa", (python, immortal, "profile-nuwa"), COMMAND_TIMEOUTS["profile_nuwa"]),
-                StageCommand("people", (python, immortal, "people"), COMMAND_TIMEOUTS["people"]),
-                StageCommand("relationships", (python, immortal, "relationships"), COMMAND_TIMEOUTS["relationships"]),
-                StageCommand("quality", (python, immortal, "quality"), COMMAND_TIMEOUTS["quality"]),
-                StageCommand("digest", (python, immortal, "digest"), COMMAND_TIMEOUTS["digest"]),
-                StageCommand(
-                    "dashboard",
-                    (python, str(self.skill_dir / "dashboard.py")),
-                    COMMAND_TIMEOUTS["dashboard"],
-                ),
+                ([python, immortal, "feishu-clean"], COMMAND_TIMEOUTS["clean"]),
+                ([python, immortal, "feishu-distill"], COMMAND_TIMEOUTS["distill"]),
+                ([python, immortal, "profile-auto-review", "--reconsider-rejected"], COMMAND_TIMEOUTS["profile_auto_review"]),
+                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
+                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "people"], COMMAND_TIMEOUTS["people"]),
+                ([python, immortal, "relationships"], COMMAND_TIMEOUTS["relationships"]),
+                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
+                ([python, immortal, "digest"], COMMAND_TIMEOUTS["digest"]),
+                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind == "full":
             goal = str(body.get("goal") or "当前任务").strip()[:120]
             mode = str(body.get("mode") or "auto")
             if mode not in ROLE_MODES:
                 mode = "auto"
-            missing = missing_pipeline_stages(self.skill_dir)
-            if missing:
-                raise FullPipelineUnavailable(missing)
             return [
-                StageCommand("run", (python, immortal, "run"), COMMAND_TIMEOUTS["collect"]),
-                StageCommand(
-                    "claims-migrate",
-                    (python, immortal, "claims-migrate"),
-                    COMMAND_TIMEOUTS["profile"],
-                ),
-                StageCommand(
-                    "profile-attribution-audit",
-                    (python, immortal, "profile-attribution-audit", "--apply"),
-                    COMMAND_TIMEOUTS["profile"],
-                ),
-                StageCommand(
-                    "living-self-build",
-                    (python, immortal, "living-self-build"),
-                    COMMAND_TIMEOUTS["profile"],
-                ),
-                StageCommand(
-                    "cards-build",
-                    (python, immortal, "cards", "build"),
-                    COMMAND_TIMEOUTS["profile"],
-                ),
-                StageCommand(
-                    "context-preview",
-                    (python, immortal, "context-preview", goal, "--mode", mode),
-                    COMMAND_TIMEOUTS["task_compile"],
-                ),
+                ([python, immortal, "run"], COMMAND_TIMEOUTS["collect"]),
+                ([python, immortal, "task-compile", goal, "--mode", mode], COMMAND_TIMEOUTS["task_compile"]),
+                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind in {"role", "session"}:
             goal = str(body.get("goal") or "").strip()
@@ -984,36 +818,24 @@ class FactoryStore:
             mode = str(body.get("mode") or "auto")
             if mode not in ROLE_MODES:
                 raise ValueError("invalid mode")
-            return [
-                StageCommand(
-                    "task-compile",
-                    (python, immortal, "task-compile", goal[:160], "--mode", mode),
-                    COMMAND_TIMEOUTS["task_compile"],
-                )
-            ]
+            cmd = [python, immortal, "task-compile", goal[:160], "--mode", mode]
+            return [(cmd, COMMAND_TIMEOUTS["task_compile"])]
         if kind == "health":
-            return [
-                StageCommand(
-                    "health",
-                    (python, immortal, "health", "--max-age-hours", "30"),
-                    COMMAND_TIMEOUTS["health"],
-                )
-            ]
+            return [([python, immortal, "health", "--max-age-hours", "30"], COMMAND_TIMEOUTS["health"])]
         if kind == "run":
-            return [StageCommand("run", (python, immortal, "run"), COMMAND_TIMEOUTS["collect"])]
+            return [([python, immortal, "run"], COMMAND_TIMEOUTS["collect"])]
         if kind == "backup_verify":
             return [
-                StageCommand(
-                    "backup-verify",
-                    (python, immortal, "backup-status", "--verify", "--max-age-hours", "168"),
+                (
+                    [python, immortal, "backup-status", "--verify", "--max-age-hours", "168"],
                     COMMAND_TIMEOUTS["health"],
                 )
             ]
         if kind == "profile_refresh":
             return [
-                StageCommand("profile", (python, immortal, "profile"), COMMAND_TIMEOUTS["profile"]),
-                StageCommand("profile-nuwa", (python, immortal, "profile-nuwa"), COMMAND_TIMEOUTS["profile_nuwa"]),
-                StageCommand("quality", (python, immortal, "quality"), COMMAND_TIMEOUTS["quality"]),
+                ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
+                ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
             ]
         raise ValueError("unknown factory job kind")
 
@@ -1037,7 +859,7 @@ class FactoryStore:
         return self.immortal_dir / "runtime" / "cancel_requests" / f"{job_id}.json"
 
     def retry_job(self, job_id: str) -> dict[str, Any]:
-        job = self._raw_job(job_id)
+        job = self.get_job(job_id)
         if not job:
             raise KeyError("job not found")
         if job.get("status") not in {"failed", "canceled", "interrupted", "attention"}:
@@ -1045,13 +867,12 @@ class FactoryStore:
         return self.start_job(str(job.get("kind") or ""), dict(job.get("body") or {}))
 
     def job_logs(self, job_id: str, *, offset: int = 0, limit: int = 8000) -> dict[str, Any]:
-        job = self._raw_job(job_id)
+        job = self.get_job(job_id)
         if not job:
             raise KeyError("job not found")
-        raw_text = "\n".join(
+        text = "\n".join(
             part for part in (str(job.get("stdout") or ""), str(job.get("stderr") or "")) if part
         )
-        text = sanitize_job_output(raw_text)
         safe_offset = max(0, int(offset))
         safe_limit = min(8000, max(1, int(limit)))
         return {
@@ -1062,14 +883,7 @@ class FactoryStore:
             "text": text[safe_offset : safe_offset + safe_limit],
         }
 
-    def _success_summary(
-        self,
-        kind: str,
-        body: dict[str, Any],
-        completed_stage_ids: tuple[str, ...] | None = None,
-    ) -> str:
-        if completed_stage_ids is not None:
-            return "已按真实命令完成：" + "、".join(completed_stage_ids) + "。"
+    def _success_summary(self, kind: str, body: dict[str, Any]) -> str:
         if kind == "collect":
             return "采集与自动链路已完成。"
         if kind == "clean":
@@ -1077,7 +891,7 @@ class FactoryStore:
         if kind in {"role", "session"}:
             return f"任务上下文已生成：{body.get('goal') or ''}"
         if kind == "full":
-            return "完整闭环已完成。"
+            return "一键采集、清洗和任务上下文生成已完成。"
         if kind == "health":
             return "健康检查已完成。"
         if kind == "run":
@@ -1089,9 +903,9 @@ class FactoryStore:
         return "任务完成。"
 
     @staticmethod
-    def _display_cmd(command: StageCommand) -> str:
+    def _display_cmd(cmd: list[str]) -> str:
         display = []
-        for item in command.argv:
+        for item in cmd:
             if item == sys.executable:
                 display.append("python3")
             else:
@@ -1969,32 +1783,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.server.control_data = value  # type: ignore[attr-defined]
         return value
 
-    @property
-    def product_data(self) -> ProductData:
-        value = getattr(self.server, "product_data", None)
-        if value is None:
-            value = ProductData(
-                self.control_center.immortal_dir,
-                control_data=self.control_data,
-                control_center=self.control_center,
-            )
-            self.server.product_data = value  # type: ignore[attr-defined]
-        return value
-
-    @property
-    def product_mutations(self) -> ProductMutationCoordinator:
-        value = getattr(self.server, "product_mutations", None)
-        if value is None:
-            value = ProductMutationCoordinator(self.control_center.immortal_dir)
-            self.server.product_mutations = value  # type: ignore[attr-defined]
-        return value
-
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def end_headers(self) -> None:
-        headers = LEGACY_SECURITY_HEADERS if getattr(self, "_legacy_security", False) else SECURITY_HEADERS
-        for name, value in headers.items():
+        for name, value in SECURITY_HEADERS.items():
             self.send_header(name, value)
         super().end_headers()
 
@@ -2016,7 +1809,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
         payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -2028,46 +1820,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
         payload = value.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        try:
-            self.wfile.write(payload)
-        except (BrokenPipeError, ConnectionResetError):
-            return
-
-    def send_legacy_html(self, value: str, status: int = 200) -> None:
-        self._legacy_security = True
-        try:
-            self.send_html(value, status=status)
-        finally:
-            self._legacy_security = False
-
-    def send_product_asset(self, request_path: str) -> None:
-        raw_name = request_path.removeprefix("/assets/")
-        try:
-            name = unquote(raw_name, errors="strict")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            self.send_json(error_payload("invalid_asset_path", "资源路径无效。"), status=400)
-            return
-        if (
-            not raw_name
-            or name not in PRODUCT_ASSETS
-            or name.startswith("/")
-            or "\\" in name
-            or any(part in {"", ".", ".."} for part in name.split("/"))
-        ):
-            self.send_json(error_payload("asset_not_found", "资源不存在。"), status=404)
-            return
-        path = PRODUCT_ASSET_ROOT / name
-        try:
-            payload = path.read_bytes()
-        except OSError:
-            self.send_json(error_payload("asset_not_found", "资源不存在。"), status=404)
-            return
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", PRODUCT_ASSETS[name])
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         try:
@@ -2088,19 +1840,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
             raise ValueError("json body must be an object")
         return value
 
+    @staticmethod
+    def _parse_reveal_param(query: dict[str, list[str]]) -> bool:
+        values = query.get("reveal", [])
+        if not values:
+            return False
+        if len(values) != 1:
+            raise ValueError("reveal must be a single value")
+        if values[0] not in {"0", "1"}:
+            raise ValueError("reveal must be 0 or 1")
+        return values[0] == "1"
+
     def do_GET(self) -> None:
         if not self.host_is_allowed():
             return
-        if is_v2_get_target(self.path):
-            status, payload = route_product_get(
-                self.path, lambda: self.product_data
-            )
-            self.send_json(payload, status=status)
-            return
         parsed = urlparse(self.path)
-        if parsed.path.startswith("/assets/"):
-            self.send_product_asset(parsed.path)
-            return
         if parsed.path == "/healthz":
             self.send_json({"status": "ok"})
             return
@@ -2119,18 +1873,33 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v1/memories":
             try:
-                self.send_json(self.control_data.memories(parse_qs(parsed.query)))
+                self.send_json(self.control_data.memories(parse_qs(parsed.query, keep_blank_values=True)))
             except ValueError as exc:
                 self.send_json(error_payload("invalid_request", str(exc)), status=400)
             return
         if parsed.path.startswith("/api/v1/memories/"):
             memory_id = parsed.path.removeprefix("/api/v1/memories/")
+            detail_query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(detail_query) - {"reveal"}:
+                self.send_json(
+                    error_payload(
+                        "invalid_request",
+                        "invalid query parameter for memory detail endpoint",
+                    ),
+                    status=400,
+                )
+                return
             try:
-                self.send_json(self.control_data.memory_detail(memory_id))
+                reveal = self._parse_reveal_param(detail_query)
             except ValueError as exc:
-                self.send_json(error_payload("invalid_memory_id", str(exc)), status=400)
+                self.send_json(error_payload("invalid_request", str(exc)), status=400)
+                return
+            try:
+                self.send_json(self.control_data.memory_detail(memory_id, reveal=reveal))
             except KeyError:
                 self.send_json(error_payload("memory_not_found", "记忆不存在。"), status=404)
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_memory_id", str(exc)), status=400)
             return
         if parsed.path in {"/api/v1/profile", "/api/v1/profile/candidates"}:
             query = parse_qs(parsed.query)
@@ -2206,18 +1975,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.send_json(error_payload("job_not_found", str(exc)), status=404)
             return
         if parsed.path == "/":
-            self.send_html(product_page_html("Immortal Memory"))
-            return
-        if parsed.path == "/control-center":
-            self.send_legacy_html(control_center_page_html("Immortal Control Center"))
+            payload = control_center_page_html("Immortal Control Center").encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
             return
         if parsed.path == "/snapshot":
-            dashboard = self.control_center.immortal_dir / "dashboard.html"
-            if dashboard.exists():
-                payload = dashboard.read_bytes()
+            if DEFAULT_DASHBOARD.exists():
+                payload = DEFAULT_DASHBOARD.read_bytes()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -2231,20 +2000,24 @@ class ReviewHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/review":
-            self.send_response(HTTPStatus.FOUND)
-            self.send_header("Location", "/?view=self&filter=candidate")
-            self.send_header("Content-Length", "0")
+            payload = page_html("长期画像审阅台").encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
+            self.wfile.write(payload)
             return
         if parsed.path == "/agent-factory":
-            self.send_response(HTTPStatus.FOUND)
-            self.send_header("Location", "/?view=use")
-            self.send_header("Content-Length", "0")
+            embedded = parse_qs(parsed.query).get("embed", ["0"])[0] == "1"
+            payload = factory_page_html("任务上下文生成器", embedded=embedded).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
+            self.wfile.write(payload)
             return
         if parsed.path == "/agent-entry":
-            agent_entry = self.control_center.immortal_dir / "agent" / "ENTRY.md"
-            if not agent_entry.exists():
+            if not DEFAULT_AGENT_ENTRY.exists():
                 self.send_html(
                     error_page(
                         "Agent Entry 尚未生成",
@@ -2253,7 +2026,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.NOT_FOUND,
                 )
                 return
-            text = agent_entry.read_text(encoding="utf-8", errors="ignore")
+            text = DEFAULT_AGENT_ENTRY.read_text(encoding="utf-8", errors="ignore")
             payload = (
                 "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -2266,7 +2039,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
             ).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -2305,19 +2077,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         try:
-            if is_v2_post_target(self.path):
-                metadata = require_write_metadata(
-                    self.headers, int(self.server.server_address[1])
-                )
-                body = read_product_json(self.headers, self.rfile.read)
-                status, payload = route_product_post(
-                    self.path,
-                    body,
-                    metadata,
-                    lambda: self.product_mutations,
-                )
-                self.send_json(payload, status=status)
-                return
             if not is_allowed_local_origin(self.headers.get("Origin") or ""):
                 self.send_json(error_payload("origin_not_allowed", "请求来源不被允许。"), status=403)
                 return
@@ -2398,11 +2157,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self.send_json(self.factory.start_job(action, {}), status=202)
                 return
             self.send_json(error_payload("not_found", "请求的资源不存在。"), status=404)
-        except ProductHttpError as exc:
-            self.send_json(
-                error_body(exc.code, exc.message, retryable=exc.retryable),
-                status=exc.status,
-            )
         except JobConflict as exc:
             self.send_json(error_payload("job_conflict", str(exc), retryable=True), status=409)
         except Exception as exc:
@@ -2413,7 +2167,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start the local Immortal profile review desk")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--vault-dir", type=Path, default=IMMORTAL_DIR, help="Memory vault to read and operate")
     parser.add_argument("--open", action="store_true", help="Open the review desk in the default browser")
     parser.add_argument("--proposal", type=Path, default=DEFAULT_PROPOSAL)
     parser.add_argument("--memories", type=Path, default=DEFAULT_PROFILE_MEMORIES)
@@ -2422,79 +2175,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def create_server(args: argparse.Namespace) -> ThreadingHTTPServer:
-    vault = normalized_path(args.vault_dir)
-    is_primary_vault = vault == normalized_path(IMMORTAL_DIR)
-    store = ReviewStore(
-        vault_default_path(
-            args.proposal,
-            DEFAULT_PROPOSAL,
-            Path("feishu/distilled/profile_merge_proposal.md"),
-            vault,
-        ),
-        vault_default_path(
-            args.memories,
-            DEFAULT_PROFILE_MEMORIES,
-            Path("feishu/distilled/profile_memories.jsonl"),
-            vault,
-        ),
-        vault_default_path(
-            args.reviewed,
-            DEFAULT_REVIEWED_FILE,
-            Path("reviewed/profile_memories.jsonl"),
-            vault,
-        ),
-        vault_default_path(
-            args.review_state,
-            DEFAULT_REVIEW_STATE,
-            Path("reviewed/profile_review_state.json"),
-            vault,
-        ),
-    )
-    server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
-    listen_address, listen_port = server.server_address[:2]
-    server.store = store  # type: ignore[attr-defined]
-    server.factory = FactoryStore(  # type: ignore[attr-defined]
-        history_path=vault / "runtime" / "control_jobs.json",
-        immortal_dir=vault,
-        skill_dir=SKILL_DIR,
-        allow_commands=is_primary_vault,
-    )
-    control_center_kwargs: dict[str, Any] = {
-        "skill_dir": SKILL_DIR,
-        "service_reachable": True,
-    }
-    if not is_primary_vault:
-        control_center_kwargs["scheduler_probe"] = lambda: {
-            "status": "unknown",
-            "detail": "隔离 vault 不绑定系统 LaunchAgent，未使用正式调度证据。",
-            "source": "isolated_vault",
-            "evidence": "--vault-dir",
-        }
-    server.control_center = ControlCenter(  # type: ignore[attr-defined]
-        vault,
-        **control_center_kwargs,
-    )
-    server.control_data = ControlData(  # type: ignore[attr-defined]
-        vault,
-        skill_dir=SKILL_DIR,
-        listen_address=str(listen_address),
-        listen_port=int(listen_port),
-        actions_enabled=is_primary_vault,
-        action_reason="" if is_primary_vault else "隔离 vault 的受控命令已禁用，避免误触正式数据。",
-    )
-    return server
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    server = create_server(args)
-    listen_address, listen_port = server.server_address[:2]
-    url = f"http://{listen_address}:{listen_port}/"
+    if args.host not in {"127.0.0.1", "localhost", "::1", "[::1]"}:
+        print(f"Unsupported host '{args.host}': only loopback is allowed.")
+        return 1
+    store = ReviewStore(args.proposal, args.memories, args.reviewed, args.review_state)
+    factory = FactoryStore()
+    control_center = ControlCenter(IMMORTAL_DIR, skill_dir=SKILL_DIR, service_reachable=True)
+    server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
+    server.store = store  # type: ignore[attr-defined]
+    server.factory = factory  # type: ignore[attr-defined]
+    server.control_center = control_center  # type: ignore[attr-defined]
+    server.control_data = ControlData(  # type: ignore[attr-defined]
+        IMMORTAL_DIR,
+        skill_dir=SKILL_DIR,
+        listen_address=args.host,
+        listen_port=args.port,
+    )
+    url = f"http://{args.host}:{args.port}/"
     print(f"Immortal dashboard: {url}")
     print(f"Task context compiler: {url}agent-factory")
     print(f"Profile review audit desk: {url}review")
-    print(f"Proposal: {server.store.proposal}")
+    print(f"Proposal: {args.proposal}")
     if args.open:
         webbrowser.open(url)
     try:

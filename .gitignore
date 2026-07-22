@@ -14,7 +14,3 @@ logs/
 *.db
 dist/
 build/
-*.egg-info/
-tests/evidence-p0*/
-.playwright-cli/
-output/playwright/

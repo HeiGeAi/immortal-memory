@@ -27,9 +27,6 @@ from ranking_common import RECENCY_TAU_DAYS, RECENCY_BOOST, local_date, recency_
 IMMORTAL_DIR = Path.home() / ".immortal"
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 EMBEDDINGS_FILE = IMMORTAL_DIR / "embeddings.jsonl"
-INDEX_UNAVAILABLE_MESSAGE = (
-    "搜索索引不可用。请先运行 index_db.py sync 更新持久化索引后重试。"
-)
 EMBEDDINGS_DIR = IMMORTAL_DIR / "embeddings"
 
 
@@ -471,12 +468,11 @@ def _inmemory_search(query, limit, source, source_prefix, since, until):
 def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
                    source_prefix: Optional[str] = None, since: Optional[str] = None,
                    until: Optional[str] = None) -> tuple:
-    """通过已验证的持久化索引执行多通道 RRF 融合检索。
+    """多通道 RRF 融合检索（持久化索引快路径 + 内存引擎回退）。
 
     快路径：SQLite 持久化索引(index_db) 提供关键词(bm25/LIKE) + 短语两通道，亚秒级。
     叠加 embedding 通道（有 key 时），RRF 融合。
-    索引新鲜度由采集后的计划同步任务维护。查询只做 O(1) 水位检查，
-    不触发深度校验、重建或全量 JSONL 回退。
+    DB 未构建或任何异常 -> 回退到内存 TF-IDF 引擎，保证 recall 永不失效。
 
     Returns: (mode, results)，mode 形如 "fusion(bm25+phrase)" / "fusion(like+phrase+embedding)"
     """
@@ -485,13 +481,12 @@ def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
     # ---- 快路径：持久化 SQLite 索引 ----
     try:
         import index_db
-        ready, labels, rankings = index_db.ready_channels(
+        index_db.sync()  # 增量同步，首次构建后基本零成本
+        labels, rankings = index_db.channels(
             query, limit=limit, source=source, source_prefix=source_prefix,
             since=since, until=until)
-        if not ready:
-            return ("index_unavailable", [])
     except Exception:
-        return ("index_unavailable", [])
+        labels, rankings = [], []
 
     if rankings:
         emb = _embedding_channel(query, candidates, source, source_prefix, since, until)
@@ -503,7 +498,8 @@ def unified_search(query: str, limit: int = 20, source: Optional[str] = None,
         fused = _rrf_fuse(rankings)
         return ("fusion(" + "+".join(labels) + ")", fused[:limit])
 
-    return ("none", [])
+    # ---- 回退：内存引擎 ----
+    return _inmemory_search(query, limit, source, source_prefix, since, until)
 
 
 def format_results(results: list, query: str, mode: str) -> str:
@@ -608,12 +604,8 @@ def main():
 
     mode, results = unified_search(query, limit=20, source=source,
                                    source_prefix=source_prefix, since=since, until=until)
-    if mode == "index_unavailable":
-        print(INDEX_UNAVAILABLE_MESSAGE, file=sys.stderr)
-        return 2
     print(format_results(results, query, mode))
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

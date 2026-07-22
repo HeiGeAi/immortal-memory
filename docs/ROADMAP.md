@@ -1,34 +1,34 @@
 # Roadmap
 
-## v1.0 Reliability baseline
+## v0.1 Empty Shell
 
-- Local vault, collection, cleaning, distillation, recall, profile, role compilation, Agent Bridge, dashboard, portable export, health checks, and thin Codex and Claude Code adapters.
-- v1.0 read paths, health commands, Agent Bridge, and legacy Control Center remain supported through the v1.1 release cycle.
+- Generic local core.
+- Codex adapter.
+- Claude Code adapter.
+- Smoke training flow.
+- Agent bridge.
+- Dashboard and factory.
+- Private-data scan.
 
-## v1.1 Living Self
+## v0.2 Product Hardening
 
-- Seven-module product: Home, Memory, Self, Judgment, Use, Trust, and System.
-- Event-backed Claim, Judgment, Context, and Outcome layers with replayable projections.
-- Immutable Living Self versions built only from effective confirmed Claims.
-- Evidence-preserving correction, version diff, and restore-as-new-version behavior.
-- Task-scoped Context preview, explicit exclusions, compilation, consume, and outcome feedback.
-- `private`, `restricted`, and `context_safe` labels with fail-closed filtering.
-- Source-to-SQLite parity, generation-bound prewarm receipts, staged migration, strict restore replay, and production switch gate.
-- Desktop and mobile browser acceptance, accessibility, API mutation safety, clean-install, rollback, and v1.0 compatibility verification.
+- Installer UX.
+- Connector SDK.
+- Better attribution audit for "not the user" contamination.
+- Encrypted export target.
+- Restore drill.
+- Background scheduler status in dashboard.
 
-## v1.2 Operational learning
+## v0.3 Interoperability
 
-- User-governed review queues for candidate Claims and Judgments.
-- Outcome-assisted suggestions that never auto-promote into confirmed identity or policy.
-- Explainable drift alerts across Living Self versions.
-- Storage budgeting, retention previews, and safer evidence deletion workflows.
-- Stable local API and MCP transport over the same authorization and context contracts.
+- Local HTTP API.
+- MCP server.
+- Plugin adapters for additional agent tools.
+- Context pack budget controls.
 
-## Later, only after local trust is proven
+## v0.4 Team / Enterprise
 
-- Additional connector SDKs and audited adapters.
-- Encrypted external backup targets and scheduled restore drills.
-- Multi-vault separation for teams without merging identities.
-- Admin-controlled scopes, retention, and audit exports.
-
-Cloud sync, autonomous irreversible action, and cross-user model merging are not default roadmap commitments. They require separate threat models and explicit user value before implementation.
+- Multi-user vault separation.
+- Admin-controlled connector scopes.
+- Audit logs.
+- Policy-based retention.
