@@ -232,13 +232,14 @@ class PackagingTest(unittest.TestCase):
                 encoding="utf-8",
             )
             dashboard = subprocess.run(
-                [str(command), "dashboard"],
+                [str(command), "dashboard-export"],
                 env=env,
                 text=True,
                 capture_output=True,
                 timeout=60,
             )
             self.assertEqual(dashboard.returncode, 0, msg=f"stdout:\n{dashboard.stdout}\nstderr:\n{dashboard.stderr}")
+            self.assertIn("Legacy dashboard snapshot (not live)", dashboard.stdout)
             dashboard_html = (tmp_path / "home" / ".immortal" / "dashboard.html").read_text(encoding="utf-8")
             self.assertIn("immortal-memory agent-entry", dashboard_html)
             self.assertNotIn("~/.codex/skills/immortal/immortal.py", dashboard_html)
