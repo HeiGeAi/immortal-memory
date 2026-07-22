@@ -80,7 +80,7 @@
     "scripts/private_scan.py",
     "scripts/smoke_test.sh"
   ],
-  "generated_at": "2026-07-22T20:20:42",
+  "generated_at": "2026-07-22T20:26:48",
   "name": "immortal-memory",
   "private_data_included": false,
   "type": "open-source-empty-shell"

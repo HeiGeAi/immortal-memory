@@ -44,8 +44,6 @@ DEFAULT_PROFILE_MEMORIES = IMMORTAL_DIR / "feishu" / "distilled" / "profile_memo
 DEFAULT_REVIEWED_DIR = IMMORTAL_DIR / "reviewed"
 DEFAULT_REVIEWED_FILE = DEFAULT_REVIEWED_DIR / "profile_memories.jsonl"
 DEFAULT_REVIEW_STATE = DEFAULT_REVIEWED_DIR / "profile_review_state.json"
-DEFAULT_DASHBOARD = IMMORTAL_DIR / "dashboard.html"
-DEFAULT_TIMELINE = IMMORTAL_DIR / "timeline.html"
 DEFAULT_SESSIONS_DIR = IMMORTAL_DIR / "sessions"
 DEFAULT_AGENT_ENTRY = IMMORTAL_DIR / "agent" / "ENTRY.md"
 DEFAULT_CONTROL_JOBS = IMMORTAL_DIR / "runtime" / "control_jobs.json"
@@ -65,7 +63,6 @@ COMMAND_TIMEOUTS = {
     "relationships": 900,
     "quality": 900,
     "digest": 600,
-    "dashboard": 900,
     "task_compile": 600,
     "health": 240,
 }
@@ -799,7 +796,6 @@ class FactoryStore:
                 ([python, immortal, "relationships"], COMMAND_TIMEOUTS["relationships"]),
                 ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
                 ([python, immortal, "digest"], COMMAND_TIMEOUTS["digest"]),
-                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind == "full":
             goal = str(body.get("goal") or "当前任务").strip()[:120]
@@ -809,7 +805,6 @@ class FactoryStore:
             return [
                 ([python, immortal, "run"], COMMAND_TIMEOUTS["collect"]),
                 ([python, immortal, "task-compile", goal, "--mode", mode], COMMAND_TIMEOUTS["task_compile"]),
-                ([python, str(self.skill_dir / "dashboard.py")], COMMAND_TIMEOUTS["dashboard"]),
             ]
         if kind in {"role", "session"}:
             goal = str(body.get("goal") or "").strip()
@@ -1983,14 +1978,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         if parsed.path == "/snapshot":
-            if DEFAULT_DASHBOARD.exists():
-                payload = DEFAULT_DASHBOARD.read_bytes()
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-                return
             self.send_html(
                 error_page(
                     "Legacy Snapshot 已停用",
@@ -2000,21 +1987,16 @@ class ReviewHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/review":
-            payload = page_html("长期画像审阅台").encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/?view=profile")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(payload)
             return
         if parsed.path == "/agent-factory":
-            embedded = parse_qs(parsed.query).get("embed", ["0"])[0] == "1"
-            payload = factory_page_html("任务上下文生成器", embedded=embedded).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/?view=agent")
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(payload)
             return
         if parsed.path == "/agent-entry":
             if not DEFAULT_AGENT_ENTRY.exists():
@@ -2195,8 +2177,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     url = f"http://{args.host}:{args.port}/"
     print(f"Immortal dashboard: {url}")
-    print(f"Task context compiler: {url}agent-factory")
-    print(f"Profile review audit desk: {url}review")
+    print(f"Task context module: {url}?view=agent")
+    print(f"Profile review module: {url}?view=profile")
     print(f"Proposal: {args.proposal}")
     if args.open:
         webbrowser.open(url)

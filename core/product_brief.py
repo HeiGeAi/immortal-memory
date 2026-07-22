@@ -32,8 +32,6 @@ PATHS = {
     "agent_entry": IMMORTAL_DIR / "agent" / "ENTRY.md",
     "latest_agent_context": IMMORTAL_DIR / "agent" / "latest-context.md",
     "latest_task_session": IMMORTAL_DIR / "sessions" / "latest.json",
-    "dashboard": IMMORTAL_DIR / "dashboard.html",
-    "timeline": IMMORTAL_DIR / "timeline.html",
 }
 
 
@@ -155,11 +153,12 @@ def build_goal() -> dict[str, Any]:
             "agent_context": "python3 ~/.codex/skills/immortal/immortal.py agent-context \"当前任务\" --print",
             "task_compile": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"当前任务\" --mode auto",
             "context_pack": "python3 ~/.codex/skills/immortal/immortal.py context \"当前任务\"",
-            "task_compiler": "http://127.0.0.1:8765/agent-factory",
-            "agent_factory_command": "python3 ~/.codex/skills/immortal/immortal.py agent-factory",
+            "dashboard": "http://127.0.0.1:8765/",
+            "dashboard_command": "python3 ~/.codex/skills/immortal/immortal.py dashboard",
+            "task_compiler": "http://127.0.0.1:8765/?view=agent",
+            "agent_factory_command": "python3 ~/.codex/skills/immortal/immortal.py dashboard",
             "daily_automation": "python3 ~/.codex/skills/immortal/immortal.py daily-status",
-            "dashboard": str(PATHS["dashboard"]),
-            "timeline": str(PATHS["timeline"]),
+            "timeline": "http://127.0.0.1:8765/?view=memories&mode=timeline",
             "package": "python3 ~/.codex/skills/immortal/immortal.py package",
             "oss_export": "python3 ~/.codex/skills/immortal/oss_export.py --output ~/Desktop/immortal-memory-open-source --force",
             "oss_repo": str(Path.home() / "Desktop" / "immortal-memory-open-source"),

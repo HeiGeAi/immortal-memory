@@ -91,8 +91,10 @@ def bridge_metadata() -> dict[str, Any]:
             "cards": f"python3 {SKILL_DIR / 'immortal.py'} cards list",
         },
         "local_urls": {
+            "control_center": "http://127.0.0.1:8765/",
             "agent_entry": "http://127.0.0.1:8765/agent-entry",
-            "agent_factory": "http://127.0.0.1:8765/agent-factory",
+            "agent_module": "http://127.0.0.1:8765/?view=agent",
+            "agent_factory": "http://127.0.0.1:8765/?view=agent",
         },
     }
 
