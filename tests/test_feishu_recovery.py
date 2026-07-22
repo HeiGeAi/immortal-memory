@@ -21,6 +21,7 @@ from feishu_recovery import (
     run_recovery_drill,
     restore_local_package,
     upload_package,
+    validate_drill_receipt,
     validate_package_manifest,
     verify_local_package,
 )
@@ -677,6 +678,43 @@ def test_recovery_drill_downloads_all_parts_and_runs_real_restore(tmp_path):
     assert "file_token" not in json.dumps(persisted)
     assert "path" not in json.dumps(persisted)
     assert persisted["recovery_drill"] == {"ok": True, "mode": "decrypt-restore"}
+    assert persisted["content_fidelity"] == "credential_redacted"
+    assert persisted["redaction_unique_candidates"] == 2
+    assert validate_drill_receipt(persisted) == persisted
+
+
+def test_recovery_drill_receipt_rejects_unexpected_or_unbound_fields(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package = tmp_path / "package"
+    built = build_encrypted_package(
+        export_dir,
+        package,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert built["ok"] is True
+    receipt = make_remote_receipt(package)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = run_recovery_drill(
+        receipt,
+        tmp_path / "drill",
+        vault_dir=vault,
+        client=DownloadingClient(package, receipt),
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert result["ok"] is True, result
+    persisted = json.loads(
+        (vault / "recovery" / "feishu" / "latest-drill.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    persisted["source_index_sha256"] = "not-a-sha256"
+
+    with pytest.raises(RecoveryError, match="recovery_drill_receipt_invalid"):
+        validate_drill_receipt(persisted)
 
 
 def test_recovery_drill_fails_when_downloaded_part_hash_changes(tmp_path):
@@ -773,3 +811,108 @@ def test_restore_local_package_rejects_a_decrypted_tar_symlink(tmp_path):
         "blockers": ["recovery_archive_invalid"],
     }
     assert not destination.exists()
+
+
+def test_recovery_cli_prepares_only_explicit_local_package(monkeypatch, tmp_path, capsys):
+    calls = []
+    monkeypatch.setattr(
+        feishu_recovery,
+        "build_encrypted_package",
+        lambda export_dir, package_dir, **kwargs: calls.append(
+            (export_dir, package_dir, kwargs)
+        )
+        or {"ok": True, "package_id": "immortal-recovery-20260722-a1b2c3d4"},
+    )
+
+    code = feishu_recovery.main(
+        [
+            "prepare",
+            "--export-dir",
+            str(tmp_path / "export"),
+            "--package-dir",
+            str(tmp_path / "package"),
+            "--recipient",
+            "A" * 40,
+            "--part-bytes",
+            str(1024 * 1024),
+        ]
+    )
+
+    assert code == 0
+    assert calls == [
+        (
+            str(tmp_path / "export"),
+            str(tmp_path / "package"),
+            {"recipient_fingerprint": "A" * 40, "part_bytes": 1024 * 1024},
+        )
+    ]
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_recovery_cli_dry_run_never_calls_remote_upload(monkeypatch, tmp_path, capsys):
+    calls = []
+    monkeypatch.setattr(
+        feishu_recovery,
+        "verify_local_package",
+        lambda _package: {
+            "ok": True,
+            "package_id": "immortal-recovery-20260722-a1b2c3d4",
+            "parts": 1,
+            "bytes": 123,
+            "blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        feishu_recovery,
+        "upload_package",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True},
+    )
+
+    code = feishu_recovery.main(
+        [
+            "upload",
+            "--package-dir",
+            str(tmp_path / "package"),
+            "--parent-folder-token",
+            "parent_12345678",
+            "--dry-run",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert calls == []
+    assert payload == {
+        "ok": True,
+        "package_id": "immortal-recovery-20260722-a1b2c3d4",
+        "would_write": True,
+        "blockers": [],
+    }
+
+
+def test_recovery_cli_rejects_small_human_part_size(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        feishu_recovery,
+        "build_encrypted_package",
+        lambda *args, **kwargs: pytest.fail("invalid part size must not build a package"),
+    )
+
+    code = feishu_recovery.main(
+        [
+            "prepare",
+            "--export-dir",
+            str(tmp_path / "export"),
+            "--package-dir",
+            str(tmp_path / "package"),
+            "--recipient",
+            "A" * 40,
+            "--part-bytes",
+            "1024",
+        ]
+    )
+
+    assert code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "blockers": ["part_size_too_small"],
+    }

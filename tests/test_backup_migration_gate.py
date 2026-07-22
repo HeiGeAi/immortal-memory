@@ -32,6 +32,25 @@ def valid_evidence() -> dict:
     }
 
 
+def valid_cloud_evidence() -> dict:
+    return {
+        "generated_at": "2026-07-20T03:30:00Z",
+        "storage": {"location": "external_cloud", "provider": "feishu_drive"},
+        "provider": "feishu_drive",
+        "verification": {
+            "mode": "remote-download-sha256+decrypt-restore",
+            "ok": True,
+        },
+        "restore_check": {"ok": True, "strict": True},
+        "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
+        "source_binding": {"ok": True},
+        "secret_scan": {"unique_candidates": 0},
+        "warnings": [],
+        "health": {"ok": True},
+        "index_parity": {"ok": True},
+    }
+
+
 def test_internal_manifest_only_backup_with_secret_warning_blocks_migration():
     evidence = valid_evidence()
     evidence.update(
@@ -144,6 +163,117 @@ def test_external_strict_restorable_fresh_healthy_backup_passes():
 
     assert result["ok"] is True
     assert result["blockers"] == []
+
+
+def test_verified_feishu_cloud_evidence_passes_external_gate():
+    result = export_restore.migration_backup_gate(
+        valid_cloud_evidence(),
+        require_external=True,
+        now=NOW,
+    )
+
+    assert result["ok"] is True
+    assert result["storage_location"] == "external_cloud"
+
+
+def test_cloud_upload_without_remote_recovery_or_source_binding_blocks():
+    evidence = valid_cloud_evidence()
+    evidence.pop("recovery_drill")
+    evidence["source_binding"] = {"ok": False}
+
+    result = export_restore.migration_backup_gate(evidence, now=NOW)
+
+    assert {
+        "cloud_recovery_drill_missing_or_failed",
+        "cloud_source_binding_failed",
+    }.issubset(result["blockers"])
+
+
+def test_cloud_evidence_requires_feishu_provider_and_remote_verification_mode():
+    evidence = valid_cloud_evidence()
+    evidence["provider"] = "other"
+    evidence["verification"] = {"mode": "strict-sha256", "ok": True}
+
+    result = export_restore.migration_backup_gate(evidence, now=NOW)
+
+    assert {
+        "cloud_provider_invalid",
+        "cloud_verification_not_remote_strict",
+    }.issubset(result["blockers"])
+
+
+def _write_feishu_drill_receipt(vault: Path, *, source_index_sha256: str) -> None:
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+    receipt = {
+        "schema_version": 1,
+        "provider": "feishu_drive",
+        "verified_at": timestamp,
+        "package_id": "immortal-recovery-20260722-a1b2c3d4",
+        "package_manifest_sha256": "b" * 64,
+        "source_index_sha256": source_index_sha256,
+        "source_export_generated_at": timestamp,
+        "content_fidelity": "credential_redacted",
+        "redaction_unique_candidates": 2,
+        "verification_mode": "remote-download-sha256+decrypt-restore",
+        "remote_parts": 1,
+        "restore_check": {"ok": True, "strict": True, "checked_files": 3},
+        "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
+    }
+    receipt_path = vault / "recovery" / "feishu" / "latest-drill.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    os.chmod(receipt_path, 0o600)
+
+
+def test_feishu_recovery_status_requires_private_receipt_and_current_raw_index(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    index = vault / "index.jsonl"
+    index.write_bytes(b'{"id":"one","content":"current"}\n')
+    _write_feishu_drill_receipt(
+        vault,
+        source_index_sha256=hashlib.sha256(index.read_bytes()).hexdigest(),
+    )
+
+    status = export_restore.get_feishu_recovery_backup_status(vault)
+
+    assert status["ok"] is True
+    assert status["storage"] == {
+        "location": "external_cloud",
+        "provider": "feishu_drive",
+    }
+    assert status["secret_scan"] == {"unique_candidates": 0}
+    assert status["redaction"] == {"unique_candidates": 2}
+    assert status["source_binding"] == {"ok": True}
+    assert str(vault) not in json.dumps(status, sort_keys=True)
+
+    index.write_bytes(b'{"id":"one","content":"changed"}\n')
+    stale = export_restore.get_feishu_recovery_backup_status(vault)
+    stale["health"] = {"ok": True}
+    stale["index_parity"] = {"ok": True}
+
+    assert stale["ok"] is False
+    assert stale["source_binding"] == {"ok": False}
+    assert "cloud_source_binding_failed" in export_restore.migration_backup_gate(
+        stale,
+        now=NOW,
+    )["blockers"]
+
+
+def test_feishu_recovery_status_rejects_public_or_invalid_drill_receipt(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "index.jsonl").write_bytes(b"proof\n")
+    _write_feishu_drill_receipt(vault, source_index_sha256="a" * 64)
+    receipt_path = vault / "recovery" / "feishu" / "latest-drill.json"
+    os.chmod(receipt_path, 0o644)
+
+    status = export_restore.get_feishu_recovery_backup_status(vault)
+
+    assert status["ok"] is False
+    assert status["warnings"] == ["cloud_drill_receipt_missing_or_unsafe"]
 
 
 def test_real_backup_status_field_shape_is_accepted():
@@ -344,6 +474,78 @@ def test_migration_preflight_command_accepts_state_selected_external_export(
 
     assert stale_code == 1
     assert "backup_stale" in json.loads(capsys.readouterr().out)["blockers"]
+
+
+def test_migration_preflight_can_select_verified_feishu_cloud_evidence(
+    tmp_path, monkeypatch, capsys
+):
+    import index_db
+    import preflight
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state_file = vault / "orchestrator_state.json"
+    state_file.write_text(json.dumps({"errors": []}), encoding="utf-8")
+    selected = valid_cloud_evidence()
+    selected["generated_at"] = datetime.now(timezone.utc).isoformat()
+    calls = []
+    monkeypatch.setattr(immortal, "IMMORTAL_DIR", vault)
+    monkeypatch.setattr(immortal, "STATE_FILE", state_file)
+    monkeypatch.setattr(
+        immortal,
+        "get_feishu_recovery_backup_status",
+        lambda candidate: calls.append(candidate) or dict(selected),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        immortal,
+        "get_migration_backup_status",
+        lambda _candidate: pytest.fail("portable evidence should not be read"),
+    )
+    monkeypatch.setattr(index_db, "is_ready", lambda: True)
+    monkeypatch.setattr(
+        preflight,
+        "gather_preflight",
+        lambda **kwargs: {"context_status": "ready", "vault_status": "healthy"},
+    )
+
+    code = immortal.command_migration_preflight(
+        argparse.Namespace(
+            require_external_backup=True,
+            max_age_hours=168,
+            json=True,
+            backup_source="feishu-cloud",
+        )
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert calls == [vault]
+    assert payload["evidence"]["backup_source"] == "feishu-cloud"
+    assert payload["evidence"]["provider"] == "feishu_drive"
+    assert payload["evidence"]["recovery_drill"] == {
+        "ok": True,
+        "mode": "decrypt-restore",
+    }
+
+
+def test_feishu_recovery_command_is_a_thin_explicit_forwarder(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        immortal,
+        "run_script",
+        lambda script, args=None: calls.append((script, args)) or 7,
+    )
+
+    assert immortal.main(["feishu-recovery", "status", "--vault-dir", "/safe/vault"]) == 7
+    assert calls == [
+        ("feishu_recovery.py", ["status", "--vault-dir", "/safe/vault"])
+    ]
+
+    parsed = immortal.build_parser().parse_args(
+        ["migration-preflight", "--backup-source", "feishu-cloud"]
+    )
+    assert parsed.backup_source == "feishu-cloud"
 
 
 @pytest.mark.parametrize(

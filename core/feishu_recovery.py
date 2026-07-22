@@ -9,6 +9,7 @@ prove that a redacted portable export is internally consistent.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import io
 import json
@@ -20,6 +21,7 @@ import subprocess
 import tarfile
 import tempfile
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping, Sequence
@@ -59,6 +61,23 @@ PACKAGE_MANIFEST_KEYS = {
 }
 PART_KEYS = {"name", "bytes", "sha256"}
 ENCRYPTION_KEYS = {"algorithm", "part_count"}
+DRILL_RECEIPT_KEYS = {
+    "schema_version",
+    "provider",
+    "verified_at",
+    "package_id",
+    "package_manifest_sha256",
+    "source_index_sha256",
+    "source_export_generated_at",
+    "content_fidelity",
+    "redaction_unique_candidates",
+    "verification_mode",
+    "remote_parts",
+    "restore_check",
+    "recovery_drill",
+}
+DRILL_RESTORE_CHECK_KEYS = {"ok", "strict", "checked_files"}
+DRILL_RECOVERY_KEYS = {"ok", "mode"}
 
 
 class RecoveryError(ValueError):
@@ -367,6 +386,52 @@ def validate_package_manifest(manifest: Any) -> None:
         raise
     except (TypeError, ValueError):
         raise RecoveryError("package_manifest_invalid")
+
+
+def validate_drill_receipt(receipt: Any) -> dict[str, Any]:
+    """Validate the private, token-free proof written after a real recovery drill."""
+    if not isinstance(receipt, Mapping) or set(receipt) != DRILL_RECEIPT_KEYS:
+        raise RecoveryError("recovery_drill_receipt_invalid")
+    payload = dict(receipt)
+    try:
+        if (
+            type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != PACKAGE_SCHEMA_VERSION
+            or payload.get("provider") != "feishu_drive"
+            or not _is_utc_timestamp(payload.get("verified_at"))
+            or not _is_utc_timestamp(payload.get("source_export_generated_at"))
+            or not _is_sha256(payload.get("package_manifest_sha256"))
+            or not _is_sha256(payload.get("source_index_sha256"))
+            or payload.get("content_fidelity") != "credential_redacted"
+            or not _is_nonnegative_int(payload.get("redaction_unique_candidates"))
+            or payload.get("verification_mode")
+            != "remote-download-sha256+decrypt-restore"
+            or not _is_nonnegative_int(payload.get("remote_parts"), positive=True)
+        ):
+            raise RecoveryError("recovery_drill_receipt_invalid")
+        _validate_package_id(payload.get("package_id"))
+        restore_check = payload.get("restore_check")
+        if (
+            not isinstance(restore_check, Mapping)
+            or set(restore_check) != DRILL_RESTORE_CHECK_KEYS
+            or restore_check.get("ok") is not True
+            or restore_check.get("strict") is not True
+            or not _is_nonnegative_int(restore_check.get("checked_files"))
+        ):
+            raise RecoveryError("recovery_drill_receipt_invalid")
+        recovery_drill = payload.get("recovery_drill")
+        if (
+            not isinstance(recovery_drill, Mapping)
+            or set(recovery_drill) != DRILL_RECOVERY_KEYS
+            or recovery_drill.get("ok") is not True
+            or recovery_drill.get("mode") != "decrypt-restore"
+        ):
+            raise RecoveryError("recovery_drill_receipt_invalid")
+    except RecoveryError:
+        raise
+    except (TypeError, ValueError):
+        raise RecoveryError("recovery_drill_receipt_invalid")
+    return payload
 
 
 def _secure_file_size_sha256(path: str | Path) -> tuple[int, str]:
@@ -1647,6 +1712,10 @@ def run_recovery_drill(
             "package_manifest_sha256": manifest_sha256,
             "source_index_sha256": manifest["source"]["source_index_sha256"],
             "source_export_generated_at": manifest["source"]["generated_at"],
+            "content_fidelity": manifest["source"]["content_fidelity"],
+            "redaction_unique_candidates": manifest["source"][
+                "redaction_unique_candidates"
+            ],
             "verification_mode": "remote-download-sha256+decrypt-restore",
             "remote_parts": len(parts),
             "restore_check": {
@@ -1656,6 +1725,7 @@ def run_recovery_drill(
             },
             "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
         }
+        validate_drill_receipt(drill_receipt)
         receipt_path, latest_path = _drill_paths(vault_dir, package_id)
         try:
             _write_private_json(receipt_path, drill_receipt)
@@ -1677,3 +1747,149 @@ def run_recovery_drill(
     finally:
         if root is not None:
             shutil.rmtree(root, ignore_errors=True)
+
+
+MIN_CLI_PART_BYTES = 1024 * 1024
+
+
+def _cli_vault_path(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser().absolute()
+    return export_restore.vault_path().expanduser().absolute()
+
+
+def _read_cli_upload_receipt(path: str | Path) -> dict[str, Any]:
+    generation = export_restore._read_private_json_generation(
+        Path(path).expanduser().absolute(),
+        max_bytes=1024 * 1024,
+    )
+    if generation is None:
+        raise RecoveryError("remote_receipt_missing_or_unsafe")
+    return _validate_upload_receipt(generation[0])
+
+
+def _print_cli_result(payload: Mapping[str, Any]) -> int:
+    result = dict(payload)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if result.get("ok") is True else 1
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run only explicit local or user-confirmed Feishu recovery operations."""
+    parser = argparse.ArgumentParser(
+        description="Immortal opt-in encrypted Feishu Drive recovery"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    prepare = sub.add_parser("prepare", help="Build a local encrypted recovery package")
+    prepare.add_argument("--export-dir", required=True)
+    prepare.add_argument("--package-dir", required=True)
+    prepare.add_argument("--recipient", required=True)
+    prepare.add_argument("--part-bytes", type=int, default=512 * 1024 * 1024)
+
+    verify = sub.add_parser("verify", help="Verify a local encrypted recovery package")
+    verify.add_argument("--package-dir", required=True)
+
+    upload = sub.add_parser(
+        "upload",
+        help="Upload a local package only with --confirm-remote-write",
+    )
+    upload.add_argument("--package-dir", required=True)
+    upload.add_argument("--parent-folder-token", required=True)
+    upload.add_argument("--vault-dir", default=None)
+    upload.add_argument("--confirm-remote-write", action="store_true")
+    upload.add_argument("--dry-run", action="store_true")
+
+    drill = sub.add_parser(
+        "drill",
+        help="Download, decrypt, and restore-test a previously uploaded package",
+    )
+    drill.add_argument("--vault-dir", default=None)
+    drill.add_argument("--receipt", default=None)
+    drill.add_argument("--drill-dir", default=None)
+
+    restore = sub.add_parser(
+        "restore",
+        help="Restore a downloaded local package into a new vault directory",
+    )
+    restore.add_argument("--package-dir", required=True)
+    restore.add_argument("--destination", required=True)
+
+    status = sub.add_parser("status", help="Show safe Feishu recovery proof status")
+    status.add_argument("--vault-dir", default=None)
+
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    try:
+        if args.command == "prepare":
+            if args.part_bytes < MIN_CLI_PART_BYTES:
+                return _print_cli_result(
+                    {"ok": False, "blockers": ["part_size_too_small"]}
+                )
+            return _print_cli_result(
+                build_encrypted_package(
+                    args.export_dir,
+                    args.package_dir,
+                    recipient_fingerprint=args.recipient,
+                    part_bytes=args.part_bytes,
+                )
+            )
+        if args.command == "verify":
+            return _print_cli_result(verify_local_package(args.package_dir))
+        if args.command == "upload":
+            if args.dry_run:
+                local = verify_local_package(args.package_dir)
+                return _print_cli_result(
+                    {
+                        "ok": local.get("ok") is True,
+                        "package_id": str(local.get("package_id") or ""),
+                        "would_write": local.get("ok") is True,
+                        "blockers": list(local.get("blockers") or []),
+                    }
+                )
+            return _print_cli_result(
+                upload_package(
+                    args.package_dir,
+                    args.parent_folder_token,
+                    vault_dir=_cli_vault_path(args.vault_dir),
+                    confirm_remote_write=bool(args.confirm_remote_write),
+                )
+            )
+        if args.command == "drill":
+            vault = _cli_vault_path(args.vault_dir)
+            receipt_path = (
+                Path(args.receipt).expanduser().absolute()
+                if args.receipt
+                else vault / RECOVERY_DIRNAME / "latest-upload.json"
+            )
+            drill_root = (
+                Path(args.drill_dir).expanduser().absolute()
+                if args.drill_dir
+                else Path(tempfile.gettempdir())
+                / f"immortal-feishu-recovery-drill-{uuid.uuid4().hex}"
+            )
+            return _print_cli_result(
+                run_recovery_drill(
+                    _read_cli_upload_receipt(receipt_path),
+                    drill_root,
+                    vault_dir=vault,
+                )
+            )
+        if args.command == "restore":
+            return _print_cli_result(
+                restore_local_package(args.package_dir, args.destination)
+            )
+        if args.command == "status":
+            return _print_cli_result(
+                export_restore.get_feishu_recovery_backup_status(
+                    _cli_vault_path(args.vault_dir)
+                )
+            )
+    except RecoveryError as exc:
+        return _print_cli_result({"ok": False, "blockers": [exc.code]})
+    except Exception:
+        return _print_cli_result({"ok": False, "blockers": ["recovery_command_failed"]})
+    return _print_cli_result({"ok": False, "blockers": ["invalid_command"]})
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

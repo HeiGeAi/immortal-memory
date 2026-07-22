@@ -552,7 +552,8 @@ def migration_backup_gate(
         location = str(storage.get("location") or "unknown")
     else:
         location = str(payload.get("storage_location") or "unknown")
-    if require_external and location != "external_disk":
+    is_feishu_cloud = location == "external_cloud"
+    if require_external and location not in {"external_disk", "external_cloud"}:
         blockers.append("backup_not_external")
 
     verification = payload.get("verification")
@@ -571,7 +572,32 @@ def migration_backup_gate(
     verification_ok = verification.get("ok")
     if verification_ok is None:
         verification_ok = status_check.get("ok")
-    if verification_mode != "strict-sha256" or verification_ok is not True:
+    if is_feishu_cloud:
+        storage_provider = ""
+        if isinstance(storage, dict):
+            storage_provider = str(storage.get("provider") or "")
+        declared_provider = str(payload.get("provider") or "")
+        if (
+            storage_provider != "feishu_drive"
+            or (declared_provider and declared_provider != "feishu_drive")
+        ):
+            blockers.append("cloud_provider_invalid")
+        if (
+            verification_mode != "remote-download-sha256+decrypt-restore"
+            or verification_ok is not True
+        ):
+            blockers.append("cloud_verification_not_remote_strict")
+        recovery_drill = payload.get("recovery_drill")
+        if (
+            not isinstance(recovery_drill, dict)
+            or recovery_drill.get("ok") is not True
+            or recovery_drill.get("mode") != "decrypt-restore"
+        ):
+            blockers.append("cloud_recovery_drill_missing_or_failed")
+        source_binding = payload.get("source_binding")
+        if not isinstance(source_binding, dict) or source_binding.get("ok") is not True:
+            blockers.append("cloud_source_binding_failed")
+    elif verification_mode != "strict-sha256" or verification_ok is not True:
         blockers.append("verification_not_strict")
 
     restore_evidence = payload.get("restore_check")
@@ -2334,6 +2360,88 @@ def get_migration_backup_status(
             "generated_at": manifest_generated or "",
             "totals": manifest.get("totals", {}),
         },
+    }
+
+
+def get_feishu_recovery_backup_status(
+    vault_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return safe cloud-recovery evidence only from a private drill receipt.
+
+    Upload receipts do not satisfy this status. The exact source-index hash in
+    a post-download, post-decrypt recovery drill must still bind to the
+    current vault index when this function runs.
+    """
+    vault = vault_path(vault_dir)
+    storage = {"location": "external_cloud", "provider": "feishu_drive"}
+
+    def failed(reason: str, *, generated_at: str = "") -> dict[str, Any]:
+        return {
+            "ok": False,
+            "trust_level": "failed",
+            "generated_at": generated_at,
+            "storage_location": "external_cloud",
+            "storage": storage,
+            "provider": "feishu_drive",
+            "verification": {
+                "ok": False,
+                "mode": "remote-download-sha256+decrypt-restore",
+            },
+            "restore_check": {"ok": False, "strict": True},
+            "recovery_drill": {"ok": False, "mode": "decrypt-restore"},
+            "source_binding": {"ok": False},
+            "secret_scan": {"unique_candidates": 0},
+            "redaction": {"unique_candidates": 0},
+            "warnings": [reason],
+        }
+
+    if not _secure_directory(vault):
+        return failed("cloud_vault_unsafe")
+    receipt_generation = _read_private_json_generation(
+        vault / "recovery" / "feishu" / "latest-drill.json",
+        max_bytes=1024 * 1024,
+    )
+    if receipt_generation is None:
+        return failed("cloud_drill_receipt_missing_or_unsafe")
+    receipt, _receipt_sha256, _receipt_identity = receipt_generation
+    try:
+        from feishu_recovery import RecoveryError, validate_drill_receipt
+    except ImportError:
+        return failed("cloud_drill_receipt_invalid")
+    try:
+        validated = validate_drill_receipt(receipt)
+    except (RecoveryError, ValueError):
+        return failed("cloud_drill_receipt_invalid")
+
+    current_index = _secure_file_size_and_sha256(vault / "index.jsonl")
+    if current_index is None:
+        return failed(
+            "cloud_source_index_unreadable",
+            generated_at=str(validated["verified_at"]),
+        )
+    source_binding_ok = current_index[1] == validated["source_index_sha256"]
+    return {
+        "ok": source_binding_ok,
+        "trust_level": "verified" if source_binding_ok else "failed",
+        "generated_at": validated["verified_at"],
+        "storage_location": "external_cloud",
+        "storage": storage,
+        "provider": "feishu_drive",
+        "verification": {
+            "ok": True,
+            "mode": validated["verification_mode"],
+        },
+        "restore_check": dict(validated["restore_check"]),
+        "recovery_drill": dict(validated["recovery_drill"]),
+        "source_binding": {"ok": source_binding_ok},
+        # The source descriptor records how many original credential-shaped
+        # values were redacted. The portable cloud copy itself was scanned
+        # clean, so the migration gate must see zero remaining candidates.
+        "secret_scan": {"unique_candidates": 0},
+        "redaction": {
+            "unique_candidates": validated["redaction_unique_candidates"]
+        },
+        "warnings": [] if source_binding_ok else ["cloud_source_index_hash_mismatch"],
     }
 
 

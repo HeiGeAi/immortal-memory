@@ -40,6 +40,7 @@ from command_hints import cli_command
 from export_restore import (
     create_export,
     get_backup_status,
+    get_feishu_recovery_backup_status,
     get_migration_backup_status,
     migration_backup_gate,
     restore_check,
@@ -1061,6 +1062,11 @@ def command_feishu_distill(args) -> int:
     return run_script("feishu_distill.py", args.feishu_distill_args)
 
 
+def command_feishu_recovery(args) -> int:
+    """Forward only explicit recovery commands to the write-capable subsystem."""
+    return run_script("feishu_recovery.py", args.feishu_recovery_args)
+
+
 def command_feishu_mirror(args) -> int:
     forwarded = list(args.feishu_mirror_args)
     guard_flags = {"--expected-user-name", "--expected-user-open-id", "--reject-user-name"}
@@ -1781,7 +1787,11 @@ def command_migration_preflight(args) -> int:
     import index_db
     import preflight
 
-    status = get_migration_backup_status(IMMORTAL_DIR)
+    backup_source = str(getattr(args, "backup_source", "portable") or "portable")
+    if backup_source == "feishu-cloud":
+        status = get_feishu_recovery_backup_status(IMMORTAL_DIR)
+    else:
+        status = get_migration_backup_status(IMMORTAL_DIR)
     health_report = preflight.gather_preflight(
         max_age_hours=float(args.max_age_hours),
         vault_dir=IMMORTAL_DIR,
@@ -1812,11 +1822,31 @@ def command_migration_preflight(args) -> int:
         require_external=bool(args.require_external_backup),
         max_age_hours=float(args.max_age_hours),
     )
+    verification = status.get("verification")
+    if not isinstance(verification, dict):
+        verification = status.get("check") if isinstance(status.get("check"), dict) else {}
+    restore_evidence = status.get("restore_check")
+    if not isinstance(restore_evidence, dict):
+        restore_evidence = status.get("check") if isinstance(status.get("check"), dict) else {}
+    recovery_drill = status.get("recovery_drill")
+    source_binding = status.get("source_binding")
     result["evidence"] = {
+        "backup_source": backup_source,
         "generated_at": status.get("generated_at"),
         "storage_location": status.get("storage_location"),
-        "verification_mode": (status.get("check") or {}).get("mode"),
-        "restore_check": {"ok": bool((status.get("check") or {}).get("ok"))},
+        "provider": str(status.get("provider") or ""),
+        "verification_mode": str(verification.get("mode") or ""),
+        "restore_check": {
+            "ok": bool(restore_evidence.get("ok")),
+            "strict": bool(restore_evidence.get("strict")),
+        },
+        "recovery_drill": {
+            "ok": bool(recovery_drill.get("ok")) if isinstance(recovery_drill, dict) else False,
+            "mode": str(recovery_drill.get("mode") or "") if isinstance(recovery_drill, dict) else "",
+        },
+        "source_binding": {
+            "ok": bool(source_binding.get("ok")) if isinstance(source_binding, dict) else False,
+        },
         "secret_scan": {
             "unique_candidates": secret_candidates
         },
@@ -2039,6 +2069,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail-closed backup, health, and index parity gate before migration",
     )
     migration_preflight.add_argument("--require-external-backup", action="store_true")
+    migration_preflight.add_argument(
+        "--backup-source",
+        choices=("portable", "feishu-cloud"),
+        default="portable",
+        help="Choose a state-selected portable export or a verified Feishu recovery drill",
+    )
     migration_preflight.add_argument("--max-age-hours", type=float, default=168)
     migration_preflight.add_argument("--json", action="store_true")
     migration_preflight.set_defaults(func=command_migration_preflight)
@@ -2078,6 +2114,13 @@ def build_parser() -> argparse.ArgumentParser:
     feishu_distill = sub.add_parser("feishu-distill", help="Build structured memory candidates from Feishu clean layer")
     feishu_distill.add_argument("feishu_distill_args", nargs=argparse.REMAINDER)
     feishu_distill.set_defaults(func=command_feishu_distill)
+
+    feishu_recovery = sub.add_parser(
+        "feishu-recovery",
+        help="Build, upload, verify, and restore explicitly confirmed encrypted Feishu recovery packages",
+    )
+    feishu_recovery.add_argument("feishu_recovery_args", nargs=argparse.REMAINDER)
+    feishu_recovery.set_defaults(func=command_feishu_recovery)
 
     feishu_mirror = sub.add_parser("feishu-mirror", help="Mirror visible Feishu Drive/Wiki/Docs resources read-only")
     feishu_mirror.add_argument("feishu_mirror_args", nargs=argparse.REMAINDER)
@@ -2368,6 +2411,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("feishu_clean.py", argv[1:])
     if argv and argv[0] == "feishu-distill":
         return run_script("feishu_distill.py", argv[1:])
+    if argv and argv[0] == "feishu-recovery":
+        return command_feishu_recovery(
+            argparse.Namespace(feishu_recovery_args=argv[1:])
+        )
     if argv and argv[0] == "feishu-mirror":
         return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[1:]))
     if argv and argv[0] == "feishu-mirror-status":

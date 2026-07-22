@@ -651,7 +651,7 @@ Expected: no test needs a real Drive account or a GPG private key.
 - Modify: `tests/test_backup_migration_gate.py`
 - Modify: `tests/test_feishu_recovery.py`
 
-- [ ] **Step 1: Write failing cloud-gate tests**
+- [x] **Step 1: Write failing cloud-gate tests**
 
 ```python
 def valid_cloud_evidence():
@@ -683,7 +683,7 @@ def test_cloud_upload_without_download_restore_or_source_binding_blocks():
     assert {"cloud_recovery_drill_missing_or_failed", "cloud_source_binding_failed"}.issubset(result["blockers"])
 ```
 
-- [ ] **Step 2: Run the test to show current gate rejects cloud evidence**
+- [x] **Step 2: Run the test to show current gate rejects cloud evidence**
 
 Run:
 
@@ -693,7 +693,7 @@ PYTHONPATH=core python3 -m pytest tests/test_backup_migration_gate.py -q
 
 Expected: cloud evidence receives `backup_not_external`.
 
-- [ ] **Step 3: Implement fail-closed cloud evidence selection**
+- [x] **Step 3: Implement fail-closed cloud evidence selection**
 
 Add `get_feishu_recovery_backup_status(vault_dir)` to `core/export_restore.py`. It imports `feishu_recovery` lazily, reads `latest-drill.json` with the existing no-follow private JSON helpers, validates schema and receipt binding, compares `source_index_sha256` with `sha256_file(vault / "index.jsonl")`, and returns only safe evidence fields.
 
@@ -717,7 +717,7 @@ if cloud and (not isinstance(source_binding, dict) or source_binding.get("ok") i
 
 Preserve all existing `external_disk` behavior and tests. Do not relax secret-scan checks: cloud packages are built from the existing credential-redacted export policy.
 
-- [ ] **Step 4: Register the explicit CLI without widening old aliases**
+- [x] **Step 4: Register the explicit CLI without widening old aliases**
 
 Add these parser shapes in `core/immortal.py`:
 
@@ -738,7 +738,7 @@ migration_preflight.add_argument(
 
 `command_feishu_recovery` forwards only its remainder to `feishu_recovery.py`. `command_migration_preflight` calls `get_feishu_recovery_backup_status` only when `backup_source == "feishu-cloud"`, preserving existing tests that pass an older `argparse.Namespace` by using `getattr(args, "backup_source", "portable")`.
 
-- [ ] **Step 5: Run migration and CLI tests, then commit**
+- [x] **Step 5: Run migration and CLI tests, then commit**
 
 Run:
 
