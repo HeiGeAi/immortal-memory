@@ -954,8 +954,15 @@ def dashboard_server_args(args: argparse.Namespace) -> list[str]:
     return server_args
 
 
+def command_dashboard_server(args) -> int:
+    try:
+        return run_script("profile_review.py", dashboard_server_args(args))
+    except KeyboardInterrupt:
+        return 130
+
+
 def command_dashboard(args) -> int:
-    return run_script("profile_review.py", dashboard_server_args(args))
+    return command_dashboard_server(args)
 
 
 def command_dashboard_export(_args) -> int:
@@ -1512,7 +1519,7 @@ def command_profile_review(args) -> int:
 
 
 def command_agent_factory(args) -> int:
-    return run_script("profile_review.py", dashboard_server_args(args))
+    return command_dashboard_server(args)
 
 
 def command_agent_entry(_args) -> int:

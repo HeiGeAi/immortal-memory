@@ -290,6 +290,18 @@ def test_dashboard_commands_propagate_script_failures(command, arguments, monkey
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize("command", ["dashboard", "agent-factory"])
+def test_dashboard_server_commands_return_interrupt_status(command, monkeypatch, capsys):
+    def interrupted(_script, _args=None):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(immortal, "run_script", interrupted)
+    args = immortal.build_parser().parse_args([command])
+
+    assert args.func(args) == 130
+    assert capsys.readouterr().out == ""
+
+
 def test_v1_overview_reuses_truth_snapshot(tmp_path):
     server, base = start_server(tmp_path)
     try:
