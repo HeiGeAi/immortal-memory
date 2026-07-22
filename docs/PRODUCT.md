@@ -33,6 +33,8 @@ Remember -> Claim -> Living Self / Judgment -> Context -> Agent -> Outcome -> Re
 
 Health is supporting evidence, not the product's main value. A healthy state stays compact. A blocking condition names the failed proof and the safe next action. Unknown is never rendered as healthy.
 
+Open the product through `immortal-memory dashboard`, not a generated file. The legacy `dashboard-export` output is marked non-live, preventing historical HTML from being mistaken for a running system.
+
 ## Correction and version behavior
 
 Original evidence is immutable. A user correction supersedes a Claim and creates a replacement while keeping the chain. The Living Self is rebuilt into a new immutable version. Version restore also creates a new descendant version, so audit history remains monotonic. Judgment and Context actions require expected versions, request IDs, idempotency keys, actor identity, and a reason.

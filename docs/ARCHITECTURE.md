@@ -29,6 +29,8 @@ The local dashboard uses seven stable, deep-linkable modules:
 6. **Trust** explains attribution, weak evidence, privacy exclusions, stale projections, and recent corrections.
 7. **System** contains collection, index, backup, diagnostics, service, version, logs, and controlled maintenance.
 
+The canonical entrypoint is `immortal-memory dashboard`. It starts a loopback HTTP service bound only to `127.0.0.1` and renders current `/api/v2` evidence. `immortal-memory agent-factory` is a compatibility alias during v1.1. `immortal-memory dashboard-export` creates only an explicit legacy static HTML snapshot; it is never health proof or the current product surface.
+
 The Living Self inside the Self module has eight sections: identity and commitments, values, expression DNA, mental models, decision heuristics, anti-patterns, tensions, and honest boundaries. These eight sections must not be confused with the seven dashboard modules.
 
 ## Authoritative layers

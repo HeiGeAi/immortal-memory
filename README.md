@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.1.1-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.1.2-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -110,13 +110,15 @@ immortal-memory agent-entry
 immortal-memory agent-context "help me review this product idea" --print
 ```
 
-打开本地控制台：
+打开真实本地产品：
 
 ```bash
-immortal-memory agent-factory
+immortal-memory dashboard --open
 ```
 
-然后访问 http://127.0.0.1:8765/
+该命令启动仅限 loopback 的服务并打开真实七模块产品。它使用实时本地 API，因此「系统」可以显示 current、partial、failed、unknown 证据，而不是生成的成功卡片。
+
+`immortal-memory agent-factory` 是 v1.1 的兼容别名。只有明确需要 legacy static HTML snapshot 时才使用 `immortal-memory dashboard-export`。该文件不是实时看板，不能证明当前健康状态。
 
 看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack；「信任」解释归因、隐私排除和纠正；「系统」展示采集、索引、备份、服务与版本健康。
 
@@ -212,7 +214,7 @@ immortal-memory agent-context "release acceptance" --print
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.1-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.2-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke
@@ -378,13 +380,15 @@ immortal-memory agent-entry
 immortal-memory agent-context "help me review this product idea" --print
 ```
 
-Open the local dashboard:
+Open the real local dashboard:
 
 ```bash
-immortal-memory agent-factory
+immortal-memory dashboard --open
 ```
 
-Then visit http://127.0.0.1:8765/
+This command starts a loopback-only service and opens the real seven-module product. It uses live local APIs, so System can show current, partial, failed, and unknown evidence rather than a generated success card.
+
+`immortal-memory agent-factory` is the v1.1 compatibility alias. Use `immortal-memory dashboard-export` only when you deliberately need a legacy static HTML snapshot. That file is not the live dashboard and cannot prove current health.
 
 The dashboard has seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. v1.0 reading paths, health checks, Agent Bridge, and the legacy Control Center remain compatible for one release cycle. See [Architecture](./docs/ARCHITECTURE.md), [Product](./docs/PRODUCT.md), and [Privacy](./docs/PRIVACY.md) for migration, rollback, health, and privacy contracts.
 

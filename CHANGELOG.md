@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+
+- Make `immortal-memory dashboard` start the real loopback seven-module product service by default.
+- Keep `immortal-memory agent-factory` as a compatibility alias during v1.1.
+- Limit `immortal-memory dashboard-export` to an explicit non-live legacy static snapshot.
+- Reject non-loopback binding to protect the private vault from accidental exposure.
+
 ## 1.1.1
 
 - Mark a loaded daily LaunchAgent as requiring attention when its most recent exit code is nonzero, and expose the code as bounded scheduler evidence instead of showing a false healthy state.
