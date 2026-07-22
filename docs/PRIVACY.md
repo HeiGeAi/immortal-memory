@@ -46,6 +46,14 @@ When historical memory text contains credential shapes, use backup-copy redactio
 
 v1.1 migration derives new files and preserves v1.0 sources. A hash-bound timezone contract may transform a verified legacy wall time only in the SQLite `ts_utc` projection, never in the raw JSONL or its `ts` value. Rollback does not require deleting new derived directories. Deletion requests must distinguish original evidence, derived models, indexes, backups, and published artifacts so one action does not falsely imply all copies are gone.
 
+### Encrypted Feishu recovery boundary
+
+An optional Feishu recovery package starts from the existing credential-redacted export policy. The package contains encrypted GPG parts plus a plaintext metadata-only manifest. The manifest must not contain local paths, vault names, record bodies, credentials, Drive tokens, open IDs, or a full public-key fingerprint. The local upload receipt may contain Drive identifiers and is private with restrictive permissions. The dashboard receives only a bounded status, never a receipt, token, path, command, part name, or fingerprint.
+
+Creating a package requires an already-installed public GPG key fingerprint. The project does not generate, import, export, print, or store private keys. A remote write requires a user-owned parent folder and an explicit confirmation flag. Never use Drive root or an untrusted shared folder as the recovery destination.
+
+An uploaded package is not proven recoverable. Only a fresh remote-download, hash-verification, decrypt, strict export check, and isolated restore drill writes the private proof receipt used by the migration gate. If the current raw index changes, that proof becomes stale for migration until a new package and drill complete. The public GitHub release scan is a separate process: it must never include a private recovery package, its receipts, or any vault artifact.
+
 ## Public release checklist
 
 Run the privacy scan over exactly the Git-tracked release set:

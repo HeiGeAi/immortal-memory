@@ -73,6 +73,26 @@ v1.1 follows `audit -> external backup -> isolated restore -> stage -> migrate -
 
 Rollback stops v1.1 services, reinstalls the retained v1.0 package and LaunchAgent configuration, ignores v1.1 derived directories, verifies original vault hashes, and reruns v1.0 health, preflight, restore, and Agent Context checks. Deleting v1.1 directories is not required.
 
+## Encrypted Feishu disaster recovery
+
+Feishu Drive is an optional, user-owned offsite recovery location. It is separate from the read-only Feishu ingestion mirror and has a deliberately narrow state sequence:
+
+```text
+local verified credential-redacted export
+  -> GPG encrypted parts
+  -> confirmed Feishu upload
+  -> exact remote download
+  -> decrypt and isolated restore
+  -> private proof receipt
+  -> migration gate
+```
+
+The package manifest contains only bounded metadata such as hashes, counts, timestamps, part names, and a public-key fingerprint suffix. Encrypted parts are uploaded before the manifest and are never overwritten. The process requires an existing public GPG key fingerprint to create a package and the matching private key only to run a real restore drill.
+
+Drive synchronization, a successful upload, a local upload receipt, and a green dashboard card without a current download-and-restore drill are not disaster-recovery proof. The migration gate accepts `external_cloud` only when the private drill receipt validates, remote bytes were checked after download, decrypt-and-restore succeeded, the receipt is fresh, and its raw-index hash still matches the current vault.
+
+GitHub release scanning and encrypted private recovery are separate pipelines. Public artifacts are built from a clean Git commit and scanned for private data. Feishu recovery packages are private, encrypted artifacts stored only in a user-owned Drive location and are never release inputs.
+
 ## Compatibility
 
 For one release cycle, v1.1 retains v1.0 read paths, health and preflight commands, Agent Bridge behavior, and the legacy Control Center under System. Adapters remain thin. They call the core bridge and never own the data model.

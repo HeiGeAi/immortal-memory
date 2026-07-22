@@ -147,6 +147,46 @@ files have been secret-scanned.
 
 v1.1 先派生、后切换，不改写 v1.0 原始文件。需要回滚时，停止 v1.1 服务，恢复 v1.0 安装包和 LaunchAgent，忽略 v1.1 新增派生目录，然后核对原始 vault 哈希并重新运行 v1.0 健康检查。
 
+### 飞书网盘异地恢复
+
+飞书网盘可以作为额外的异地恢复介质，但它不是同步盘替代品。只有「加密上传后，再从远端下载、解密、严格校验并恢复到隔离目录」的演练成功，才会在迁移门禁中被当作外部恢复证据。
+
+以下命令只使用你自己的 vault、你已经安装的 GPG 公钥和你自己拥有的飞书文件夹。尖括号内容必须替换成真实的公开指纹或用户自有文件夹 token，绝不要提供私钥、不要把包上传到网盘根目录或不受信任的共享文件夹。
+
+```bash
+# 1. 生成仅用于恢复的、已做凭证形态脱敏的本地导出。
+immortal-memory backup \
+  --vault-dir "$HOME/.immortal" \
+  --output-dir "$HOME/.immortal/recovery/exports" \
+  --redact-secrets --fail-on-secrets
+
+# 2. 用已经存在的 GPG 公钥指纹构建本地加密包。此步不会访问飞书。
+immortal-memory feishu-recovery prepare \
+  --export-dir "$HOME/.immortal/recovery/exports/immortal-export-<timestamp>" \
+  --package-dir "$HOME/.immortal/recovery/packages/<package-id>" \
+  --recipient <PUBLIC_KEY_FINGERPRINT>
+
+# 3. 显式确认后才写入飞书。父文件夹必须是你专门创建并拥有的目录。
+immortal-memory feishu-recovery upload \
+  --package-dir "$HOME/.immortal/recovery/packages/<package-id>" \
+  --parent-folder-token <USER_OWNED_FOLDER_TOKEN> \
+  --vault-dir "$HOME/.immortal" \
+  --confirm-remote-write
+
+# 4. 从远端下载所有密文分片，用匹配的私钥解密并恢复到临时隔离 vault。
+immortal-memory feishu-recovery drill \
+  --vault-dir "$HOME/.immortal" \
+  --receipt "$HOME/.immortal/recovery/feishu/receipts/<package-id>.upload.json"
+
+# 5. 只有演练收据仍绑定当前 index.jsonl 时，才允许把它作为迁移外部备份。
+immortal-memory migration-preflight \
+  --require-external-backup \
+  --backup-source feishu-cloud \
+  --json
+```
+
+`prepare` 只创建本地密文分片，不上传。`upload` 会向飞书写入私有加密数据，必须带 `--confirm-remote-write`。`drill` 需要对应私钥，它会下载、核对哈希、解密、严格校验导出并完成隔离恢复，临时明文随后删除。上传成功、本地收据、飞书同步状态或没有当前演练的绿色看板都不能证明灾备可恢复。
+
 ### v1.0 命令迁移
 
 `immortal package` 已安全退役。公开发布只能从干净 Git commit 构建 wheel 和 source archive，并分别扫描源码、wheel、archive 和 adapter。不要从真实运行目录复制文件，也不要用姓名、路径或客户名替换表冒充脱敏。

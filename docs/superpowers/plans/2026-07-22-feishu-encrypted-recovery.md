@@ -623,9 +623,9 @@ delete extracted and recovered payloads in finally
 write only a private hash-and-count recovery drill receipt
 ```
 
-Also expose `restore_local_package(package_dir, destination, cryptor=...)` for a replacement machine that has downloaded the encrypted package manually. It must run the same package validation, decrypt, safe tar extraction, strict restore check, and `restore_export(..., rebind_vault_config=True)`, retain only the chosen restored vault, and delete its temporary plaintext extraction tree.
+Also expose `restore_local_package(package_dir, destination, cryptor=cryptor)` for a replacement machine that has downloaded the encrypted package manually. It must run the same package validation, decrypt, safe tar extraction, strict restore check, and `restore_export(extracted_export, destination, rebind_vault_config=True)`, retain only the chosen restored vault, and delete its temporary plaintext extraction tree.
 
-The success receipt is `<vault>/recovery/feishu/receipts/<package-id>.drill.json`, and `latest-drill.json` points to it. It contains `schema_version`, `provider`, `verified_at`, `package_id`, `package_manifest_sha256`, `source_index_sha256`, `source_export_generated_at`, `verification_mode`, `remote_parts`, `restore_check`, and `recovery_drill`. It must not contain paths, tokens, ciphertext, manifest bodies, or source text.
+The success receipt is `<vault>/recovery/feishu/receipts/<package-id>.drill.json`, and `latest-drill.json` points to it. It contains `schema_version`, `provider`, `verified_at`, `package_id`, `package_manifest_sha256`, `source_index_sha256`, `source_export_generated_at`, `content_fidelity`, `redaction_unique_candidates`, `verification_mode`, `remote_parts`, `restore_check`, and `recovery_drill`. It must not contain paths, tokens, ciphertext, manifest bodies, or source text.
 
 - [x] **Step 4: Add negative extraction and proof-binding tests**
 
@@ -846,7 +846,7 @@ Expected: the dashboard is informative but never becomes a one-click cloud-write
 - Modify: `docs/PRIVACY.md`
 - Modify: `tests/test_v11_packaging.py`
 
-- [ ] **Step 1: Add exact operator documentation**
+- [x] **Step 1: Add exact operator documentation**
 
 Add this staged command sequence to `README.md`, replacing placeholders only with user-owned paths and an already-installed public-key fingerprint:
 
@@ -877,11 +877,11 @@ immortal-memory migration-preflight \
 
 Explain that `prepare` does not upload, `upload` writes private encrypted data, `drill` requires the matching private key and proves restoration, and no command should target Drive root or a shared untrusted folder.
 
-- [ ] **Step 2: Update architecture and privacy contracts**
+- [x] **Step 2: Update architecture and privacy contracts**
 
 Add the exact state sequence `local verified redacted export -> GPG encrypted parts -> confirmed Feishu upload -> exact remote download -> decrypt and isolated restore -> private proof receipt -> migration gate`. State explicitly that Drive synchronization, a successful upload, a local receipt, and a green dashboard card without a current drill are not disaster-recovery proof. State that GitHub release scanning and encrypted private recovery are separate pipelines.
 
-- [ ] **Step 3: Add packaging closure test**
+- [x] **Step 3: Add packaging closure test**
 
 ```python
 def test_wheel_contains_feishu_recovery_module_and_no_vault_artifacts(tmp_path):
@@ -891,7 +891,7 @@ def test_wheel_contains_feishu_recovery_module_and_no_vault_artifacts(tmp_path):
     assert not any(".immortal" in name or "recovery/feishu" in name for name in names)
 ```
 
-- [ ] **Step 4: Run the full verification set**
+- [x] **Step 4: Run the full verification set**
 
 Run:
 
@@ -905,7 +905,7 @@ git diff --check
 
 Expected: all tests pass, source and wheel contain no private vault content, and the package version remains the intended `1.1.0` release version already synchronized in `core/VERSION` and `pyproject.toml`.
 
-- [ ] **Step 5: Browser acceptance against an isolated vault**
+- [x] **Step 5: Browser acceptance against an isolated vault**
 
 Run the System view against a temporary vault with a synthetic verified cloud receipt and confirm:
 
@@ -917,7 +917,7 @@ the existing isolated-vault action-disablement remains intact
 
 Capture only synthetic test data in `output/playwright/`; do not capture a live vault or commit screenshots.
 
-- [ ] **Step 6: Commit documentation and verification changes**
+- [x] **Step 6: Commit documentation and verification changes**
 
 ```bash
 git add README.md docs/ARCHITECTURE.md docs/PRIVACY.md tests/test_v11_packaging.py

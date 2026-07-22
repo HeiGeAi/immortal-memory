@@ -21,7 +21,7 @@ def _run(command, **kwargs):
     )
 
 
-def test_clean_wheel_installs_complete_v11_cli(tmp_path):
+def build_wheel(tmp_path: Path) -> Path:
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
     build = _run(
@@ -42,9 +42,17 @@ def test_clean_wheel_installs_complete_v11_cli(tmp_path):
     assert build.returncode == 0, build.stdout + build.stderr
     wheels = list(wheelhouse.glob("immortal_memory-*.whl"))
     assert len(wheels) == 1
-    wheel = wheels[0]
+    return wheels[0]
+
+
+def wheel_names(wheel: Path) -> set[str]:
     with zipfile.ZipFile(wheel) as archive:
-        members = set(archive.namelist())
+        return set(archive.namelist())
+
+
+def test_clean_wheel_installs_complete_v11_cli(tmp_path):
+    wheel = build_wheel(tmp_path)
+    members = wheel_names(wheel)
     required = {
         "immortal_memory/claim_store.py",
         "immortal_memory/context_compiler.py",
@@ -109,3 +117,13 @@ def test_clean_wheel_installs_complete_v11_cli(tmp_path):
         assert "ModuleNotFoundError" not in output
         assert "ImportError" not in output
         assert "Traceback" not in output
+
+
+def test_wheel_contains_feishu_recovery_module_and_no_vault_artifacts(tmp_path):
+    wheel = build_wheel(tmp_path)
+    names = wheel_names(wheel)
+
+    assert "immortal_memory/feishu_recovery.py" in names
+    assert not any(
+        ".immortal" in name or "recovery/feishu" in name for name in names
+    )

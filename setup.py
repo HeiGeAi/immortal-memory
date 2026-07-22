@@ -11,6 +11,7 @@ setup(
     name="immortal-memory",
     version=(ROOT / "core" / "VERSION").read_text(encoding="utf-8").strip(),
     description="Local-first personal memory layer for AI agents",
+    url="https://github.com/HeiGeAi/immortal-memory",
     python_requires=">=3.9",
     packages=["immortal_memory"],
     package_dir={"immortal_memory": "core"},
