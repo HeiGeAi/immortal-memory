@@ -6,6 +6,7 @@ import hashlib
 import json
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -127,6 +128,46 @@ class BackupStatusTrustTest(unittest.TestCase):
             status = self._status(tmp, verify=True)
             self.assertEqual(status.get("trust_level"), "verified")
             self.assertEqual(status["check"]["checked_files"], 1)
+
+
+class ExportSourceBoundaryTest(unittest.TestCase):
+    def test_export_rejects_symlinked_source_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            vault = base / "vault"
+            vault.mkdir()
+            outside = base / "outside.jsonl"
+            outside.write_text("{}\n", encoding="utf-8")
+            (vault / "index.jsonl").symlink_to(outside)
+
+            with self.assertRaises(ValueError):
+                export_restore.create_export(vault, base / "exports")
+
+            self.assertFalse(list((base / "exports").glob("immortal-export-*")))
+
+
+def test_real_backup_always_requests_strict_restore_check(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(export_restore, "IMMORTAL_DIR", tmp_path / "vault")
+    import immortal
+
+    monkeypatch.setattr(immortal, "command_export", lambda _args: 0)
+    monkeypatch.setattr(
+        immortal,
+        "read_json",
+        lambda _path, _default: {"last_portable_export_dir": str(tmp_path / "export")},
+    )
+
+    def capture(args):
+        captured["strict"] = args.strict
+        return 0
+
+    monkeypatch.setattr(immortal, "command_restore_check", capture)
+
+    result = immortal.command_backup(SimpleNamespace(redact_secrets=False))
+
+    assert result == 0
+    assert captured["strict"] is True
 
 
 def test_export_restore_includes_v11_event_layers(tmp_path, monkeypatch):

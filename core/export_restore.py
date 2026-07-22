@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 IMMORTAL_DIR = Path.home() / ".immortal"
 EXPORTS_DIRNAME = "exports"
 MANIFEST_NAME = "manifest.json"
+SECRET_REDACTION_RECEIPT = "secret-redaction-receipt.json"
 EXPORT_PREFIX = "immortal-export-"
 
 REQUIRED_PATHS = [
@@ -175,10 +176,14 @@ def should_skip_dir(path: Path, source_root: Path, export_root: Path | None = No
 
 
 def iter_files(root: Path, source_root: Path, export_root: Path | None = None) -> list[Path]:
+    if root.is_symlink():
+        raise ValueError(f"unsafe symlink in export source: {relpath(root, source_root)}")
     if root.is_file():
         return [root]
     files: list[Path] = []
     for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            raise ValueError(f"unsafe symlink in export source: {relpath(path, source_root)}")
         if path.is_dir():
             continue
         if any(should_skip_dir(parent, source_root, export_root) for parent in [path.parent, *path.parents]):
@@ -301,6 +306,7 @@ def create_export(
     output_dir: str | Path | None = None,
     include_raw: bool = False,
     fail_on_secrets: bool = False,
+    redact_secrets: bool = False,
 ) -> dict[str, Any]:
     """Create a portable export directory and return its manifest payload."""
     vault = vault_path(vault_dir)
@@ -326,13 +332,35 @@ def create_export(
 
     items: list[dict[str, Any]] = []
     total_bytes = 0
-    for source in files:
-        relative = relpath(source, vault)
-        target = export_dir / relative
-        copy_file(source, target)
-        item = file_item(target, export_dir)
-        items.append(item)
-        total_bytes += item["size"]
+    secret_redaction: dict[str, Any] = {}
+    try:
+        for source in files:
+            relative = relpath(source, vault)
+            target = export_dir / relative
+            if relative == "index.jsonl" and redact_secrets:
+                import secret_scan
+
+                secret_redaction = secret_scan.redact_jsonl_copy(source, target)
+            else:
+                copy_file(source, target)
+            item = file_item(target, export_dir)
+            items.append(item)
+            total_bytes += item["size"]
+        if redact_secrets and secret_redaction:
+            receipt_path = export_dir / SECRET_REDACTION_RECEIPT
+            write_json_atomic(
+                receipt_path,
+                {
+                    "generated_at": iso_utc(),
+                    **secret_redaction,
+                },
+            )
+            receipt_item = file_item(receipt_path, export_dir)
+            items.append(receipt_item)
+            total_bytes += receipt_item["size"]
+    except Exception:
+        shutil.rmtree(export_dir, ignore_errors=True)
+        raise
 
     # 出口敏感形态扫描（hash-only，绝不写入原文）。index 清洗完成前默认只告警不阻断，
     # 避免自动导出断流；清洗后调用方应传 fail_on_secrets=True 转为硬门禁。
@@ -346,7 +374,17 @@ def create_export(
             "scanned_file": "index.jsonl",
             "unique_candidates": report["unique_candidates"],
             "unique_by_pattern": report["unique_by_pattern"],
+            "scan_complete": report.get("scan_complete", False),
+            "invalid_json_line_count": report.get("invalid_json_line_count", 0),
+            "oversized_line_count": report.get("oversized_line_count", 0),
         }
+        if not report.get("scan_complete", False):
+            warnings.append(
+                "secret_scan_incomplete: index.jsonl 含无效 JSON、无效 UTF-8 或超大行"
+            )
+            if fail_on_secrets:
+                shutil.rmtree(export_dir, ignore_errors=True)
+                raise SecretShapesFound("export aborted: index.jsonl secret scan is incomplete")
         if report["unique_candidates"] > 0:
             warnings.append(
                 f"secret_shapes_present: index.jsonl 含 {report['unique_candidates']} 个未脱敏凭证形态候选"
@@ -369,6 +407,10 @@ def create_export(
         "export_dir": str(export_dir),
         "storage_location": location,
         "secret_scan": secret_summary,
+        "secret_redaction": {
+            **secret_redaction,
+            "receipt": SECRET_REDACTION_RECEIPT,
+        } if secret_redaction else {},
         "include_raw": bool(include_raw),
         "items": items,
         "totals": {
@@ -2182,6 +2224,11 @@ def main() -> int:
     p_export.add_argument("--output-dir")
     p_export.add_argument("--include-raw", action="store_true")
     p_export.add_argument("--fail-on-secrets", action="store_true", help="Abort export when unredacted secret shapes are detected in index.jsonl")
+    p_export.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact detected credential shapes only in the exported index copy and write a hash-only receipt",
+    )
 
     p_latest = sub.add_parser("latest")
     p_latest.add_argument("--vault-dir")
@@ -2221,7 +2268,15 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "create-export":
         try:
-            print_json(create_export(args.vault_dir, args.output_dir, args.include_raw, fail_on_secrets=args.fail_on_secrets))
+            print_json(
+                create_export(
+                    args.vault_dir,
+                    args.output_dir,
+                    args.include_raw,
+                    fail_on_secrets=args.fail_on_secrets,
+                    redact_secrets=args.redact_secrets,
+                )
+            )
         except SecretShapesFound as exc:
             print(f"FAILED: {exc}", file=sys.stderr)
             return 1

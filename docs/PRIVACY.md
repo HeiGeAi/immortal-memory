@@ -42,6 +42,8 @@ Files containing events, previews, receipts, contracts, or quarantine metadata a
 
 Before migration, create a verified export on a different device or volume. The manifest binds each file hash, event heads, view watermarks, schema versions, and restore replay results. A backup stored only inside the source vault or on the same failure domain is not sufficient loss protection.
 
+When historical memory text contains credential shapes, use backup-copy redaction instead of rewriting the authoritative `index.jsonl`. The export stores a deterministic redacted index and a hash-only `secret-redaction-receipt.json`, then scans the exported index again and runs strict restore verification. This mechanism is deliberately scoped to `index.jsonl`; it does not certify arbitrary binary files or unrelated vault paths as secret-free. Export source paths containing symlinks are rejected rather than followed.
+
 v1.1 migration derives new files and preserves v1.0 sources. Rollback does not require deleting new derived directories. Deletion requests must distinguish original evidence, derived models, indexes, backups, and published artifacts so one action does not falsely imply all copies are gone.
 
 ## Public release checklist

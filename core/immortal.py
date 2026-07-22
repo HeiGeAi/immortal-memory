@@ -1689,6 +1689,8 @@ def command_export(args) -> int:
         vault_dir=args.vault_dir,
         output_dir=args.output_dir,
         include_raw=bool(args.include_raw),
+        fail_on_secrets=bool(getattr(args, "fail_on_secrets", False)),
+        redact_secrets=bool(getattr(args, "redact_secrets", False)),
     )
     totals = manifest.get("totals") or {}
     write_state_key("last_portable_export", manifest.get("generated_at"))
@@ -1740,7 +1742,7 @@ def command_backup(args) -> int:
 
     class _RestoreArgs:
         export_path = export_dir
-        strict = False
+        strict = True
         json = False
 
     return command_restore_check(_RestoreArgs())
@@ -1984,6 +1986,16 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--vault-dir", default=None)
     backup.add_argument("--output-dir", default=None, help="Export target; use an external disk or synced folder for real loss protection")
     backup.add_argument("--include-raw", action="store_true")
+    backup.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact credential shapes only in the backup copy and require strict verification",
+    )
+    backup.add_argument(
+        "--fail-on-secrets",
+        action="store_true",
+        help="Abort if credential shapes remain after optional backup-copy redaction",
+    )
     backup.set_defaults(func=command_backup)
     sub.add_parser("distill", help="Regenerate digital soul").set_defaults(func=lambda args: run_script("distill.py"))
     sub.add_parser("profile", help="Build structured owner profile from distilled memories and raw evidence").set_defaults(
@@ -2001,6 +2013,16 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--vault-dir", default=None)
     export.add_argument("--output-dir", default=None)
     export.add_argument("--include-raw", action="store_true", help="Also include explicitly supported raw source folders")
+    export.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact credential shapes only in the exported index copy and write a hash-only receipt",
+    )
+    export.add_argument(
+        "--fail-on-secrets",
+        action="store_true",
+        help="Abort if credential shapes remain after optional export-copy redaction",
+    )
     export.set_defaults(func=command_export)
 
     backup_status = sub.add_parser("backup-status", help="Show latest portable export status")

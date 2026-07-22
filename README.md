@@ -125,7 +125,7 @@ immortal-memory agent-factory
 下面这组命令只完成隔离恢复和迁移演练，不会切换生产。不要直接在生产 vault 上试跑。先创建异盘备份并通过严格恢复校验，再把 v1.0 vault 恢复到独立 staging 目录。含无时区 Hermes 时间戳时，必须先准备经哈希绑定的私有时区合同，并把参数同时传给 staging 和 migration：
 
 ```bash
-immortal-memory backup --vault-dir "$HOME/.immortal" --output-dir "/Volumes/IMMORTAL_BACKUP/immortal-v1.0"
+immortal-memory backup --vault-dir "$HOME/.immortal" --output-dir "/Volumes/IMMORTAL_BACKUP/immortal-v1.0" --redact-secrets --fail-on-secrets
 EXPORT_DIR="$(find "/Volumes/IMMORTAL_BACKUP/immortal-v1.0" -maxdepth 1 -type d -name 'immortal-export-*' | sort | tail -n 1)"
 immortal-memory restore-check "$EXPORT_DIR" --strict --json
 python3 core/export_restore.py restore-export "$EXPORT_DIR" "/tmp/immortal-v11-staging" --rebind-vault-config
@@ -133,6 +133,13 @@ TIMEZONE_CONTRACT="/absolute/path/to/hermes-timezone-contract.json"
 python3 core/export_restore.py stage-v11-index --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
 python3 core/export_restore.py v11-migrate --vault-dir "/tmp/immortal-v11-staging" --timezone-contract "$TIMEZONE_CONTRACT"
 ```
+
+`--redact-secrets` never edits the authoritative vault. It creates a deterministic
+credential-redacted `index.jsonl` inside the backup generation, records full
+SHA-256 evidence in `secret-redaction-receipt.json`, scans the exported copy
+again, and makes `backup` use strict restore verification. This option is scoped
+to the memory index. It is not a claim that arbitrary binary or unrelated vault
+files have been secret-scanned.
 
 如果旧 `index.jsonl` 含无时区时间戳，`stage-v11-index` 会隔离无法证明时区的记录并拒绝生产切换。只有来源可信、权限为 `0600`、内容哈希匹配的 Hermes 时区合同才能通过 `--timezone-contract /absolute/path/to/contract.json` 提供证据。不要为了让门禁变绿而猜时区。
 
