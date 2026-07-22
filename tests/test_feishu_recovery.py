@@ -4,6 +4,7 @@ import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
+import tarfile
 
 import pytest
 
@@ -17,6 +18,8 @@ from feishu_recovery import (
     build_package_manifest,
     inspect_source_export,
     require_fingerprint,
+    run_recovery_drill,
+    restore_local_package,
     upload_package,
     validate_package_manifest,
     verify_local_package,
@@ -37,6 +40,11 @@ def write_redacted_export(
     index = export_dir / "index.jsonl"
     index.write_text(
         '{"id":"one","content":"[REDACTED_SECRET]"}\n',
+        encoding="utf-8",
+    )
+    config = export_dir / "config.json"
+    config.write_text(
+        json.dumps({"vault_dir": "/private/live/vault", "owner": "test"}),
         encoding="utf-8",
     )
     receipt = export_dir / "secret-redaction-receipt.json"
@@ -69,14 +77,19 @@ def write_redacted_export(
                 "sha256": _sha256(index),
             },
             {
+                "relpath": "config.json",
+                "size": config.stat().st_size,
+                "sha256": _sha256(config),
+            },
+            {
                 "relpath": "secret-redaction-receipt.json",
                 "size": receipt.stat().st_size,
                 "sha256": _sha256(receipt),
             },
         ],
         "totals": {
-            "files": 2,
-            "bytes": index.stat().st_size + receipt.stat().st_size,
+            "files": 3,
+            "bytes": index.stat().st_size + config.stat().st_size + receipt.stat().st_size,
         },
     }
     (export_dir / "manifest.json").write_text(
@@ -93,7 +106,7 @@ def valid_source_descriptor() -> dict:
         "source_index_sha256": "c" * 64,
         "redacted_index_sha256": "d" * 64,
         "redaction_unique_candidates": 2,
-        "files": 2,
+        "files": 3,
         "bytes": 12,
         "content_fidelity": "credential_redacted",
     }
@@ -119,8 +132,9 @@ def test_inspect_source_export_requires_strict_redaction_proof(tmp_path):
         "manifest_sha256": _sha256(export_dir / "manifest.json"),
         "source_index_sha256": "a" * 64,
         "redacted_index_sha256": _sha256(export_dir / "index.jsonl"),
-        "files": 2,
+        "files": 3,
         "bytes": (export_dir / "index.jsonl").stat().st_size
+        + (export_dir / "config.json").stat().st_size
         + (export_dir / "secret-redaction-receipt.json").stat().st_size,
     }
     encoded = json.dumps(inspected, sort_keys=True)
@@ -558,3 +572,204 @@ def test_upload_removes_new_receipt_when_private_receipt_write_fails(tmp_path, m
     assert result["ok"] is False
     assert result["blockers"] == ["receipt_write_failed"]
     assert not list((tmp_path / "vault").rglob("*.upload.json"))
+
+
+class CopyCryptorWithDecrypt(CopyCryptor):
+    def decrypt(self, part_paths, consume_plaintext):
+        consume_plaintext(BytesIO(b"".join(path.read_bytes() for path in part_paths)))
+
+
+def make_remote_receipt(package: Path) -> dict:
+    manifest = json.loads(
+        (package / "immortal-feishu-recovery.json").read_text(encoding="utf-8")
+    )
+    remote_files = []
+    for index, part in enumerate(manifest["parts"], start=1):
+        remote_files.append(
+            {
+                "package_name": part["name"],
+                "remote_name": Path(part["name"]).name,
+                "bytes": part["bytes"],
+                "sha256": part["sha256"],
+                "file_token": f"filepart{index:08d}",
+            }
+        )
+    manifest_path = package / "immortal-feishu-recovery.json"
+    remote_files.append(
+        {
+            "package_name": "immortal-feishu-recovery.json",
+            "remote_name": "immortal-feishu-recovery.json",
+            "bytes": manifest_path.stat().st_size,
+            "sha256": _sha256(manifest_path),
+            "file_token": "filemanifest0001",
+        }
+    )
+    return {
+        "schema_version": 1,
+        "provider": "feishu_drive",
+        "package_id": manifest["package_id"],
+        "uploaded_at": "2026-07-22T00:00:01Z",
+        "package_manifest_sha256": _sha256(manifest_path),
+        "source": manifest["source"],
+        "remote_package_folder_token": "package_new_12345678",
+        "remote_parts_folder_token": "parts_new_12345678",
+        "remote_folder_hash": feishu_recovery._remote_folder_hash(
+            "package_new_12345678"
+        ),
+        "remote_files": remote_files,
+        "remote_verification": {"ok": True, "mode": "exact", "checks": 2},
+    }
+
+
+class DownloadingClient:
+    def __init__(self, package: Path, receipt: dict, *, corrupt_name: str = ""):
+        self._sources = {
+            item["file_token"]: (item["package_name"], package / item["package_name"])
+            for item in receipt["remote_files"]
+        }
+        self.corrupt_name = corrupt_name
+        self.downloads = []
+
+    def download(self, file_token, output):
+        package_name, source = self._sources[file_token]
+        self.downloads.append(package_name)
+        payload = source.read_bytes()
+        if package_name == self.corrupt_name:
+            payload += b"tampered"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(payload)
+
+
+def test_recovery_drill_downloads_all_parts_and_runs_real_restore(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package = tmp_path / "package"
+    built = build_encrypted_package(
+        export_dir,
+        package,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert built["ok"] is True
+    receipt = make_remote_receipt(package)
+    client = DownloadingClient(package, receipt)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = run_recovery_drill(
+        receipt,
+        tmp_path / "drill",
+        vault_dir=vault,
+        client=client,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+
+    assert result["ok"] is True, result
+    assert result["verification_mode"] == "remote-download-sha256+decrypt-restore"
+    assert result["source_index_sha256"] == "a" * 64
+    assert set(client.downloads) == {item["package_name"] for item in receipt["remote_files"]}
+    assert not (tmp_path / "drill").exists()
+    persisted = json.loads(
+        (vault / "recovery" / "feishu" / "receipts" / f"{result['package_id']}.drill.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "file_token" not in json.dumps(persisted)
+    assert "path" not in json.dumps(persisted)
+    assert persisted["recovery_drill"] == {"ok": True, "mode": "decrypt-restore"}
+
+
+def test_recovery_drill_fails_when_downloaded_part_hash_changes(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package = tmp_path / "package"
+    built = build_encrypted_package(
+        export_dir,
+        package,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert built["ok"] is True
+    receipt = make_remote_receipt(package)
+    corrupt_name = receipt["remote_files"][0]["package_name"]
+    vault = tmp_path / "vault"
+    vault.mkdir()
+
+    result = run_recovery_drill(
+        receipt,
+        tmp_path / "drill",
+        vault_dir=vault,
+        client=DownloadingClient(package, receipt, corrupt_name=corrupt_name),
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+
+    assert result == {
+        "ok": False,
+        "package_id": receipt["package_id"],
+        "blockers": ["remote_part_hash_mismatch"],
+    }
+    assert not (tmp_path / "drill").exists()
+    assert not list(vault.rglob("*.drill.json"))
+
+
+def test_restore_local_package_rebinds_a_real_new_vault_and_removes_plaintext_stage(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package = tmp_path / "package"
+    built = build_encrypted_package(
+        export_dir,
+        package,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert built["ok"] is True
+    destination = tmp_path / "recovered-vault"
+
+    result = restore_local_package(
+        package,
+        destination,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+
+    assert result["ok"] is True, result
+    assert json.loads((destination / "config.json").read_text(encoding="utf-8"))["vault_dir"] == str(
+        destination
+    )
+    assert not list(tmp_path.glob(".immortal-feishu-recovery-*"))
+
+
+def test_restore_local_package_rejects_a_decrypted_tar_symlink(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package = tmp_path / "package"
+    built = build_encrypted_package(
+        export_dir,
+        package,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptorWithDecrypt(),
+    )
+    assert built["ok"] is True
+
+    class MaliciousCryptor(CopyCryptorWithDecrypt):
+        def decrypt(self, part_paths, consume_plaintext):
+            payload = BytesIO()
+            with tarfile.open(fileobj=payload, mode="w") as archive:
+                manifest = b'{"items":[],"totals":{"files":0,"bytes":0},"warnings":[]}'
+                info = tarfile.TarInfo("export/manifest.json")
+                info.size = len(manifest)
+                archive.addfile(info, BytesIO(manifest))
+                link = tarfile.TarInfo("export/escape")
+                link.type = tarfile.SYMTYPE
+                link.linkname = "/private/escape"
+                archive.addfile(link)
+            consume_plaintext(BytesIO(payload.getvalue()))
+
+    destination = tmp_path / "recovered-vault"
+    result = restore_local_package(package, destination, cryptor=MaliciousCryptor())
+
+    assert result == {
+        "ok": False,
+        "package_id": built["package_id"],
+        "blockers": ["recovery_archive_invalid"],
+    }
+    assert not destination.exists()

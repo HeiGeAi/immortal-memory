@@ -561,7 +561,7 @@ Expected: all write behavior is confirmation-gated and all tests remain offline.
 - Modify: `core/feishu_recovery.py`
 - Modify: `tests/test_feishu_recovery.py`
 
-- [ ] **Step 1: Write failing recovery-drill tests**
+- [x] **Step 1: Write failing recovery-drill tests**
 
 ```python
 from feishu_recovery import run_recovery_drill
@@ -573,7 +573,7 @@ class CopyCryptorWithDecrypt(CopyCryptor):
 
 
 def test_recovery_drill_downloads_all_parts_and_runs_real_restore(tmp_path):
-    package = make_valid_package(tmp_path, cryptor=CopyCryptorWithDecrypt())
+    package = make_valid_package(tmp_path)
     receipt = make_remote_receipt(package)
     client = DownloadingClient.from_package(package)
 
@@ -586,7 +586,7 @@ def test_recovery_drill_downloads_all_parts_and_runs_real_restore(tmp_path):
 
 
 def test_recovery_drill_fails_when_downloaded_part_hash_changes(tmp_path):
-    package = make_valid_package(tmp_path, cryptor=CopyCryptorWithDecrypt())
+    package = make_valid_package(tmp_path)
     receipt = make_remote_receipt(package)
     client = DownloadingClient.from_package(package, corrupt_name="parts/part-00001.gpg")
 
@@ -596,7 +596,7 @@ def test_recovery_drill_fails_when_downloaded_part_hash_changes(tmp_path):
     assert result["blockers"] == ["remote_part_hash_mismatch"]
 ```
 
-- [ ] **Step 2: Run the targeted tests and confirm red**
+- [x] **Step 2: Run the targeted tests and confirm red**
 
 Run:
 
@@ -606,7 +606,7 @@ PYTHONPATH=core python3 -m pytest tests/test_feishu_recovery.py -q
 
 Expected: `run_recovery_drill` is missing.
 
-- [ ] **Step 3: Implement download, safe tar extraction, and isolated restore**
+- [x] **Step 3: Implement download, safe tar extraction, and isolated restore**
 
 Implement `run_recovery_drill(upload_receipt, drill_root, *, client, cryptor)` with this exact sequence:
 
@@ -623,13 +623,15 @@ delete extracted and recovered payloads in finally
 write only a private hash-and-count recovery drill receipt
 ```
 
+Also expose `restore_local_package(package_dir, destination, cryptor=...)` for a replacement machine that has downloaded the encrypted package manually. It must run the same package validation, decrypt, safe tar extraction, strict restore check, and `restore_export(..., rebind_vault_config=True)`, retain only the chosen restored vault, and delete its temporary plaintext extraction tree.
+
 The success receipt is `<vault>/recovery/feishu/receipts/<package-id>.drill.json`, and `latest-drill.json` points to it. It contains `schema_version`, `provider`, `verified_at`, `package_id`, `package_manifest_sha256`, `source_index_sha256`, `source_export_generated_at`, `verification_mode`, `remote_parts`, `restore_check`, and `recovery_drill`. It must not contain paths, tokens, ciphertext, manifest bodies, or source text.
 
-- [ ] **Step 4: Add negative extraction and proof-binding tests**
+- [x] **Step 4: Add negative extraction and proof-binding tests**
 
 Add tests that reject a tar symlink, archive path traversal, a manifest not first, duplicate archive member, mismatched source-export manifest SHA, absent private-key decrypt result, and a receipt whose source index hash differs from a later vault hash.
 
-- [ ] **Step 5: Run Task 4 tests and commit**
+- [x] **Step 5: Run Task 4 tests and commit**
 
 Run:
 

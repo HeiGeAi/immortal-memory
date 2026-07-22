@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1060,6 +1061,29 @@ class LarkDriveClient:
             cwd=package.parent,
         )
 
+    def download(self, file_token: str, output: Path) -> None:
+        token = _require_drive_token(file_token, "remote_download_failed")
+        destination = Path(output).expanduser().absolute()
+        if os.path.lexists(destination):
+            raise RecoveryError("remote_download_failed")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._call(
+            [
+                self.cli_binary,
+                "drive",
+                "+download",
+                "--as",
+                "user",
+                "--file-token",
+                token,
+                "--output",
+                str(destination),
+                "--format",
+                "json",
+            ]
+        )
+        _secure_file_size_sha256(destination)
+
 
 def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
@@ -1203,3 +1227,453 @@ def upload_package(
         }
     except RecoveryError as exc:
         return _upload_failure(exc.code, package_id=locals().get("package_id", ""))
+
+
+UPLOAD_RECEIPT_KEYS = {
+    "schema_version",
+    "provider",
+    "package_id",
+    "uploaded_at",
+    "package_manifest_sha256",
+    "source",
+    "remote_package_folder_token",
+    "remote_parts_folder_token",
+    "remote_folder_hash",
+    "remote_files",
+    "remote_verification",
+}
+REMOTE_FILE_KEYS = {
+    "package_name",
+    "remote_name",
+    "bytes",
+    "sha256",
+    "file_token",
+}
+REMOTE_VERIFICATION_KEYS = {"ok", "mode", "checks"}
+
+
+def _validate_upload_receipt(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, Mapping) or set(receipt) != UPLOAD_RECEIPT_KEYS:
+        raise RecoveryError("remote_receipt_invalid")
+    payload = dict(receipt)
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != PACKAGE_SCHEMA_VERSION
+        or payload.get("provider") != "feishu_drive"
+        or not _is_utc_timestamp(payload.get("uploaded_at"))
+        or not _is_sha256(payload.get("package_manifest_sha256"))
+    ):
+        raise RecoveryError("remote_receipt_invalid")
+    try:
+        package_id = _validate_package_id(payload.get("package_id"))
+        _validate_source_descriptor(payload.get("source"))
+        package_folder = _require_drive_token(
+            payload.get("remote_package_folder_token"), "remote_receipt_invalid"
+        )
+        parts_folder = _require_drive_token(
+            payload.get("remote_parts_folder_token"), "remote_receipt_invalid"
+        )
+    except RecoveryError as exc:
+        raise RecoveryError("remote_receipt_invalid") from exc
+    if package_folder == parts_folder:
+        raise RecoveryError("remote_receipt_invalid")
+    if payload.get("remote_folder_hash") != _remote_folder_hash(package_folder):
+        raise RecoveryError("remote_receipt_invalid")
+    verification = payload.get("remote_verification")
+    if (
+        not isinstance(verification, Mapping)
+        or set(verification) != REMOTE_VERIFICATION_KEYS
+        or verification.get("ok") is not True
+        or verification.get("mode") != "exact"
+        or type(verification.get("checks")) is not int
+        or verification.get("checks") != 2
+    ):
+        raise RecoveryError("remote_receipt_invalid")
+    remote_files = payload.get("remote_files")
+    if not isinstance(remote_files, list) or not remote_files:
+        raise RecoveryError("remote_receipt_invalid")
+    manifest_records: list[dict[str, Any]] = []
+    part_records: list[dict[str, Any]] = []
+    file_tokens: set[str] = set()
+    for record in remote_files:
+        if not isinstance(record, Mapping) or set(record) != REMOTE_FILE_KEYS:
+            raise RecoveryError("remote_receipt_invalid")
+        candidate = dict(record)
+        package_name = candidate.get("package_name")
+        remote_name = candidate.get("remote_name")
+        if (
+            not isinstance(package_name, str)
+            or not isinstance(remote_name, str)
+            or Path(package_name).name != remote_name
+            or not _is_nonnegative_int(candidate.get("bytes"), positive=True)
+            or not _is_sha256(candidate.get("sha256"))
+        ):
+            raise RecoveryError("remote_receipt_invalid")
+        try:
+            file_token = _require_drive_token(
+                candidate.get("file_token"), "remote_receipt_invalid"
+            )
+        except RecoveryError as exc:
+            raise RecoveryError("remote_receipt_invalid") from exc
+        if file_token in file_tokens:
+            raise RecoveryError("remote_receipt_invalid")
+        file_tokens.add(file_token)
+        if package_name == PACKAGE_MANIFEST_NAME and remote_name == PACKAGE_MANIFEST_NAME:
+            manifest_records.append(candidate)
+            continue
+        match = PART_NAME_RE.fullmatch(package_name)
+        if match is None:
+            raise RecoveryError("remote_receipt_invalid")
+        part_records.append(candidate)
+    if len(manifest_records) != 1 or not part_records:
+        raise RecoveryError("remote_receipt_invalid")
+    part_records.sort(key=lambda row: int(PART_NAME_RE.fullmatch(row["package_name"]).group(1)))
+    for expected, record in enumerate(part_records, start=1):
+        match = PART_NAME_RE.fullmatch(record["package_name"])
+        if match is None or int(match.group(1)) != expected:
+            raise RecoveryError("remote_receipt_invalid")
+    payload["package_id"] = package_id
+    payload["remote_files"] = [*part_records, manifest_records[0]]
+    return payload
+
+
+def _prepare_drill_root(path: str | Path) -> Path:
+    root = Path(path).expanduser().absolute()
+    if os.path.lexists(root):
+        raise RecoveryError("drill_destination_exists")
+    root.mkdir(parents=True, mode=0o700)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _download_remote_file(
+    client: Any,
+    record: Mapping[str, Any],
+    destination: Path,
+    *,
+    manifest: bool,
+) -> None:
+    try:
+        client.download(record["file_token"], destination)
+        size, digest = _secure_file_size_sha256(destination)
+    except RecoveryError:
+        raise
+    except Exception as exc:
+        raise RecoveryError("remote_download_failed") from exc
+    if size != record["bytes"] or digest != record["sha256"]:
+        raise RecoveryError(
+            "remote_manifest_hash_mismatch" if manifest else "remote_part_hash_mismatch"
+        )
+
+
+def _write_stream_file(
+    root: Path,
+    relative: str,
+    source: BinaryIO,
+    expected_size: int,
+    expected_sha256: str | None = None,
+) -> None:
+    if (
+        not relative
+        or relative.startswith("/")
+        or ".." in Path(relative).parts
+        or not _is_nonnegative_int(expected_size)
+    ):
+        raise RecoveryError("recovery_archive_invalid")
+    destination = root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for parent in [destination.parent, *destination.parents]:
+        if parent == root.parent:
+            break
+        metadata = os.lstat(parent)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise RecoveryError("recovery_archive_invalid")
+        os.chmod(parent, 0o700)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            str(destination),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        digest = hashlib.sha256()
+        total = 0
+        remaining = expected_size
+        while remaining:
+            block = source.read(min(1024 * 1024, remaining))
+            if not block:
+                break
+            offset = 0
+            while offset < len(block):
+                offset += os.write(descriptor, block[offset:])
+            digest.update(block)
+            total += len(block)
+            remaining -= len(block)
+        trailing = source.read(1)
+        if total != expected_size or trailing:
+            raise RecoveryError("recovery_archive_invalid")
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise RecoveryError("recovery_archive_invalid")
+        os.fsync(descriptor)
+    except RecoveryError:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise RecoveryError("recovery_archive_invalid") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _extract_export_tar(plaintext: BinaryIO, destination: Path) -> None:
+    destination.mkdir(parents=True, mode=0o700)
+    os.chmod(destination, 0o700)
+    try:
+        with tarfile.open(fileobj=plaintext, mode="r|") as archive:
+            members = iter(archive)
+            first = next(members, None)
+            if (
+                first is None
+                or first.name != "export/manifest.json"
+                or not first.isreg()
+                or first.size > MAX_JSON_BYTES
+            ):
+                raise RecoveryError("recovery_archive_invalid")
+            first_source = archive.extractfile(first)
+            if first_source is None:
+                raise RecoveryError("recovery_archive_invalid")
+            manifest_bytes = first_source.read(MAX_JSON_BYTES + 1)
+            if len(manifest_bytes) != first.size or len(manifest_bytes) > MAX_JSON_BYTES:
+                raise RecoveryError("recovery_archive_invalid")
+            try:
+                source_manifest = json.loads(manifest_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RecoveryError("recovery_archive_invalid") from exc
+            if not isinstance(source_manifest, dict):
+                raise RecoveryError("recovery_archive_invalid")
+            items = _manifest_items_by_path(source_manifest)
+            _write_stream_file(
+                destination,
+                export_restore.MANIFEST_NAME,
+                io.BytesIO(manifest_bytes),
+                len(manifest_bytes),
+            )
+            seen: set[str] = set()
+            for member in members:
+                if not member.isreg() or not member.name.startswith("export/"):
+                    raise RecoveryError("recovery_archive_invalid")
+                relative = member.name[len("export/") :]
+                item = items.get(relative)
+                if item is None or relative in seen or member.size != item.get("size"):
+                    raise RecoveryError("recovery_archive_invalid")
+                member_source = archive.extractfile(member)
+                if member_source is None:
+                    raise RecoveryError("recovery_archive_invalid")
+                _write_stream_file(
+                    destination,
+                    relative,
+                    member_source,
+                    member.size,
+                    item.get("sha256") if isinstance(item.get("sha256"), str) else None,
+                )
+                seen.add(relative)
+            if seen != set(items):
+                raise RecoveryError("recovery_archive_invalid")
+    except RecoveryError:
+        raise
+    except (OSError, tarfile.TarError) as exc:
+        raise RecoveryError("recovery_archive_invalid") from exc
+
+
+def _drill_paths(vault_dir: str | Path, package_id: str) -> tuple[Path, Path]:
+    vault = Path(vault_dir).expanduser().absolute()
+    try:
+        metadata = os.lstat(vault)
+    except OSError as exc:
+        raise RecoveryError("recovery_receipt_write_failed") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RecoveryError("recovery_receipt_write_failed")
+    root = vault / RECOVERY_DIRNAME
+    receipts = root / "receipts"
+    try:
+        _ensure_private_directory(root.parent)
+        _ensure_private_directory(root)
+        _ensure_private_directory(receipts)
+    except RecoveryError as exc:
+        raise RecoveryError("recovery_receipt_write_failed") from exc
+    return receipts / f"{package_id}.drill.json", root / "latest-drill.json"
+
+
+def _drill_failure(package_id: str, code: str) -> dict[str, Any]:
+    return {"ok": False, "package_id": package_id, "blockers": [code]}
+
+
+def restore_local_package(
+    package_dir: str | Path,
+    destination: str | Path,
+    *,
+    cryptor: Any | None = None,
+) -> dict[str, Any]:
+    """Restore a previously downloaded encrypted package into a chosen new vault."""
+    local = verify_local_package(package_dir)
+    if not local.get("ok"):
+        return _drill_failure("", "package_not_verified")
+    package = Path(package_dir).expanduser().absolute()
+    target = Path(destination).expanduser().absolute()
+    if os.path.lexists(target):
+        return _drill_failure(str(local["package_id"]), "restore_destination_exists")
+    try:
+        manifest, _manifest_sha256, _manifest_bytes = _read_json_object(
+            package / PACKAGE_MANIFEST_NAME
+        )
+        validate_package_manifest(manifest)
+        parts = _validate_parts(manifest["parts"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        selected_cryptor = cryptor if cryptor is not None else OpenPGPCryptor()
+        with tempfile.TemporaryDirectory(
+            prefix=".immortal-feishu-recovery-",
+            dir=str(target.parent),
+        ) as temporary:
+            extracted_export = Path(temporary) / "export"
+            selected_cryptor.decrypt(
+                [package / part["name"] for part in parts],
+                lambda stream: _extract_export_tar(stream, extracted_export),
+            )
+            restore_check = export_restore.restore_check(extracted_export, strict=True)
+            if not restore_check.get("ok"):
+                raise RecoveryError("recovery_restore_check_failed")
+            restored = export_restore.restore_export(
+                extracted_export,
+                target,
+                rebind_vault_config=True,
+            )
+            if not restored.get("ok"):
+                raise RecoveryError("recovery_restore_failed")
+        return {
+            "ok": True,
+            "package_id": manifest["package_id"],
+            "destination": str(target),
+            "restore_check": {
+                "ok": True,
+                "strict": True,
+                "checked_files": int(restore_check.get("checked_files") or 0),
+            },
+            "blockers": [],
+        }
+    except RecoveryError as exc:
+        return _drill_failure(str(local["package_id"]), exc.code)
+    except Exception:
+        return _drill_failure(str(local["package_id"]), "decrypt_restore_failed")
+
+
+def run_recovery_drill(
+    upload_receipt: Mapping[str, Any],
+    drill_root: str | Path,
+    *,
+    vault_dir: str | Path,
+    client: Any | None = None,
+    cryptor: Any | None = None,
+) -> dict[str, Any]:
+    """Download, decrypt, verify, and restore a package into an ephemeral vault."""
+    package_id = ""
+    root: Path | None = None
+    try:
+        receipt = _validate_upload_receipt(upload_receipt)
+        package_id = receipt["package_id"]
+        root = _prepare_drill_root(drill_root)
+        downloaded_package = root / "download" / "package"
+        _ensure_private_directory(downloaded_package)
+        _ensure_private_directory(downloaded_package / PARTS_DIRNAME)
+        manifest_record = next(
+            item
+            for item in receipt["remote_files"]
+            if item["package_name"] == PACKAGE_MANIFEST_NAME
+        )
+        selected_client = client or LarkDriveClient()
+        _download_remote_file(
+            selected_client,
+            manifest_record,
+            downloaded_package / PACKAGE_MANIFEST_NAME,
+            manifest=True,
+        )
+        manifest, manifest_sha256, _manifest_bytes = _read_json_object(
+            downloaded_package / PACKAGE_MANIFEST_NAME
+        )
+        validate_package_manifest(manifest)
+        if (
+            manifest_sha256 != receipt["package_manifest_sha256"]
+            or manifest.get("package_id") != package_id
+            or manifest.get("source") != receipt["source"]
+        ):
+            raise RecoveryError("remote_manifest_hash_mismatch")
+        parts = _validate_parts(manifest["parts"])
+        remote_parts = {
+            item["package_name"]: item
+            for item in receipt["remote_files"]
+            if item["package_name"] != PACKAGE_MANIFEST_NAME
+        }
+        if set(remote_parts) != {part["name"] for part in parts}:
+            raise RecoveryError("remote_receipt_invalid")
+        for part in parts:
+            record = remote_parts[part["name"]]
+            if record["bytes"] != part["bytes"] or record["sha256"] != part["sha256"]:
+                raise RecoveryError("remote_receipt_invalid")
+            _download_remote_file(
+                selected_client,
+                record,
+                downloaded_package / part["name"],
+                manifest=False,
+            )
+        if not verify_local_package(downloaded_package).get("ok"):
+            raise RecoveryError("remote_package_verification_failed")
+        selected_cryptor = cryptor if cryptor is not None else OpenPGPCryptor()
+        restored = restore_local_package(
+            downloaded_package,
+            root / "recovered",
+            cryptor=selected_cryptor,
+        )
+        if not restored.get("ok"):
+            blockers = restored.get("blockers")
+            raise RecoveryError(
+                str(blockers[0]) if isinstance(blockers, list) and blockers else "recovery_restore_failed"
+            )
+        restore_check = restored["restore_check"]
+        drill_receipt = {
+            "schema_version": PACKAGE_SCHEMA_VERSION,
+            "provider": "feishu_drive",
+            "verified_at": _now_utc(),
+            "package_id": package_id,
+            "package_manifest_sha256": manifest_sha256,
+            "source_index_sha256": manifest["source"]["source_index_sha256"],
+            "source_export_generated_at": manifest["source"]["generated_at"],
+            "verification_mode": "remote-download-sha256+decrypt-restore",
+            "remote_parts": len(parts),
+            "restore_check": {
+                "ok": True,
+                "strict": True,
+                "checked_files": int(restore_check.get("checked_files") or 0),
+            },
+            "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
+        }
+        receipt_path, latest_path = _drill_paths(vault_dir, package_id)
+        try:
+            _write_private_json(receipt_path, drill_receipt)
+            _write_private_json(latest_path, drill_receipt)
+        except Exception as exc:
+            receipt_path.unlink(missing_ok=True)
+            raise RecoveryError("recovery_receipt_write_failed") from exc
+        return {
+            "ok": True,
+            "package_id": package_id,
+            "source_index_sha256": drill_receipt["source_index_sha256"],
+            "verification_mode": drill_receipt["verification_mode"],
+            "blockers": [],
+        }
+    except RecoveryError as exc:
+        return _drill_failure(package_id, exc.code)
+    except Exception:
+        return _drill_failure(package_id, "decrypt_restore_failed")
+    finally:
+        if root is not None:
+            shutil.rmtree(root, ignore_errors=True)
