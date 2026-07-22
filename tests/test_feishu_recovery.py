@@ -7,13 +7,17 @@ from pathlib import Path
 
 import pytest
 
+import feishu_recovery
+
 from feishu_recovery import (
+    LarkDriveClient,
     OpenPGPCryptor,
     RecoveryError,
     build_encrypted_package,
     build_package_manifest,
     inspect_source_export,
     require_fingerprint,
+    upload_package,
     validate_package_manifest,
     verify_local_package,
 )
@@ -258,6 +262,20 @@ class CopyCryptor:
         write_ciphertext(plaintext.getvalue())
 
 
+def make_valid_package(tmp_path: Path) -> Path:
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package_dir = tmp_path / "package"
+    result = build_encrypted_package(
+        export_dir,
+        package_dir,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptor(),
+    )
+    assert result["ok"] is True
+    return package_dir
+
+
 def test_build_encrypted_package_splits_and_hashes_all_ciphertext(tmp_path):
     export_dir = tmp_path / "immortal-export-safe"
     write_redacted_export(export_dir)
@@ -366,3 +384,177 @@ def test_openpgp_cryptor_rejects_a_subkey_or_missing_public_key():
 
     with pytest.raises(RecoveryError, match="recipient_public_key_unavailable"):
         cryptor.assert_recipient("A" * 40)
+
+
+class RecordingDriveRunner:
+    def __init__(self):
+        self.calls = []
+        self.created_folders = 0
+
+    def __call__(self, argv, *, cwd=None):
+        self.calls.append((argv, cwd))
+        if "+create-folder" in argv:
+            self.created_folders += 1
+            token = (
+                "package_new_12345678"
+                if self.created_folders == 1
+                else "parts_new_12345678"
+            )
+            return {"data": {"token": token}}
+        if "+status" in argv:
+            return {"ok": True, "detection": "exact"}
+        return {"data": {"file_token": "file_12345678"}}
+
+
+def test_upload_requires_explicit_remote_write_confirmation(tmp_path):
+    package = make_valid_package(tmp_path)
+    runner = RecordingDriveRunner()
+
+    result = upload_package(
+        package,
+        "parent_12345678",
+        vault_dir=tmp_path / "vault",
+        client=LarkDriveClient(runner),
+        confirm_remote_write=False,
+    )
+
+    assert result == {
+        "ok": False,
+        "package_id": "",
+        "receipt": {},
+        "blockers": ["remote_write_confirmation_required"],
+    }
+    assert runner.calls == []
+
+
+def test_upload_creates_dedicated_folder_uploads_manifest_last_and_runs_exact_status(tmp_path):
+    package = make_valid_package(tmp_path)
+    runner = RecordingDriveRunner()
+    (tmp_path / "vault").mkdir()
+
+    result = upload_package(
+        package,
+        "parent_12345678",
+        vault_dir=tmp_path / "vault",
+        client=LarkDriveClient(runner),
+        confirm_remote_write=True,
+    )
+
+    upload_calls = [argv for argv, _cwd in runner.calls if "+upload" in argv]
+    create_calls = [argv for argv, _cwd in runner.calls if "+create-folder" in argv]
+    status_calls = [argv for argv, _cwd in runner.calls if "+status" in argv]
+    assert result["ok"] is True
+    assert len(create_calls) == 2
+    assert len(status_calls) == 2
+    assert all(
+        "/" not in argv[argv.index("--name") + 1]
+        for argv in upload_calls
+    )
+    assert upload_calls[-1][upload_calls[-1].index("--name") + 1] == "immortal-feishu-recovery.json"
+    assert "parent_12345678" not in json.dumps(result["receipt"])
+    assert "package_new_12345678" not in json.dumps(result["receipt"])
+    assert "parts_new_12345678" not in json.dumps(result["receipt"])
+    assert "file_12345678" not in json.dumps(result["receipt"])
+    persisted = json.loads(
+        (tmp_path / "vault" / "recovery" / "feishu" / "receipts" / f"{result['package_id']}.upload.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted["remote_package_folder_token"] == "package_new_12345678"
+    assert persisted["remote_parts_folder_token"] == "parts_new_12345678"
+    assert [item["file_token"] for item in persisted["remote_files"]]
+    assert (tmp_path / "vault" / "recovery" / "feishu" / "latest-upload.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "response, expected_blocker",
+    [
+        ({"data": {}}, "remote_folder_response_invalid"),
+        ({"ok": False, "detection": "quick"}, "remote_verification_failed"),
+    ],
+)
+def test_upload_fails_closed_for_invalid_remote_evidence(tmp_path, response, expected_blocker):
+    package = make_valid_package(tmp_path)
+
+    class Runner(RecordingDriveRunner):
+        def __call__(self, argv, *, cwd=None):
+            if "+create-folder" in argv and expected_blocker == "remote_folder_response_invalid":
+                self.calls.append((argv, cwd))
+                return response
+            if "+status" in argv and expected_blocker == "remote_verification_failed":
+                self.calls.append((argv, cwd))
+                return response
+            return super().__call__(argv, cwd=cwd)
+
+    result = upload_package(
+        package,
+        "parent_12345678",
+        vault_dir=tmp_path / "vault",
+        client=LarkDriveClient(Runner()),
+        confirm_remote_write=True,
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == [expected_blocker]
+    assert not list((tmp_path / "vault").rglob("*.upload.json"))
+
+
+@pytest.mark.parametrize(
+    "mode, expected_blocker",
+    [
+        ("missing_file_token", "remote_file_response_invalid"),
+        ("part_upload_raises", "drive_command_failed"),
+    ],
+)
+def test_upload_fails_closed_for_missing_or_failed_part_upload(tmp_path, mode, expected_blocker):
+    package = make_valid_package(tmp_path)
+    (tmp_path / "vault").mkdir()
+
+    class Runner(RecordingDriveRunner):
+        def __call__(self, argv, *, cwd=None):
+            if "+upload" in argv and mode == "missing_file_token":
+                self.calls.append((argv, cwd))
+                return {"data": {}}
+            if "+upload" in argv and mode == "part_upload_raises":
+                raise RuntimeError("network unavailable")
+            return super().__call__(argv, cwd=cwd)
+
+    result = upload_package(
+        package,
+        "parent_12345678",
+        vault_dir=tmp_path / "vault",
+        client=LarkDriveClient(Runner()),
+        confirm_remote_write=True,
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == [expected_blocker]
+    assert not list((tmp_path / "vault").rglob("*.upload.json"))
+
+
+def test_upload_removes_new_receipt_when_private_receipt_write_fails(tmp_path, monkeypatch):
+    package = make_valid_package(tmp_path)
+    (tmp_path / "vault").mkdir()
+    calls = 0
+
+    def fail_after_first_write(path, payload):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected")
+        return original(path, payload)
+
+    original = feishu_recovery._write_private_json
+    monkeypatch.setattr(feishu_recovery, "_write_private_json", fail_after_first_write)
+
+    result = upload_package(
+        package,
+        "parent_12345678",
+        vault_dir=tmp_path / "vault",
+        client=LarkDriveClient(RecordingDriveRunner()),
+        confirm_remote_write=True,
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == ["receipt_write_failed"]
+    assert not list((tmp_path / "vault").rglob("*.upload.json"))

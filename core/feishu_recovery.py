@@ -29,11 +29,13 @@ import export_restore
 PACKAGE_SCHEMA_VERSION = 1
 PACKAGE_MANIFEST_NAME = "immortal-feishu-recovery.json"
 PARTS_DIRNAME = "parts"
+RECOVERY_DIRNAME = "recovery/feishu"
 MAX_JSON_BYTES = 8 * 1024 * 1024
 FINGERPRINT_RE = re.compile(r"\A(?:[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})\Z")
 PACKAGE_ID_RE = re.compile(r"\Aimmortal-recovery-\d{8}-[a-f0-9]{8}\Z")
 PART_NAME_RE = re.compile(r"\Aparts/part-(\d{5})\.gpg\Z")
 SHA256_RE = re.compile(r"\A[a-f0-9]{64}\Z")
+DRIVE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9_-]{8,256}\Z")
 
 SOURCE_DESCRIPTOR_KEYS = {
     "generated_at",
@@ -909,3 +911,295 @@ def verify_local_package(package_dir: str | Path) -> dict[str, Any]:
             "bytes": 0,
             "blockers": ["package_contents_invalid"],
         }
+
+
+def _require_drive_token(value: Any, code: str) -> str:
+    candidate = str(value or "").strip()
+    if DRIVE_TOKEN_RE.fullmatch(candidate) is None:
+        raise RecoveryError(code)
+    return candidate
+
+
+def _find_response_value(payload: Any, names: set[str]) -> str:
+    if isinstance(payload, Mapping):
+        for name in names:
+            value = payload.get(name)
+            if isinstance(value, str) and value:
+                return value
+        for value in payload.values():
+            found = _find_response_value(value, names)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _find_response_value(value, names)
+            if found:
+                return found
+    return ""
+
+
+def _response_has_exact_status(payload: Any) -> bool:
+    if isinstance(payload, Mapping):
+        if payload.get("ok") is True and payload.get("detection") == "exact":
+            return True
+        return any(_response_has_exact_status(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_response_has_exact_status(value) for value in payload)
+    return False
+
+
+class LarkDriveClient:
+    """Small JSON-only adapter for the explicit user-owned Drive recovery flow."""
+
+    def __init__(
+        self,
+        runner: Callable[..., Mapping[str, Any]] | None = None,
+        *,
+        cli_binary: str = "lark-cli",
+    ) -> None:
+        self.cli_binary = cli_binary
+        self._runner = runner or self._run_subprocess
+
+    def _run_subprocess(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+    ) -> Mapping[str, Any]:
+        try:
+            completed = subprocess.run(
+                list(argv),
+                cwd=str(cwd) if cwd is not None else None,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3600,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RecoveryError("drive_command_failed") from exc
+        if completed.returncode != 0:
+            raise RecoveryError("drive_command_failed")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RecoveryError("drive_response_invalid") from exc
+        if not isinstance(payload, Mapping):
+            raise RecoveryError("drive_response_invalid")
+        return payload
+
+    def _call(self, argv: Sequence[str], *, cwd: Path | None = None) -> Mapping[str, Any]:
+        try:
+            payload = self._runner(list(argv), cwd=cwd)
+        except RecoveryError:
+            raise
+        except Exception as exc:
+            raise RecoveryError("drive_command_failed") from exc
+        if not isinstance(payload, Mapping):
+            raise RecoveryError("drive_response_invalid")
+        return payload
+
+    def create_folder(self, parent_folder_token: str, package_id: str) -> str:
+        parent = _require_drive_token(parent_folder_token, "remote_parent_token_invalid")
+        payload = self._call(
+            [
+                self.cli_binary,
+                "drive",
+                "+create-folder",
+                "--as",
+                "user",
+                "--folder-token",
+                parent,
+                "--name",
+                package_id,
+                "--format",
+                "json",
+            ]
+        )
+        token = _find_response_value(payload, {"folder_token", "token"})
+        return _require_drive_token(token, "remote_folder_response_invalid")
+
+    def upload(self, path: Path, folder_token: str, name: str) -> str:
+        remote_folder = _require_drive_token(folder_token, "remote_folder_response_invalid")
+        payload = self._call(
+            [
+                self.cli_binary,
+                "drive",
+                "+upload",
+                "--as",
+                "user",
+                "--folder-token",
+                remote_folder,
+                "--file",
+                str(path.absolute()),
+                "--name",
+                name,
+                "--format",
+                "json",
+            ]
+        )
+        token = _find_response_value(payload, {"file_token"})
+        return _require_drive_token(token, "remote_file_response_invalid")
+
+    def status(self, package_dir: Path, folder_token: str) -> Mapping[str, Any]:
+        remote_folder = _require_drive_token(folder_token, "remote_folder_response_invalid")
+        package = package_dir.absolute()
+        return self._call(
+            [
+                self.cli_binary,
+                "drive",
+                "+status",
+                "--as",
+                "user",
+                "--folder-token",
+                remote_folder,
+                "--local-dir",
+                package.name,
+                "--format",
+                "json",
+            ],
+            cwd=package.parent,
+        )
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RecoveryError("receipt_write_failed")
+    os.chmod(path, 0o700)
+
+
+def _upload_paths(vault_dir: str | Path, package_id: str) -> tuple[Path, Path]:
+    vault = Path(vault_dir).expanduser().absolute()
+    try:
+        metadata = os.lstat(vault)
+    except OSError as exc:
+        raise RecoveryError("receipt_write_failed") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RecoveryError("receipt_write_failed")
+    root = vault / RECOVERY_DIRNAME
+    receipts = root / "receipts"
+    _ensure_private_directory(root.parent)
+    _ensure_private_directory(root)
+    _ensure_private_directory(receipts)
+    return receipts / f"{package_id}.upload.json", root / "latest-upload.json"
+
+
+def _remote_folder_hash(token: str) -> str:
+    return hashlib.sha256(("feishu-folder-v1:" + token).encode("utf-8")).hexdigest()
+
+
+def _safe_upload_receipt(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    remote_files = receipt.get("remote_files")
+    return {
+        "package_id": str(receipt.get("package_id") or ""),
+        "uploaded_at": str(receipt.get("uploaded_at") or ""),
+        "part_count": max(0, len(remote_files) - 1) if isinstance(remote_files, list) else 0,
+        "remote_folder_hash": str(receipt.get("remote_folder_hash") or ""),
+        "remote_verification": "exact",
+    }
+
+
+def _upload_failure(code: str, *, package_id: str = "") -> dict[str, Any]:
+    return {
+        "ok": False,
+        "package_id": package_id,
+        "receipt": {},
+        "blockers": [code],
+    }
+
+
+def upload_package(
+    package_dir: str | Path,
+    parent_folder_token: str,
+    *,
+    vault_dir: str | Path,
+    client: LarkDriveClient | None = None,
+    confirm_remote_write: bool = False,
+) -> dict[str, Any]:
+    """Upload one verified package only after explicit local confirmation."""
+    local = verify_local_package(package_dir)
+    if not local.get("ok"):
+        return _upload_failure("package_not_verified")
+    if not confirm_remote_write:
+        return _upload_failure("remote_write_confirmation_required")
+    try:
+        parent = _require_drive_token(parent_folder_token, "remote_parent_token_invalid")
+        package = Path(package_dir).expanduser().absolute()
+        manifest, manifest_sha256, manifest_bytes = _read_json_object(
+            package / PACKAGE_MANIFEST_NAME
+        )
+        validate_package_manifest(manifest)
+        package_id = str(manifest["package_id"])
+        parts = _validate_parts(manifest["parts"])
+        selected_client = client or LarkDriveClient()
+        remote_package_folder = selected_client.create_folder(parent, package_id)
+        remote_parts_folder = selected_client.create_folder(
+            remote_package_folder,
+            PARTS_DIRNAME,
+        )
+        remote_files: list[dict[str, Any]] = []
+        for part in parts:
+            file_token = selected_client.upload(
+                package / part["name"],
+                remote_parts_folder,
+                Path(part["name"]).name,
+            )
+            remote_files.append(
+                {
+                    "package_name": part["name"],
+                    "remote_name": Path(part["name"]).name,
+                    "bytes": part["bytes"],
+                    "sha256": part["sha256"],
+                    "file_token": file_token,
+                }
+            )
+        manifest_token = selected_client.upload(
+            package / PACKAGE_MANIFEST_NAME,
+            remote_package_folder,
+            PACKAGE_MANIFEST_NAME,
+        )
+        remote_files.append(
+            {
+                "package_name": PACKAGE_MANIFEST_NAME,
+                "remote_name": PACKAGE_MANIFEST_NAME,
+                "bytes": manifest_bytes,
+                "sha256": manifest_sha256,
+                "file_token": manifest_token,
+            }
+        )
+        root_status = selected_client.status(package, remote_package_folder)
+        parts_status = selected_client.status(package / PARTS_DIRNAME, remote_parts_folder)
+        if not (
+            _response_has_exact_status(root_status)
+            and _response_has_exact_status(parts_status)
+        ):
+            return _upload_failure("remote_verification_failed", package_id=package_id)
+        receipt = {
+            "schema_version": PACKAGE_SCHEMA_VERSION,
+            "provider": "feishu_drive",
+            "package_id": package_id,
+            "uploaded_at": _now_utc(),
+            "package_manifest_sha256": manifest_sha256,
+            "source": manifest["source"],
+            "remote_package_folder_token": remote_package_folder,
+            "remote_parts_folder_token": remote_parts_folder,
+            "remote_folder_hash": _remote_folder_hash(remote_package_folder),
+            "remote_files": remote_files,
+            "remote_verification": {"ok": True, "mode": "exact", "checks": 2},
+        }
+        receipt_path, latest_path = _upload_paths(vault_dir, package_id)
+        try:
+            _write_private_json(receipt_path, receipt)
+            _write_private_json(latest_path, receipt)
+        except Exception as exc:
+            receipt_path.unlink(missing_ok=True)
+            raise RecoveryError("receipt_write_failed") from exc
+        return {
+            "ok": True,
+            "package_id": package_id,
+            "receipt": _safe_upload_receipt(receipt),
+            "blockers": [],
+        }
+    except RecoveryError as exc:
+        return _upload_failure(exc.code, package_id=locals().get("package_id", ""))

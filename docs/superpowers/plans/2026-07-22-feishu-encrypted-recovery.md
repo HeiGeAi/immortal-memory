@@ -460,7 +460,7 @@ Expected: package tests pass without contacting GPG or Feishu in the test suite.
 - Modify: `core/feishu_recovery.py`
 - Modify: `tests/test_feishu_recovery.py`
 
-- [ ] **Step 1: Write failing confirmation and command-shape tests**
+- [x] **Step 1: Write failing confirmation and command-shape tests**
 
 ```python
 from feishu_recovery import LarkDriveClient, upload_package
@@ -483,7 +483,7 @@ def test_upload_requires_explicit_remote_write_confirmation(tmp_path):
     package = make_valid_package(tmp_path)
     runner = RecordingRunner()
 
-    result = upload_package(package, "parent_12345678", client=LarkDriveClient(runner), confirm_remote_write=False)
+    result = upload_package(package, "parent_12345678", vault_dir=tmp_path / "vault", client=LarkDriveClient(runner), confirm_remote_write=False)
 
     assert result["ok"] is False
     assert result["blockers"] == ["remote_write_confirmation_required"]
@@ -494,7 +494,8 @@ def test_upload_creates_dedicated_folder_uploads_manifest_last_and_runs_exact_st
     package = make_valid_package(tmp_path)
     runner = RecordingRunner()
 
-    result = upload_package(package, "parent_12345678", client=LarkDriveClient(runner), confirm_remote_write=True)
+    (tmp_path / "vault").mkdir()
+    result = upload_package(package, "parent_12345678", vault_dir=tmp_path / "vault", client=LarkDriveClient(runner), confirm_remote_write=True)
 
     upload_calls = [argv for argv, _cwd in runner.calls if "+upload" in argv]
     assert result["ok"] is True
@@ -503,7 +504,7 @@ def test_upload_creates_dedicated_folder_uploads_manifest_last_and_runs_exact_st
     assert "parent_12345678" not in json.dumps(result["receipt"])
 ```
 
-- [ ] **Step 2: Run tests to confirm the upload path is absent**
+- [x] **Step 2: Run tests to confirm the upload path is absent**
 
 Run:
 
@@ -513,34 +514,36 @@ PYTHONPATH=core python3 -m pytest tests/test_feishu_recovery.py -q
 
 Expected: `LarkDriveClient` and `upload_package` are missing.
 
-- [ ] **Step 3: Implement the adapter and receipt persistence**
+- [x] **Step 3: Implement the adapter and receipt persistence**
 
 Implement `LarkDriveClient` around an injectable runner. Production execution uses these exact command forms:
 
 ```text
 lark-cli drive +create-folder --as user --folder-token <parent> --name <package-id> --format json
-lark-cli drive +upload --as user --folder-token <new-folder> --file <part> --name <part-name> --format json
-lark-cli drive +upload --as user --folder-token <new-folder> --file <manifest> --name immortal-feishu-recovery.json --format json
-lark-cli drive +status --as user --folder-token <new-folder> --local-dir <package-name> --format json
+lark-cli drive +create-folder --as user --folder-token <package-folder> --name parts --format json
+lark-cli drive +upload --as user --folder-token <parts-folder> --file <part> --name <flat-part-name> --format json
+lark-cli drive +upload --as user --folder-token <package-folder> --file <manifest> --name immortal-feishu-recovery.json --format json
+lark-cli drive +status --as user --folder-token <package-folder> --local-dir <package-name> --format json
+lark-cli drive +status --as user --folder-token <parts-folder> --local-dir parts --format json
 ```
 
 `upload_package` must:
 
 1. call `verify_local_package` before any write;
 2. reject a missing confirmation or invalid opaque token before any runner call;
-3. create a new folder under the supplied parent, not Drive root;
-4. upload every encrypted part in manifest order, then upload the metadata manifest last;
-5. require `detection == "exact"` and `ok is True` from `+status`;
-6. write a `remote-upload-receipt.json` with package manifest SHA, part names and hashes, remote file tokens, a hashed remote folder identifier, and status mode;
+3. create a new package folder and a contained `parts` folder under the supplied parent, never Drive root;
+4. upload every encrypted part in manifest order to the contained folder, then upload the metadata manifest to the package folder last;
+5. require `detection == "exact"` and `ok is True` from both `+status` checks;
+6. write a `remote-upload-receipt.json` with package manifest SHA, package-relative part names, flat remote names, remote file tokens, hashed package-folder identity, and status mode;
 7. never put a full folder token, a local path, command line, stderr, or raw response in the receipt returned to the dashboard.
 
 Write the private receipt under `<vault>/recovery/feishu/receipts/<package-id>.json` and atomically update `<vault>/recovery/feishu/latest-upload.json`. Both files are mode `0o600` and are ignored by Git because they live in the vault.
 
-- [ ] **Step 4: Add failure tests**
+- [x] **Step 4: Add failure tests**
 
 Add parameterized tests for malformed create-folder responses, missing file token, non-exact status, a failed part upload, and an injected receipt write error. Assert that the returned blocker is stable and no success receipt is persisted.
 
-- [ ] **Step 5: Run Task 3 tests and commit**
+- [x] **Step 5: Run Task 3 tests and commit**
 
 Run:
 
