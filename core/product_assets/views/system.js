@@ -268,20 +268,24 @@ function openAction(kind, description, jobsTarget, trigger, isCurrent) {
   }, trigger);
 }
 
-function actionPanel(jobsTarget, isCurrent) {
+function actionPanel(jobsTarget, isCurrent, { actionsAvailable = true, actionReason = "" } = {}) {
   const section = document.createElement("section");
   section.className = "state-panel";
   section.append(node("p", "CONTROLLED ACTIONS · 受控操作", "kicker"), node("h2", "让系统实际运行"), node("p", "这里仅提供后端固定白名单中的四项操作。每次执行都会建立真实任务记录，并保留脱敏日志。", "state-message"));
   const actions = document.createElement("div");
   actions.className = "honest-actions";
-  ACTIONS.forEach(([kind, label, description]) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    if (kind !== "run") button.className = "secondary";
-    button.textContent = label;
-    button.addEventListener("click", () => openAction(kind, description, jobsTarget, button, isCurrent));
-    actions.append(button);
-  });
+  if (!actionsAvailable) {
+    section.append(node("p", actionReason || "当前服务不允许执行受控命令。", "coverage-warning"));
+  } else {
+    ACTIONS.forEach(([kind, label, description]) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      if (kind !== "run") button.className = "secondary";
+      button.textContent = label;
+      button.addEventListener("click", () => openAction(kind, description, jobsTarget, button, isCurrent));
+      actions.append(button);
+    });
+  }
   const refresh = document.createElement("button");
   refresh.type = "button";
   refresh.className = "secondary";
@@ -309,7 +313,11 @@ export async function renderSystem(root, { signal, isCurrent, navigate, updateHe
 
   const jobsTarget = document.createElement("section");
   jobsTarget.setAttribute("aria-label", "真实运行记录");
-  fragment.append(actionPanel(jobsTarget, isCurrent), jobsTarget);
+  const capability = systemResult.status === "fulfilled" ? systemResult.value?.capabilities : null;
+  fragment.append(actionPanel(jobsTarget, isCurrent, {
+    actionsAvailable: capability?.actions_available !== false,
+    actionReason: capability?.action_reason || "",
+  }), jobsTarget);
   if (jobsResult.status === "fulfilled") renderJobs(jobsTarget, jobsResult.value);
   else {
     const failure = node("div", "", "state-panel error-state");

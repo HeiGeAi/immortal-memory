@@ -302,7 +302,7 @@ class ControlCenter:
             "每日调度器",
             str(scheduler["status"]),
             str(scheduler["detail"]),
-            source="launchctl",
+            source=str(scheduler.get("source") or "launchctl"),
             evidence=str(scheduler.get("evidence") or ""),
         )
         service_signal = _signal(

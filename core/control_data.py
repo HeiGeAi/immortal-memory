@@ -36,11 +36,15 @@ class ControlData:
         skill_dir: Path | None = None,
         listen_address: str = "127.0.0.1",
         listen_port: int = 8765,
+        actions_enabled: bool = True,
+        action_reason: str = "",
     ) -> None:
         self.immortal_dir = Path(immortal_dir)
         self.skill_dir = Path(skill_dir) if skill_dir else Path(__file__).resolve().parent
         self.listen_address = listen_address
         self.listen_port = int(listen_port)
+        self.actions_enabled = bool(actions_enabled)
+        self.action_reason = str(action_reason or "")
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def capabilities(self) -> dict[str, Any]:
@@ -68,7 +72,9 @@ class ControlData:
                 }
                 for module_id in MODULE_IDS
             ],
-            "actions": ["run", "health", "backup_verify", "profile_refresh"],
+            "actions": ["run", "health", "backup_verify", "profile_refresh"] if self.actions_enabled else [],
+            "actions_available": self.actions_enabled,
+            "action_reason": self.action_reason if not self.actions_enabled else "",
         }
 
     def readiness(self) -> tuple[int, dict[str, Any]]:

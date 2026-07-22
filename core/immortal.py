@@ -1491,6 +1491,8 @@ def command_profile_review(args) -> int:
 
 def command_agent_factory(args) -> int:
     server_args = ["--host", args.host, "--port", str(args.port)]
+    if args.vault_dir:
+        server_args.extend(["--vault-dir", args.vault_dir])
     if args.open:
         server_args.append("--open")
     print(f"Task context compiler: http://{args.host}:{args.port}/agent-factory")
@@ -2206,6 +2208,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_factory = sub.add_parser("agent-factory", help="Start the local task context compiler server")
     agent_factory.add_argument("--host", default="127.0.0.1")
     agent_factory.add_argument("--port", type=int, default=8765)
+    agent_factory.add_argument("--vault-dir", default="", help="Override the dashboard vault for isolated verification")
     agent_factory.add_argument("--open", action="store_true")
     agent_factory.set_defaults(func=command_agent_factory)
 

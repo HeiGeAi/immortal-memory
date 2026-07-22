@@ -132,6 +132,7 @@ def test_system_evidence_uses_human_labels_and_local_times():
     assert "formatTimestamp(content)" in system
     assert "logs.text" in system
     assert "任务可能已经建立" in system
+    assert "actions_available" in system
 
 
 def test_self_ui_exposes_evidence_versions_and_real_correction():
@@ -268,13 +269,12 @@ def test_timestamp_formatter_honors_explicit_timezone_and_dst():
     assert "08:00" in second
 
 
-def test_sensitive_legacy_html_routes_are_no_store(tmp_path, monkeypatch):
+def test_sensitive_legacy_html_routes_are_no_store(tmp_path):
     dashboard = tmp_path / "dashboard.html"
     dashboard.write_text("<html><body>private snapshot</body></html>")
-    agent_entry = tmp_path / "latest-context.md"
+    agent_entry = tmp_path / "agent" / "ENTRY.md"
+    agent_entry.parent.mkdir()
     agent_entry.write_text("private agent context")
-    monkeypatch.setattr(profile_review, "DEFAULT_DASHBOARD", dashboard)
-    monkeypatch.setattr(profile_review, "DEFAULT_AGENT_ENTRY", agent_entry)
     server, base = _start_server(tmp_path)
     try:
         for route in ("/snapshot", "/agent-entry"):

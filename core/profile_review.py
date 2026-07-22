@@ -103,6 +103,15 @@ ROLE_MODES = {
 }
 
 
+def normalized_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def vault_default_path(value: Path, default: Path, relative: Path, vault: Path) -> Path:
+    """Keep explicit custom review files intact while scoping defaults to a vault."""
+    return vault / relative if Path(value) == default else Path(value)
+
+
 @dataclass(frozen=True)
 class StageCommand:
     stage_id: str
@@ -537,10 +546,11 @@ def file_status(path: Path) -> dict[str, Any]:
     }
 
 
-def latest_session_dirs() -> list[Path]:
-    if not DEFAULT_SESSIONS_DIR.exists():
+def latest_session_dirs(sessions_dir: Path | None = None) -> list[Path]:
+    root = Path(sessions_dir) if sessions_dir is not None else DEFAULT_SESSIONS_DIR
+    if not root.exists():
         return []
-    dirs = [path for path in DEFAULT_SESSIONS_DIR.iterdir() if path.is_dir() and (path / "manifest.json").exists()]
+    dirs = [path for path in root.iterdir() if path.is_dir() and (path / "manifest.json").exists()]
     dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     return dirs
 
@@ -586,11 +596,13 @@ class FactoryStore:
         immortal_dir: Path = IMMORTAL_DIR,
         skill_dir: Path = SKILL_DIR,
         runner: Any = run_process,
+        allow_commands: bool = True,
     ) -> None:
         self.history_path = Path(history_path)
         self.immortal_dir = Path(immortal_dir)
         self.skill_dir = Path(skill_dir)
         self.runner = runner
+        self.allow_commands = bool(allow_commands)
         self.lock = threading.Lock()
         saved = read_json(self.history_path, [])
         saved_jobs = saved if isinstance(saved, list) else []
@@ -650,13 +662,13 @@ class FactoryStore:
         return value
 
     def snapshot(self) -> dict[str, Any]:
-        state = read_json(IMMORTAL_DIR / "orchestrator_state.json", {})
-        quality = read_json(IMMORTAL_DIR / "quality" / "latest.json", {})
-        digest = read_json(IMMORTAL_DIR / "digests" / "latest.json", {})
-        feishu_clean = read_json(IMMORTAL_DIR / "feishu" / "clean" / "coverage.json", {})
-        feishu_distilled = read_json(IMMORTAL_DIR / "feishu" / "distilled" / "coverage.json", {})
-        people = read_json(IMMORTAL_DIR / "people" / "people_index.json", {})
-        roles = [session_summary(path) for path in latest_session_dirs()[:18]]
+        state = read_json(self.immortal_dir / "orchestrator_state.json", {})
+        quality = read_json(self.immortal_dir / "quality" / "latest.json", {})
+        digest = read_json(self.immortal_dir / "digests" / "latest.json", {})
+        feishu_clean = read_json(self.immortal_dir / "feishu" / "clean" / "coverage.json", {})
+        feishu_distilled = read_json(self.immortal_dir / "feishu" / "distilled" / "coverage.json", {})
+        people = read_json(self.immortal_dir / "people" / "people_index.json", {})
+        roles = [session_summary(path) for path in latest_session_dirs(self.immortal_dir / "sessions")[:18]]
         with self.lock:
             jobs = sorted(self.jobs.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return {
@@ -684,33 +696,41 @@ class FactoryStore:
             },
             "digest_status": ((digest.get("errors") or {}).get("status") if isinstance(digest, dict) else None),
             "layers": {
-                "index": file_status(IMMORTAL_DIR / "index.jsonl"),
-                "profile": file_status(IMMORTAL_DIR / "profile.json"),
-                "profile_nuwa": file_status(IMMORTAL_DIR / "profile_nuwa.json"),
+                "index": file_status(self.immortal_dir / "index.jsonl"),
+                "profile": file_status(self.immortal_dir / "profile.json"),
+                "profile_nuwa": file_status(self.immortal_dir / "profile_nuwa.json"),
                 "people": {
-                    **file_status(IMMORTAL_DIR / "people" / "people_index.json"),
+                    **file_status(self.immortal_dir / "people" / "people_index.json"),
                     "count": len(people.get("people") or []) if isinstance(people.get("people"), list) else 0,
                 },
                 "feishu_clean": {
-                    **file_status(IMMORTAL_DIR / "feishu" / "clean" / "coverage.json"),
+                    **file_status(self.immortal_dir / "feishu" / "clean" / "coverage.json"),
                     "records": (feishu_clean.get("counters") or {}).get("records_written")
                     or (feishu_clean.get("counters") or {}).get("clean_records")
                     or 0,
                 },
                 "feishu_distilled": {
-                    **file_status(IMMORTAL_DIR / "feishu" / "distilled" / "coverage.json"),
+                    **file_status(self.immortal_dir / "feishu" / "distilled" / "coverage.json"),
                     "memories": (feishu_distilled.get("counters") or {}).get("memories_written") or 0,
                     "profile_memories": (feishu_distilled.get("counters") or {}).get("profile_memories_written") or 0,
                 },
             },
+            "execution": {
+                "commands_allowed": self.allow_commands,
+                "reason": "" if self.allow_commands else "隔离 vault 的受控命令已禁用，避免误触正式数据。",
+            },
             "roles": roles,
             "jobs": jobs[:JOB_HISTORY_LIMIT],
-            "commands": {
-                "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
-                "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
-                "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
-                "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
-            },
+            "commands": (
+                {
+                    "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
+                    "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
+                    "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
+                    "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
+                }
+                if self.allow_commands
+                else {}
+            ),
         }
 
     def start_job(self, kind: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -727,6 +747,8 @@ class FactoryStore:
             "profile_refresh",
         }:
             raise ValueError("unknown factory job kind")
+        if not self.allow_commands:
+            raise JobConflict("隔离 vault 的受控命令已禁用，避免误触正式数据。")
         if kind in {"run", "collect", "full"} and self._orchestrator_is_active():
             raise JobConflict("Immortal 编排器已经运行")
         job_id = uuid.uuid4().hex[:12]
@@ -2190,8 +2212,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.send_legacy_html(control_center_page_html("Immortal Control Center"))
             return
         if parsed.path == "/snapshot":
-            if DEFAULT_DASHBOARD.exists():
-                payload = DEFAULT_DASHBOARD.read_bytes()
+            dashboard = self.control_center.immortal_dir / "dashboard.html"
+            if dashboard.exists():
+                payload = dashboard.read_bytes()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -2220,7 +2243,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if parsed.path == "/agent-entry":
-            if not DEFAULT_AGENT_ENTRY.exists():
+            agent_entry = self.control_center.immortal_dir / "agent" / "ENTRY.md"
+            if not agent_entry.exists():
                 self.send_html(
                     error_page(
                         "Agent Entry 尚未生成",
@@ -2229,7 +2253,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     status=HTTPStatus.NOT_FOUND,
                 )
                 return
-            text = DEFAULT_AGENT_ENTRY.read_text(encoding="utf-8", errors="ignore")
+            text = agent_entry.read_text(encoding="utf-8", errors="ignore")
             payload = (
                 "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
                 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
@@ -2389,6 +2413,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start the local Immortal profile review desk")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--vault-dir", type=Path, default=IMMORTAL_DIR, help="Memory vault to read and operate")
     parser.add_argument("--open", action="store_true", help="Open the review desk in the default browser")
     parser.add_argument("--proposal", type=Path, default=DEFAULT_PROPOSAL)
     parser.add_argument("--memories", type=Path, default=DEFAULT_PROFILE_MEMORIES)
@@ -2397,26 +2422,79 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_server(args: argparse.Namespace) -> ThreadingHTTPServer:
+    vault = normalized_path(args.vault_dir)
+    is_primary_vault = vault == normalized_path(IMMORTAL_DIR)
+    store = ReviewStore(
+        vault_default_path(
+            args.proposal,
+            DEFAULT_PROPOSAL,
+            Path("feishu/distilled/profile_merge_proposal.md"),
+            vault,
+        ),
+        vault_default_path(
+            args.memories,
+            DEFAULT_PROFILE_MEMORIES,
+            Path("feishu/distilled/profile_memories.jsonl"),
+            vault,
+        ),
+        vault_default_path(
+            args.reviewed,
+            DEFAULT_REVIEWED_FILE,
+            Path("reviewed/profile_memories.jsonl"),
+            vault,
+        ),
+        vault_default_path(
+            args.review_state,
+            DEFAULT_REVIEW_STATE,
+            Path("reviewed/profile_review_state.json"),
+            vault,
+        ),
+    )
+    server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
+    listen_address, listen_port = server.server_address[:2]
+    server.store = store  # type: ignore[attr-defined]
+    server.factory = FactoryStore(  # type: ignore[attr-defined]
+        history_path=vault / "runtime" / "control_jobs.json",
+        immortal_dir=vault,
+        skill_dir=SKILL_DIR,
+        allow_commands=is_primary_vault,
+    )
+    control_center_kwargs: dict[str, Any] = {
+        "skill_dir": SKILL_DIR,
+        "service_reachable": True,
+    }
+    if not is_primary_vault:
+        control_center_kwargs["scheduler_probe"] = lambda: {
+            "status": "unknown",
+            "detail": "隔离 vault 不绑定系统 LaunchAgent，未使用正式调度证据。",
+            "source": "isolated_vault",
+            "evidence": "--vault-dir",
+        }
+    server.control_center = ControlCenter(  # type: ignore[attr-defined]
+        vault,
+        **control_center_kwargs,
+    )
+    server.control_data = ControlData(  # type: ignore[attr-defined]
+        vault,
+        skill_dir=SKILL_DIR,
+        listen_address=str(listen_address),
+        listen_port=int(listen_port),
+        actions_enabled=is_primary_vault,
+        action_reason="" if is_primary_vault else "隔离 vault 的受控命令已禁用，避免误触正式数据。",
+    )
+    return server
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    store = ReviewStore(args.proposal, args.memories, args.reviewed, args.review_state)
-    factory = FactoryStore()
-    control_center = ControlCenter(IMMORTAL_DIR, skill_dir=SKILL_DIR, service_reachable=True)
-    server = ThreadingHTTPServer((args.host, args.port), ReviewHandler)
-    server.store = store  # type: ignore[attr-defined]
-    server.factory = factory  # type: ignore[attr-defined]
-    server.control_center = control_center  # type: ignore[attr-defined]
-    server.control_data = ControlData(  # type: ignore[attr-defined]
-        IMMORTAL_DIR,
-        skill_dir=SKILL_DIR,
-        listen_address=args.host,
-        listen_port=args.port,
-    )
-    url = f"http://{args.host}:{args.port}/"
+    server = create_server(args)
+    listen_address, listen_port = server.server_address[:2]
+    url = f"http://{listen_address}:{listen_port}/"
     print(f"Immortal dashboard: {url}")
     print(f"Task context compiler: {url}agent-factory")
     print(f"Profile review audit desk: {url}review")
-    print(f"Proposal: {args.proposal}")
+    print(f"Proposal: {server.store.proposal}")
     if args.open:
         webbrowser.open(url)
     try:
