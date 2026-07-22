@@ -761,7 +761,7 @@ Expected: an absent, stale, malformed, locally altered, or upload-only cloud rec
 - Modify: `tests/test_control_data.py`
 - Modify: `tests/test_product_ui_v2.py`
 
-- [ ] **Step 1: Add failing read-model tests**
+- [x] **Step 1: Add failing read-model tests**
 
 ```python
 def test_backups_exposes_redacted_cloud_recovery_state(tmp_path, monkeypatch):
@@ -787,7 +787,7 @@ def test_backups_exposes_redacted_cloud_recovery_state(tmp_path, monkeypatch):
     assert "path" not in json.dumps(cloud)
 ```
 
-- [ ] **Step 2: Run tests and confirm the field is missing**
+- [x] **Step 2: Run tests and confirm the field is missing**
 
 Run:
 
@@ -797,7 +797,7 @@ PYTHONPATH=core python3 -m pytest tests/test_control_data.py tests/test_product_
 
 Expected: `cloud_recovery` is absent and the System view has no recovery card.
 
-- [ ] **Step 3: Implement safe System evidence**
+- [x] **Step 3: Implement safe System evidence**
 
 `ControlData.backups()` adds this bounded object:
 
@@ -815,7 +815,7 @@ Expected: `cloud_recovery` is absent and the System view has no recovery card.
 
 The implementation must not return receipt paths, part names, remote folder identifiers, remote file tokens, recipient fingerprints, commands, or raw failure text. `system.js` renders a dedicated card titled `飞书异地恢复` with one of these exact human states: `未配置`, `等待恢复演练`, `已验证可恢复`, `证据失效`. It must show a clear next action but no `button`, form, route, or endpoint for upload.
 
-- [ ] **Step 4: Add UI contract tests**
+- [x] **Step 4: Add UI contract tests**
 
 ```python
 def test_system_ui_shows_cloud_recovery_evidence_without_upload_action():
@@ -826,7 +826,7 @@ def test_system_ui_shows_cloud_recovery_evidence_without_upload_action():
     assert "feishu-recovery upload" not in page
 ```
 
-- [ ] **Step 5: Run Task 6 tests and commit**
+- [x] **Step 5: Run Task 6 tests and commit**
 
 Run:
 

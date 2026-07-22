@@ -276,6 +276,18 @@ def test_feishu_recovery_status_rejects_public_or_invalid_drill_receipt(tmp_path
     assert status["warnings"] == ["cloud_drill_receipt_missing_or_unsafe"]
 
 
+def test_feishu_recovery_status_distinguishes_unconfigured_from_failed_proof(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "index.jsonl").write_bytes(b"proof\n")
+
+    status = export_restore.get_feishu_recovery_backup_status(vault)
+
+    assert status["ok"] is False
+    assert status["warnings"] == ["cloud_not_configured"]
+    assert status["upload_present"] is False
+
+
 def test_real_backup_status_field_shape_is_accepted():
     status = {
         "generated_at": "2026-07-20T03:30:00Z",

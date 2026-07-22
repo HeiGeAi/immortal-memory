@@ -50,6 +50,25 @@ const ACTIONS = [
   ["profile_refresh", "刷新画像", "重新生成长期画像、Nuwa 画像与质量报告。"],
 ];
 
+const CLOUD_RECOVERY_REASON = {
+  cloud_not_configured: "尚未发现飞书异地恢复配置或完成记录。",
+  cloud_recovery_drill_pending: "已发现加密上传记录，但尚未完成远端下载后的恢复演练。",
+  cloud_upload_receipt_invalid: "上传记录不可作为恢复依据，需要重新核对。",
+  cloud_drill_receipt_missing_or_unsafe: "恢复演练记录不满足本机安全校验。",
+  cloud_drill_receipt_invalid: "恢复演练证据格式不完整或已失效。",
+  cloud_source_index_unreadable: "当前记忆索引不可安全读取，无法确认恢复点。",
+  cloud_source_index_hash_mismatch: "当前记忆已变化，恢复演练对应的恢复点不再是最新。",
+  cloud_vault_unsafe: "本机记忆库状态无法作为恢复依据。",
+  cloud_recovery_validator_unavailable: "恢复证据校验组件当前不可用。",
+  cloud_recovery_status_unavailable: "当前无法读取恢复证据，不把它当作已验证。",
+};
+
+const CLOUD_RECOVERY_BINDING = {
+  matched: "与当前记忆一致",
+  mismatch: "当前记忆已变化",
+  missing: "尚未建立",
+};
+
 function node(tag, value = "", className = "") {
   const result = document.createElement(tag);
   result.className = className;
@@ -94,6 +113,51 @@ function systemSection(title, value) {
   if (!list.children.length) list.append(node("p", "当前没有可报告的数据。", "state-message"));
   section.append(list);
   return section;
+}
+
+function cloudRecoveryState(cloud = {}) {
+  if (cloud.status === "verified") return "已验证可恢复";
+  if (cloud.reason_code === "cloud_not_configured") return "未配置";
+  if (cloud.reason_code === "cloud_recovery_drill_pending") return "等待恢复演练";
+  return "证据失效";
+}
+
+function cloudRecoveryCard(cloud = {}) {
+  const card = document.createElement("section");
+  card.className = "state-panel cloud-recovery-card";
+  card.dataset.status = cloud.status || "unknown";
+  const state = cloudRecoveryState(cloud);
+  const details = document.createElement("dl");
+  details.className = "detail-list";
+  appendFact(details, "当前状态", state);
+  appendFact(details, "云端位置", cloud.provider || "未配置");
+  appendFact(
+    details,
+    "最近验证",
+    cloud.last_verified_at ? formatTimestamp(cloud.last_verified_at) : "尚未验证",
+  );
+  appendFact(
+    details,
+    "验证方式",
+    cloud.verification === "remote-download-sha256+decrypt-restore"
+      ? "远端下载、校验、解密并恢复"
+      : "尚未建立",
+  );
+  appendFact(
+    details,
+    "当前记忆绑定",
+    CLOUD_RECOVERY_BINDING[cloud.source_binding] || "尚未建立",
+  );
+  const reason = CLOUD_RECOVERY_REASON[cloud.reason_code] || "";
+  card.append(
+    node("p", "OFFSITE RECOVERY · 异地恢复", "kicker"),
+    node("h2", "飞书异地恢复"),
+    node("p", state, cloud.status === "verified" ? "state-message" : "coverage-warning"),
+    node("p", reason || "恢复点已通过远端下载和真实恢复演练核验。", "state-message"),
+    details,
+    node("p", `下一步：${cloud.action || "读取最新证据"}`, "state-message"),
+  );
+  return card;
 }
 
 function commandLabel(command = "") {
@@ -332,9 +396,12 @@ export async function renderSystem(root, { signal, isCurrent, navigate, updateHe
     evidenceHeading.className = "view-heading";
     evidenceHeading.append(node("p", "VERIFIABLE EVIDENCE · 可复核依据", "kicker"), node("h2", "五类依据彼此独立"));
     fragment.append(evidenceHeading);
+    fragment.append(cloudRecoveryCard(data.backups?.cloud_recovery || {}));
     const grid = document.createElement("div");
     grid.className = "system-grid";
-    [["健康", data.health], ["能力", data.capabilities], ["来源", data.sources], ["备份", data.backups], ["诊断", data.diagnostics]].forEach(([title, value]) => grid.append(systemSection(title, value)));
+    const backupEvidence = { ...(data.backups || {}) };
+    delete backupEvidence.cloud_recovery;
+    [["健康", data.health], ["能力", data.capabilities], ["来源", data.sources], ["备份", backupEvidence], ["诊断", data.diagnostics]].forEach(([title, value]) => grid.append(systemSection(title, value)));
     fragment.append(grid);
   } else {
     updateHealth("连续性未知", "unknown");

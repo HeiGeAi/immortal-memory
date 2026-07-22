@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import export_restore
 from redact_common import redact
 
 
@@ -551,6 +552,109 @@ class ControlData:
             },
         }
 
+    def _cloud_recovery(self) -> dict[str, str]:
+        """Map private recovery proof to the tiny safe System-view contract."""
+        unavailable = {
+            "status": "unknown",
+            "provider": "",
+            "last_verified_at": "",
+            "verification": "",
+            "source_binding": "missing",
+            "reason_code": "cloud_recovery_status_unavailable",
+            "action": "在终端完成加密上传与恢复演练",
+        }
+        allowed_reasons = {
+            "cloud_not_configured",
+            "cloud_recovery_drill_pending",
+            "cloud_upload_receipt_invalid",
+            "cloud_drill_receipt_missing_or_unsafe",
+            "cloud_drill_receipt_invalid",
+            "cloud_source_index_unreadable",
+            "cloud_source_index_hash_mismatch",
+            "cloud_vault_unsafe",
+            "cloud_recovery_validator_unavailable",
+        }
+        try:
+            evidence = export_restore.get_feishu_recovery_backup_status(
+                self.immortal_dir
+            )
+        except Exception:
+            return unavailable
+        if not isinstance(evidence, dict):
+            return unavailable
+
+        warnings = evidence.get("warnings")
+        raw_reason = str(warnings[0]) if isinstance(warnings, list) and warnings else ""
+        reason = raw_reason if raw_reason in allowed_reasons else ""
+        raw_timestamp = str(evidence.get("generated_at") or "")
+        try:
+            parsed_timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            timestamp = raw_timestamp if parsed_timestamp.tzinfo is not None else ""
+        except ValueError:
+            timestamp = ""
+        verification = evidence.get("verification")
+        verification_mode = (
+            str(verification.get("mode") or "")
+            if isinstance(verification, dict)
+            else ""
+        )
+        if verification_mode != "remote-download-sha256+decrypt-restore":
+            verification_mode = ""
+        recovery_drill = evidence.get("recovery_drill")
+        source_binding = evidence.get("source_binding")
+        is_verified = bool(
+            evidence.get("ok") is True
+            and evidence.get("provider") == "feishu_drive"
+            and isinstance(verification, dict)
+            and verification.get("ok") is True
+            and verification_mode
+            and isinstance(recovery_drill, dict)
+            and recovery_drill.get("ok") is True
+            and recovery_drill.get("mode") == "decrypt-restore"
+            and isinstance(source_binding, dict)
+            and source_binding.get("ok") is True
+        )
+        if is_verified:
+            return {
+                "status": "verified",
+                "provider": "Feishu Drive",
+                "last_verified_at": timestamp,
+                "verification": verification_mode,
+                "source_binding": "matched",
+                "reason_code": "",
+                "action": "无需操作",
+            }
+
+        binding_state = (
+            "mismatch" if reason == "cloud_source_index_hash_mismatch" else "missing"
+        )
+        if reason == "cloud_not_configured":
+            return {
+                **unavailable,
+                "reason_code": reason,
+            }
+        if reason == "cloud_recovery_drill_pending":
+            return {
+                "status": "attention",
+                "provider": "Feishu Drive",
+                "last_verified_at": timestamp,
+                "verification": verification_mode,
+                "source_binding": binding_state,
+                "reason_code": reason,
+                "action": "在终端执行恢复演练",
+            }
+        return {
+            "status": "attention",
+            "provider": "Feishu Drive"
+            if evidence.get("provider") == "feishu_drive"
+            else "",
+            "last_verified_at": timestamp,
+            "verification": verification_mode,
+            "source_binding": binding_state,
+            "reason_code": reason or "cloud_recovery_status_unavailable",
+            "action": "在终端核对证据并重新恢复演练",
+        }
+
     def backups(self) -> dict[str, Any]:
         state = self._read_json(self.immortal_dir / "orchestrator_state.json")
         manifests: list[Path] = []
@@ -622,6 +726,7 @@ class ControlData:
             )
         return {
             "items": items,
+            "cloud_recovery": self._cloud_recovery(),
             "actions": [{"id": "verify", "label": "校验最新备份"}],
             "restore_available": False,
             "delete_available": False,

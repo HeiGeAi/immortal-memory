@@ -135,6 +135,15 @@ def test_system_evidence_uses_human_labels_and_local_times():
     assert "actions_available" in system
 
 
+def test_system_ui_shows_cloud_recovery_evidence_without_upload_action():
+    page = (ASSETS / "views" / "system.js").read_text(encoding="utf-8")
+    for state in ("飞书异地恢复", "未配置", "等待恢复演练", "已验证可恢复", "证据失效"):
+        assert state in page
+    assert "cloudRecoveryCard" in page
+    assert "confirm-remote-write" not in page
+    assert "feishu-recovery upload" not in page
+
+
 def test_self_ui_exposes_evidence_versions_and_real_correction():
     self_js = (ASSETS / "views" / "self.js").read_text(encoding="utf-8")
     api_js = (ASSETS / "api.js").read_text(encoding="utf-8")

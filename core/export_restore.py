@@ -2375,7 +2375,12 @@ def get_feishu_recovery_backup_status(
     vault = vault_path(vault_dir)
     storage = {"location": "external_cloud", "provider": "feishu_drive"}
 
-    def failed(reason: str, *, generated_at: str = "") -> dict[str, Any]:
+    def failed(
+        reason: str,
+        *,
+        generated_at: str = "",
+        upload_present: bool = False,
+    ) -> dict[str, Any]:
         return {
             "ok": False,
             "trust_level": "failed",
@@ -2392,22 +2397,53 @@ def get_feishu_recovery_backup_status(
             "source_binding": {"ok": False},
             "secret_scan": {"unique_candidates": 0},
             "redaction": {"unique_candidates": 0},
+            "upload_present": upload_present,
             "warnings": [reason],
         }
 
     if not _secure_directory(vault):
         return failed("cloud_vault_unsafe")
+    try:
+        from feishu_recovery import (
+            RecoveryError,
+            _validate_upload_receipt,
+            validate_drill_receipt,
+        )
+    except ImportError:
+        return failed("cloud_recovery_validator_unavailable")
+
+    upload_path = vault / "recovery" / "feishu" / "latest-upload.json"
+    upload_generation = _read_private_json_generation(
+        upload_path,
+        max_bytes=1024 * 1024,
+    )
+    if upload_generation is None:
+        upload_state = "invalid" if os.path.lexists(upload_path) else "missing"
+    else:
+        try:
+            _validate_upload_receipt(upload_generation[0])
+        except (RecoveryError, ValueError):
+            upload_state = "invalid"
+        else:
+            upload_state = "valid"
+
+    drill_path = vault / "recovery" / "feishu" / "latest-drill.json"
     receipt_generation = _read_private_json_generation(
-        vault / "recovery" / "feishu" / "latest-drill.json",
+        drill_path,
         max_bytes=1024 * 1024,
     )
     if receipt_generation is None:
-        return failed("cloud_drill_receipt_missing_or_unsafe")
+        if os.path.lexists(drill_path):
+            return failed(
+                "cloud_drill_receipt_missing_or_unsafe",
+                upload_present=upload_state == "valid",
+            )
+        if upload_state == "valid":
+            return failed("cloud_recovery_drill_pending", upload_present=True)
+        if upload_state == "invalid":
+            return failed("cloud_upload_receipt_invalid")
+        return failed("cloud_not_configured")
     receipt, _receipt_sha256, _receipt_identity = receipt_generation
-    try:
-        from feishu_recovery import RecoveryError, validate_drill_receipt
-    except ImportError:
-        return failed("cloud_drill_receipt_invalid")
     try:
         validated = validate_drill_receipt(receipt)
     except (RecoveryError, ValueError):
@@ -2418,6 +2454,7 @@ def get_feishu_recovery_backup_status(
         return failed(
             "cloud_source_index_unreadable",
             generated_at=str(validated["verified_at"]),
+            upload_present=upload_state == "valid",
         )
     source_binding_ok = current_index[1] == validated["source_index_sha256"]
     return {
@@ -2441,6 +2478,7 @@ def get_feishu_recovery_backup_status(
         "redaction": {
             "unique_candidates": validated["redaction_unique_candidates"]
         },
+        "upload_present": upload_state == "valid",
         "warnings": [] if source_binding_ok else ["cloud_source_index_hash_mismatch"],
     }
 

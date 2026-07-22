@@ -93,6 +93,10 @@ dt { color: var(--bone-faint); font: 10px var(--mono); overflow-wrap: anywhere; 
 dd { margin: 0; overflow-wrap: anywhere; }
 .state-message, .state-panel { color: var(--bone-soft); }
 .state-panel { padding: 28px; border: 1px solid var(--line); background: var(--ink-raised); }
+.cloud-recovery-card { margin: 0 0 24px; border-left: 3px solid var(--line); }
+.cloud-recovery-card[data-status="verified"] { border-left-color: var(--copper); }
+.cloud-recovery-card[data-status="attention"] { border-left-color: var(--cinnabar); }
+.cloud-recovery-card h2 { margin: 8px 0 12px; color: var(--copper-bright); }
 .coverage-warning { margin: 18px 0 0; padding: 14px 16px; border: 1px solid var(--line); border-left: 3px solid var(--cinnabar); color: var(--bone-soft); background: var(--ink-raised); }
 .error-state { border-left: 3px solid var(--cinnabar); }
 .error-text { color: #e07a63; }

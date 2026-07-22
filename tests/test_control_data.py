@@ -9,6 +9,7 @@ from datetime import datetime
 
 import pytest
 
+import export_restore
 import immortal
 import profile_review
 from control_center import ControlCenter
@@ -85,6 +86,69 @@ def test_readyz_returns_503_when_vault_is_missing(tmp_path):
     assert status == 503
     assert payload["status"] == "not_ready"
     assert payload["checks"]["vault_readable"] is False
+
+
+def test_backups_exposes_redacted_cloud_recovery_state(tmp_path, monkeypatch):
+    data = ControlData(tmp_path, skill_dir=tmp_path)
+    monkeypatch.setattr(
+        export_restore,
+        "get_feishu_recovery_backup_status",
+        lambda _vault: {
+            "ok": True,
+            "storage_location": "external_cloud",
+            "provider": "feishu_drive",
+            "generated_at": "2026-07-22T00:00:00Z",
+            "verification": {
+                "mode": "remote-download-sha256+decrypt-restore",
+                "ok": True,
+            },
+            "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
+            "source_binding": {"ok": True},
+            "warnings": [],
+        },
+    )
+
+    cloud = data.backups()["cloud_recovery"]
+
+    assert cloud == {
+        "status": "verified",
+        "provider": "Feishu Drive",
+        "last_verified_at": "2026-07-22T00:00:00Z",
+        "verification": "remote-download-sha256+decrypt-restore",
+        "source_binding": "matched",
+        "reason_code": "",
+        "action": "无需操作",
+    }
+    encoded = json.dumps(cloud, ensure_ascii=False)
+    assert "folder_token" not in encoded
+    assert "path" not in encoded
+
+
+def test_backups_marks_pending_drill_without_exposing_remote_receipt(tmp_path, monkeypatch):
+    data = ControlData(tmp_path, skill_dir=tmp_path)
+    monkeypatch.setattr(
+        export_restore,
+        "get_feishu_recovery_backup_status",
+        lambda _vault: {
+            "ok": False,
+            "storage_location": "external_cloud",
+            "provider": "feishu_drive",
+            "generated_at": "2026-07-22T00:00:00Z",
+            "verification": {
+                "mode": "remote-download-sha256+decrypt-restore",
+                "ok": False,
+            },
+            "recovery_drill": {"ok": False, "mode": "decrypt-restore"},
+            "source_binding": {"ok": False},
+            "warnings": ["cloud_recovery_drill_pending"],
+        },
+    )
+
+    cloud = data.backups()["cloud_recovery"]
+
+    assert cloud["status"] == "attention"
+    assert cloud["reason_code"] == "cloud_recovery_drill_pending"
+    assert cloud["action"] == "在终端执行恢复演练"
 
 
 def test_dashboard_server_scopes_default_paths_to_requested_vault(tmp_path):
