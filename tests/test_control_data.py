@@ -268,6 +268,28 @@ def test_dashboard_export_refreshes_and_labels_the_legacy_snapshot(tmp_path, mon
     assert str(tmp_path / "vault" / "dashboard.html") in output
 
 
+@pytest.mark.parametrize("command", ["dashboard", "agent-factory"])
+def test_dashboard_server_commands_reject_nonloopback_host(command):
+    with pytest.raises(SystemExit) as raised:
+        immortal.build_parser().parse_args([command, "--host", "0.0.0.0"])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("command", "arguments"),
+    [
+        ("dashboard", ["dashboard"]),
+        ("dashboard-export", ["dashboard-export"]),
+    ],
+)
+def test_dashboard_commands_propagate_script_failures(command, arguments, monkeypatch, capsys):
+    monkeypatch.setattr(immortal, "run_script", lambda _script, _args=None: 17)
+    args = immortal.build_parser().parse_args(arguments)
+
+    assert args.func(args) == 17
+    assert capsys.readouterr().out == ""
+
+
 def test_v1_overview_reuses_truth_snapshot(tmp_path):
     server, base = start_server(tmp_path)
     try:

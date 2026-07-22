@@ -2050,7 +2050,12 @@ def build_parser() -> argparse.ArgumentParser:
         "dashboard",
         help="Start local dashboard server on loopback for the live product",
     )
-    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument(
+        "--host",
+        default="127.0.0.1",
+        choices=("127.0.0.1",),
+        help="Loopback address for the private local dashboard",
+    )
     dashboard.add_argument("--port", type=int, default=8765)
     dashboard.add_argument("--vault-dir", default="", help="Override dashboard vault for isolated verification")
     dashboard.add_argument("--open", action="store_true", help="Open live dashboard URL after startup")
@@ -2271,8 +2276,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile_review.add_argument("profile_review_args", nargs=argparse.REMAINDER)
     profile_review.set_defaults(func=command_profile_review)
 
-    agent_factory = sub.add_parser("agent-factory", help="Start the local task context compiler server")
-    agent_factory.add_argument("--host", default="127.0.0.1")
+    agent_factory = sub.add_parser(
+        "agent-factory",
+        help="Start the local task context compiler server on loopback",
+    )
+    agent_factory.add_argument(
+        "--host",
+        default="127.0.0.1",
+        choices=("127.0.0.1",),
+        help="Loopback address for the private local dashboard",
+    )
     agent_factory.add_argument("--port", type=int, default=8765)
     agent_factory.add_argument("--vault-dir", default="", help="Override the dashboard vault for isolated verification")
     agent_factory.add_argument("--open", action="store_true")
