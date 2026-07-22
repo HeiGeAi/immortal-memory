@@ -53,7 +53,7 @@ body {
     var(--void);
   background-size: 48px 48px;
 }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 .app { width: min(1180px, 100%); margin: 0 auto; padding: 20px 40px 48px; }
 .masthead {
@@ -617,8 +617,8 @@ function detailBlocks(value) {
   }).join('');
 }
 
-function confirmAction({title, copy, impact, execute, control = null}) {
-  pendingAction = {execute, control};
+function confirmAction({title, copy, impact, execute, control = null, feedback = {}}) {
+  pendingAction = {execute, control, feedback};
   $('dialogTitle').textContent = title;
   $('dialogCopy').textContent = copy;
   $('dialogImpact').textContent = impact;
@@ -627,16 +627,16 @@ function confirmAction({title, copy, impact, execute, control = null}) {
 
 async function runPendingAction() {
   if (!pendingAction) return;
-  const {execute, control} = pendingAction;
+  const {execute, control, feedback} = pendingAction;
   pendingAction = null;
+  const labels = {
+    loading:'正在执行', loadingMeta:'LOCAL ACTION', success:'已完成', successMeta:'DONE', error:'执行失败', errorMeta:'RETRY',
+    ...feedback
+  };
   try {
-    const run = () => withControlFeedback($('dialogConfirm'), {
-      loading:'正在执行', loadingMeta:'LOCAL ACTION', success:'已提交', successMeta:'RECORDED', error:'执行失败', errorMeta:'RETRY'
-    }, execute);
+    const run = () => withControlFeedback($('dialogConfirm'), labels, execute);
     if (control) {
-      await withControlFeedback(control, {
-        loading:'正在执行', loadingMeta:'LOCAL ACTION', success:'已提交', successMeta:'RECORDED', error:'执行失败', errorMeta:'RETRY'
-      }, run);
+      await withControlFeedback(control, labels, run);
     } else {
       await run();
     }
@@ -789,13 +789,22 @@ async function renderProfile() {
 
 async function renderAgent() {
   const data = await api('/api/v1/agent');
+  const model = data.personal_model || {available:false,status:'missing',accepted_models:0,heuristics:0,boundaries:0,active_corrections:0,corrections:[]};
   const rows = data.contexts.map(item => `
     <button class="row" data-context-id="${esc(item.slug)}"><strong>${esc(item.goal)}</strong><p>${esc(item.mode || 'auto')}</p>${tag(item.status)}<span class="mono">${esc(when(item.generated_at))}</span></button>`).join('');
-  setSystem(data.available ? 'ready' : 'attention', data.available ? 'Agent 入口已就绪' : 'Agent 入口尚未生成');
+  const correctionRows = (model.corrections || []).map(item => `
+    <div class="row"><strong>${esc(item.id)}</strong><p>${esc(item.scope)} · ${item.active ? '已生效' : '已撤销'} · ${esc(when(item.created_at))}</p>${tag(item.active ? 'ready' : 'attention')}<span>${item.active ? `<button class="control" data-personal-model-revoke="${esc(item.id)}"><span><strong>撤销</strong><small>APPEND ONLY</small></span></button>` : '<span class="mono">REVOKED</span>'}</span></div>`).join('');
+  setSystem(model.available ? model.status : 'attention', model.available ? `Personal Model · ${statusLabel(model.status)} · ${model.active_corrections || 0} 条纠正` : 'Personal Model 尚未编译');
   $('viewRoot').innerHTML = `${viewHead('agent', `ENTRY · ${data.entry.exists ? 'READY' : 'MISSING'}`)}
-    <section class="grid grid-2">
+    <section class="grid grid-3">
       <div class="card"><div class="card-top"><span class="mono">ENTRY.md</span>${tag(data.entry.exists ? 'ready' : 'unknown')}</div><h4>稳定 Agent 入口</h4><p>${data.entry.exists ? `更新时间 ${esc(when(data.entry.updated_at))} · ${num(data.entry.bytes)} B` : '读取页面不会自动生成文件。'}</p></div>
-      <form class="card" id="contextForm"><div class="card-top"><span class="mono">CONTEXT COMPILER</span>${tag('ready')}</div><h4>生成任务上下文</h4><p>只接受目标和固定模式，不接受命令字符串。</p><input class="field" id="contextGoal" required maxlength="160" placeholder="例如：为发布 v1.1.0 做最终审查"><select class="field" id="contextMode"><option value="auto">自动</option><option value="answer">回答</option><option value="code">开发</option><option value="research">研究</option><option value="plan">规划</option></select><button class="control primary" type="submit"><span><strong>生成上下文</strong><small>CONTROLLED JOB</small></span></button></form>
+      <div class="card"><div class="card-top"><span class="mono">PERSONAL MODEL</span>${tag(model.available ? model.status : 'unknown')}</div><h4>可审计个人模型</h4><p>${model.available ? `已接受模型 ${num(model.accepted_models)} · 启发式 ${num(model.heuristics)} · 纠正 ${num(model.active_corrections)}` : '尚未编译。先完成 profile 和 Nuwa 派生层，再手动或随编排生成。'}</p>${model.available ? `<div class="source">REV ${esc(model.revision || 'unknown')} · ${esc(when(model.generated_at))}</div><button class="control" data-personal-model-reveal><span><strong>查看本机模型</strong><small>CONFIRM REVEAL</small></span></button>` : ''}</div>
+      <form class="card" id="contextForm"><div class="card-top"><span class="mono">CONTEXT COMPILER</span>${tag('ready')}</div><h4>生成任务上下文</h4><p>只接受目标和固定模式，不接受命令字符串。</p><input class="field" id="contextGoal" required maxlength="160" placeholder="例如：为发布 v1.2.0 做最终审查"><select class="field" id="contextMode"><option value="auto">自动</option><option value="answer">回答</option><option value="code">开发</option><option value="research">研究</option><option value="plan">规划</option></select><button class="control primary" type="submit"><span><strong>生成上下文</strong><small>CONTROLLED JOB</small></span></button></form>
+    </section>
+    <div class="section-title"><div><h3>用户纠正</h3><p>纠正写入追加式账本，不改写原始记忆或 profile 事实层。</p></div><span class="micro">CORRECTION LEDGER</span></div>
+    <section class="grid grid-2">
+      <form class="card" id="personalModelCorrectionForm"><div class="card-top"><span class="mono">ADD CORRECTION</span>${tag('attention')}</div><h4>补充、约束或纠正工作模型</h4><p>正文默认不会出现在列表和审计日志。看起来像凭据的内容会被拒绝。</p><select class="field" id="personalModelScope"><option value="persona">表达与协作</option><option value="judgment">判断规则</option><option value="memory">记忆解释</option><option value="boundary">边界条件</option></select><textarea class="field" id="personalModelStatement" rows="4" minlength="4" maxlength="600" required placeholder="例如：回答时先给结论，再列依据和动作。"></textarea><button class="control primary" type="submit"><span><strong>记录纠正</strong><small>APPEND ONLY</small></span></button></form>
+      <div class="card"><div class="card-top"><span class="mono">ACTIVE LEDGER</span>${tag(model.available ? model.status : 'unknown')}</div><h4>纠正状态</h4><p>列表只显示 ID、范围和状态，不显示纠正正文。</p><div class="row-list">${correctionRows || '<div class="empty">还没有用户纠正。</div>'}</div></div>
     </section>
     <div class="section-title"><div><h3>最近上下文</h3><p>这里只展示元数据，不返回完整 vault。</p></div></div>
     <section class="row-list">${rows || '<div class="empty">还没有任务上下文</div>'}</section>`;
@@ -892,6 +901,57 @@ async function revealMemory(id, control) {
   });
 }
 
+async function revealPersonalModel(control) {
+  confirmAction({
+    title:'确认显示 Personal Model',
+    copy:'模型正文会从本机派生文件读取，只显示在当前抽屉，不写入日志。',
+    impact:'其中可能包含你主动写入的纠正内容。关闭抽屉后不会保留在看板列表。',
+    control,
+    feedback:{loading:'正在读取', loadingMeta:'LOCAL FILE', success:'已显示', successMeta:'LOCAL VIEW', error:'读取失败', errorMeta:'RETRY'},
+    execute: async () => {
+      const data = await api('/api/v1/agent/personal-model?reveal=1');
+      showDrawer('Personal Model · 本机内容', detailBlocks(data));
+    }
+  });
+}
+
+function submitPersonalModelCorrection(form, control) {
+  const scope = $('personalModelScope').value;
+  const statement = $('personalModelStatement').value.trim();
+  if (statement.length < 4) {
+    toast('纠正内容至少需要 4 个字符。', true);
+    return;
+  }
+  confirmAction({
+    title:'记录 Personal Model 纠正',
+    copy:`范围：${scope}。这条纠正会进入追加式账本，并重新编译派生模型。`,
+    impact:'不会改写原始记忆、profile 或 Nuwa 输入。列表和审计日志不展示纠正正文。',
+    control,
+    feedback:{loading:'正在记录', loadingMeta:'APPEND ONLY', success:'已记录', successMeta:'APPEND ONLY', error:'记录失败', errorMeta:'RETRY'},
+    execute: async () => {
+      await api('/api/v1/agent/personal-model/corrections', {method:'POST', body:JSON.stringify({scope,statement})});
+      form.reset();
+      toast('纠正已记录并重新编译');
+      await renderActive();
+    }
+  });
+}
+
+function revokePersonalModelCorrection(id, control) {
+  confirmAction({
+    title:'撤销 Personal Model 纠正',
+    copy:`将追加一条撤销事件：${id}。`,
+    impact:'不会删除历史记录，也不会改写原始记忆。后续任务上下文不再采纳这条纠正。',
+    control,
+    feedback:{loading:'正在撤销', loadingMeta:'LEDGER UPDATE', success:'已撤销', successMeta:'LEDGER UPDATED', error:'撤销失败', errorMeta:'RETRY'},
+    execute: async () => {
+      await api(`/api/v1/agent/personal-model/corrections/${encodeURIComponent(id)}/revoke`, {method:'POST', body:'{}'});
+      toast('纠正已撤销');
+      await renderActive();
+    }
+  });
+}
+
 async function openProfile(id) {
   const data = await api(`/api/v1/profile/candidates/${encodeURIComponent(id)}`);
   const actions = [];
@@ -968,6 +1028,8 @@ function bindViewEvents() {
   document.querySelectorAll('[data-memory-id]').forEach(button => button.onclick = () => openMemory(button.dataset.memoryId).catch(error => toast(error.message, true)));
   document.querySelectorAll('[data-profile-id]').forEach(button => button.onclick = () => openProfile(button.dataset.profileId).catch(error => toast(error.message, true)));
   document.querySelectorAll('[data-context-id]').forEach(button => button.onclick = () => openContext(button.dataset.contextId).catch(error => toast(error.message, true)));
+  document.querySelectorAll('[data-personal-model-reveal]').forEach(button => button.onclick = () => revealPersonalModel(button).catch(error => toast(error.message, true)));
+  document.querySelectorAll('[data-personal-model-revoke]').forEach(button => button.onclick = () => revokePersonalModelCorrection(button.dataset.personalModelRevoke, button));
   $('memorySearch')?.addEventListener('click', event => withControlFeedback(event.currentTarget, {loading:'正在查询', loadingMeta:'LOCAL INDEX', success:'结果已更新', successMeta:'REFRESHED'}, async () => { memoryOffset = 0; await renderMemories(); bindViewEvents(); }).catch(error => toast(error.message, true)));
   $('memoryPrev')?.addEventListener('click', event => withControlFeedback(event.currentTarget, {loading:'正在读取', loadingMeta:'PREVIOUS', success:'列表已更新', successMeta:'REFRESHED'}, async () => { memoryOffset = Math.max(0, memoryOffset - 20); await renderMemories(); bindViewEvents(); }).catch(error => toast(error.message, true)));
   $('memoryNext')?.addEventListener('click', event => withControlFeedback(event.currentTarget, {loading:'正在读取', loadingMeta:'NEXT PAGE', success:'列表已更新', successMeta:'REFRESHED'}, async () => { memoryOffset += 20; await renderMemories(); bindViewEvents(); }).catch(error => toast(error.message, true)));
@@ -992,6 +1054,10 @@ function bindViewEvents() {
       control:event.submitter || $('contextForm')?.querySelector('.control'),
       execute:async () => { const job = await api('/api/v1/agent/contexts', {method:'POST', body:JSON.stringify({goal,mode})}); toast(`上下文任务 ${job.id} 已创建`); await switchView('runs'); await openJob(job.id); }
     });
+  });
+  $('personalModelCorrectionForm')?.addEventListener('submit', event => {
+    event.preventDefault();
+    submitPersonalModelCorrection(event.currentTarget, event.submitter || event.currentTarget.querySelector('.control'));
   });
 }
 

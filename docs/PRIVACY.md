@@ -26,6 +26,14 @@ Prefer:
 - evidence IDs over full messages;
 - scoped task context over full profile dumps.
 
+## Personal Model Boundary
+
+Personal Model snapshots and user corrections are local derived artifacts.
+They must not be uploaded to a remote service by default, embedded into a
+public Skill, or treated as a user's identity. The dashboard shows metadata
+without correction bodies until a deliberate local reveal. Correction audit
+events contain identifiers and scopes, never the correction text.
+
 ## Account Guard
 
 Enterprise connectors should confirm account identity before broad collection.

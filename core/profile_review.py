@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from control_center import ControlCenter
 from control_center_ui import control_center_page_html
 from control_data import ControlData
+import personal_model
 from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
@@ -59,6 +60,7 @@ COMMAND_TIMEOUTS = {
     "profile_auto_review": 1200,
     "profile": 900,
     "profile_nuwa": 900,
+    "personal_model": 900,
     "people": 900,
     "relationships": 900,
     "quality": 900,
@@ -747,7 +749,7 @@ class FactoryStore:
                     )
                     return
                 if result.returncode != 0:
-                    if result.returncode == 2 and any(part in {"profile-nuwa", "role-distill", "agent-build", "task-compile", "agent-session"} for part in cmd):
+                    if result.returncode == 2 and any(part in {"profile-nuwa", "personal-model", "role-distill", "agent-build", "task-compile", "agent-session"} for part in cmd):
                         attention = True
                         continue
                     raise RuntimeError(f"command failed with code {result.returncode}: {self._display_cmd(cmd)}")
@@ -792,6 +794,7 @@ class FactoryStore:
                 ([python, immortal, "profile-auto-review", "--reconsider-rejected"], COMMAND_TIMEOUTS["profile_auto_review"]),
                 ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
                 ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "personal-model", "build"], COMMAND_TIMEOUTS["personal_model"]),
                 ([python, immortal, "people"], COMMAND_TIMEOUTS["people"]),
                 ([python, immortal, "relationships"], COMMAND_TIMEOUTS["relationships"]),
                 ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
@@ -830,6 +833,7 @@ class FactoryStore:
             return [
                 ([python, immortal, "profile"], COMMAND_TIMEOUTS["profile"]),
                 ([python, immortal, "profile-nuwa"], COMMAND_TIMEOUTS["profile_nuwa"]),
+                ([python, immortal, "personal-model", "build"], COMMAND_TIMEOUTS["personal_model"]),
                 ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
             ]
         raise ValueError("unknown factory job kind")
@@ -894,7 +898,7 @@ class FactoryStore:
         if kind == "backup_verify":
             return "最新便携备份校验已完成。"
         if kind == "profile_refresh":
-            return "长期画像和质量报告已刷新。"
+            return "长期画像、Personal Model 和质量报告已刷新。"
         return "任务完成。"
 
     @staticmethod
@@ -1926,6 +1930,23 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v1/agent":
             self.send_json(self.control_data.agent_status())
             return
+        if parsed.path == "/api/v1/agent/personal-model":
+            detail_query = parse_qs(parsed.query, keep_blank_values=True)
+            if set(detail_query) - {"reveal"}:
+                self.send_json(
+                    error_payload(
+                        "invalid_request",
+                        "invalid query parameter for personal model endpoint",
+                    ),
+                    status=400,
+                )
+                return
+            try:
+                reveal = self._parse_reveal_param(detail_query)
+                self.send_json(self.control_data.personal_model_detail(reveal=reveal))
+            except ValueError as exc:
+                self.send_json(error_payload("invalid_request", str(exc)), status=400)
+            return
         if parsed.path.startswith("/api/v1/agent/contexts/"):
             context_id = parsed.path.removeprefix("/api/v1/agent/contexts/")
             try:
@@ -2105,6 +2126,37 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     ),
                     status=202,
                 )
+                return
+            if parsed.path == "/api/v1/agent/personal-model/corrections":
+                unknown = set(body) - {"scope", "statement"}
+                if unknown:
+                    raise ValueError(f"unsupported field: {sorted(unknown)[0]}")
+                result = personal_model.add_correction(
+                    body.get("scope"),
+                    body.get("statement"),
+                    vault_dir=self.control_center.immortal_dir,
+                )
+                self.send_json(result)
+                return
+            correction_prefix = "/api/v1/agent/personal-model/corrections/"
+            if parsed.path.startswith(correction_prefix) and parsed.path.endswith("/revoke"):
+                correction_id = parsed.path.removeprefix(correction_prefix).removesuffix("/revoke")
+                if "/" in correction_id:
+                    raise ValueError("invalid correction id")
+                if body:
+                    raise ValueError("correction revoke does not accept parameters")
+                try:
+                    result = personal_model.revoke_correction(
+                        correction_id,
+                        vault_dir=self.control_center.immortal_dir,
+                    )
+                except KeyError:
+                    self.send_json(
+                        error_payload("correction_not_found", "纠正记录不存在。"),
+                        status=404,
+                    )
+                    return
+                self.send_json(result)
                 return
             if parsed.path == "/api/v1/backups/verify":
                 if body:

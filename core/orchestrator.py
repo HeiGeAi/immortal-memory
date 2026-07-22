@@ -202,6 +202,7 @@ def load_state() -> dict:
         "last_distill": None,
         "last_profile": None,
         "last_profile_nuwa": None,
+        "last_personal_model": None,
         "last_role_distill": None,
         "last_task_compile": None,
         "last_profile_auto_review": None,
@@ -503,6 +504,19 @@ def profile_nuwa():
         log(f"Nuwa 风格画像已更新但质量门禁需关注: {out.strip()[:300]}")
         return True
     log(f"Nuwa 风格画像更新失败: {out.strip()[:300]}")
+    return False
+
+
+def personal_model():
+    log("=== 阶段 5B3: 编译 Personal Model ===")
+    ok, out = run_script("personal_model.py", "build", timeout=300)
+    if ok:
+        log("Personal Model 已更新")
+        return True
+    if "quality=attention" in out:
+        log(f"Personal Model 已更新但质量门禁需关注: {out.strip()[:300]}")
+        return True
+    log(f"Personal Model 更新失败: {out.strip()[:300]}")
     return False
 
 
@@ -1017,6 +1031,10 @@ def run_main():
         state["last_profile"] = now_iso
         if profile_nuwa():
             state["last_profile_nuwa"] = now_iso
+            if personal_model():
+                state["last_personal_model"] = now_iso
+            else:
+                errors.append("personal model failed")
         else:
             errors.append("profile nuwa failed")
     else:

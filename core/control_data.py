@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import personal_model
 from redact_common import redact
 
 
@@ -52,13 +53,12 @@ class ControlData:
             "sources": True,
             "memories": (self.immortal_dir / "index.jsonl").is_file(),
             "profile": True,
-            "agent": (self.immortal_dir / "agent").is_dir(),
+            "agent": True,
             "backup": True,
             "diagnostics": True,
         }
         reasons = {
             "memories": "记忆索引尚未生成",
-            "agent": "Agent 入口目录尚未生成",
         }
         return {
             "schema_version": 1,
@@ -525,12 +525,59 @@ class ControlData:
             )
         return items
 
+    def personal_model_status(self) -> dict[str, Any]:
+        model_path = self.immortal_dir / "models" / "personal_model.json"
+        markdown_path = self.immortal_dir / "models" / "personal_model.md"
+        model = self._read_json(model_path)
+        if not model:
+            return {
+                "available": False,
+                "status": "missing",
+                "generated_at": "",
+                "revision": "",
+                "accepted_models": 0,
+                "heuristics": 0,
+                "boundaries": 0,
+                "active_corrections": 0,
+                "corrections": [],
+                "quality_checks": [],
+                "content_available": False,
+            }
+        status = personal_model.metadata(model)
+        status["content_available"] = markdown_path.is_file()
+        return status
+
+    def personal_model_detail(self, *, reveal: bool = False) -> dict[str, Any]:
+        status = self.personal_model_status()
+        result = {
+            **status,
+            "content_state": "hidden",
+            "reveal_required": True,
+            "reveal_hint": "模型正文默认隐藏。确认后仅在本机抽屉中显示。",
+        }
+        if not reveal:
+            return result
+        markdown_path = self.immortal_dir / "models" / "personal_model.md"
+        try:
+            content = redact(markdown_path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            content = ""
+        result.update(
+            {
+                "content_state": "revealed",
+                "reveal_required": False,
+                "content": content,
+            }
+        )
+        return result
+
     def agent_status(self) -> dict[str, Any]:
         entry = self._file_metadata(self.immortal_dir / "agent" / "ENTRY.md")
         contexts = self._agent_contexts()
         return {
             "available": bool(entry["exists"]),
             "entry": entry,
+            "personal_model": self.personal_model_status(),
             "contexts": contexts,
             "supported_actions": [
                 {

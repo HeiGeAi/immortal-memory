@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.1.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.2.0-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -27,12 +27,13 @@
 
 要让它说出像你会说的话、按你会做的判断去做事，只有一个办法：用**足够高密度的个人上下文**，把它从共识里硬拽出来。
 
-Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。它做四件事：
+Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。它做五件事：
 
 1. **先把你正在丢失的数字痕迹接住。** 对话、文件、会议、聊天记录，先存下来，丢不了。
 2. **把这些原始痕迹蒸馏成可检索、有出处的记忆。** 每一条都能追回到源头。
 3. **任何本地 AI agent 干活之前，给它生成一份贴着当前任务的上下文包。**
 4. **需要重复某种行为时，直接编译出一个场景化的角色 agent。** 比如写稿审稿、商业顾问、项目操盘、会议分析。
+5. **把经过审核的判断模式编译成可审计的 Personal Model。** 它能被纠正和撤销，但不会把一次推断伪装成永久人格。
 
 ## 为什么不是再写一份长 prompt
 
@@ -52,6 +53,16 @@ Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也
 - 你的决策过程、权衡理由、失败复盘
 
 一个关键原则：采集真实的你，不是理想中的你。你实际怎么做决策，比你以为自己怎么做决策，重要得多。
+
+## Personal Model：可纠正，不冒充
+
+Personal Model 不是“让 AI 假装就是你”。它只读取已审核的画像和通过验证的判断模型，作为一次任务的工作参考。
+
+- 只有跨域、可生成、具区分度的已接受模型才能进入。
+- 证据不足时明确返回 `attention`，而不是假装已经了解你。
+- 你的纠正写进追加式账本。撤销会追加新事件，不删除历史，不改写原始记忆。
+- 控制中心默认只展示元数据。完整内容只在本机确认后显示。
+- 它不上传模型、纠正或原始语料，也不自动安装持久化身份 Skill。
 
 ## 它怎么把噪音变成判断
 
@@ -194,12 +205,13 @@ There is a sharper problem underneath. A large model is wired to produce **confi
 
 To make it say what you would say and decide the way you would decide, there is only one move: push **high-density personal context** at it until it gets dragged out of the consensus prior.
 
-Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. It does four things:
+Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. It does five things:
 
 1. **Catch your digital traces before they are lost.** Conversations, files, meetings, chat logs, all captured into a recoverable vault.
 2. **Distill raw traces into searchable, evidence-backed memory.** Every memory points back to its source.
 3. **Generate a task-local context pack** for any local agent before it starts work.
 4. **Compile scenario role agents** when you need a behavior on repeat: writing reviewer, business advisor, project operator, meeting analyst.
+5. **Compile an auditable Personal Model** from reviewed derived layers, with explicit corrections and boundaries instead of identity roleplay.
 
 ## Why not just write a longer prompt
 

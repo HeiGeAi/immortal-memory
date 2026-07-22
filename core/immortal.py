@@ -58,6 +58,9 @@ PROFILE_JSON = IMMORTAL_DIR / "profile.json"
 PROFILE_COMPACT_MD = IMMORTAL_DIR / "profile_compact.md"
 PROFILE_NUWA_MD = IMMORTAL_DIR / "profile_nuwa.md"
 PROFILE_NUWA_JSON = IMMORTAL_DIR / "profile_nuwa.json"
+PERSONAL_MODEL_DIR = IMMORTAL_DIR / "models"
+PERSONAL_MODEL_JSON = PERSONAL_MODEL_DIR / "personal_model.json"
+PERSONAL_MODEL_MD = PERSONAL_MODEL_DIR / "personal_model.md"
 PEOPLE_MD = IMMORTAL_DIR / "people" / "people_index.md"
 PEOPLE_JSON = IMMORTAL_DIR / "people" / "people_index.json"
 RELATIONSHIP_JSON = IMMORTAL_DIR / "relationships" / "relationship_index.json"
@@ -465,6 +468,15 @@ def command_doctor(_args) -> int:
         and (nuwa_gate or {}).get("status") in {"ok", "attention"},
         f"{fmt_size(PROFILE_NUWA_MD)}, {(nuwa_gate or {}).get('status', 'missing')}",
     )
+    personal_model = read_json(PERSONAL_MODEL_JSON, {})
+    personal_gate = personal_model.get("quality_gate") if isinstance(personal_model, dict) else {}
+    add_optional(
+        "Personal Model",
+        PERSONAL_MODEL_MD.exists()
+        and PERSONAL_MODEL_JSON.exists()
+        and (personal_gate or {}).get("status") in {"ok", "attention"},
+        f"{fmt_size(PERSONAL_MODEL_MD)}, {(personal_gate or {}).get('status', 'missing')}",
+    )
     relationship_data = read_json(RELATIONSHIP_JSON, {})
     relationship_summary = relationship_data.get("summary") if isinstance(relationship_data, dict) else {}
     if not isinstance(relationship_summary, dict):
@@ -563,6 +575,7 @@ def command_health(args) -> int:
     add_state("飞书蒸馏", "last_feishu_distill")
     add_state("长期画像", "last_profile")
     add_state("Nuwa 画像", "last_profile_nuwa")
+    add_state("Personal Model", "last_personal_model")
     add_state("人物索引", "last_people_index")
     add_state("关联证据", "last_relationship_index")
     add_state("质量报告", "last_quality")
@@ -578,6 +591,8 @@ def command_health(args) -> int:
     add_file("Profile Attribution Audit", PROFILE_ATTRIBUTION_AUDIT_JSON)
     add_file("Nuwa Profile JSON", PROFILE_NUWA_JSON)
     add_file("Nuwa Profile MD", PROFILE_NUWA_MD)
+    add_file("Personal Model JSON", PERSONAL_MODEL_JSON)
+    add_file("Personal Model MD", PERSONAL_MODEL_MD)
     # 2026-06-14：Product Goal / Digest / 主看板 / 时间线 已停用，改为校验判断力卡片盒
     add_file("判断力卡片盒", CARDS_COMPACT_MD, min_size=64)
     add_file("Agent Entry MD", AGENT_ENTRY_MD, min_size=1024)
@@ -836,6 +851,12 @@ def command_context(args) -> int:
     print(f"- Last collect: {local_time(state.get('last_collect'))}")
     print(f"- Total records: {state.get('total_records', 'unknown')}")
     print()
+    if PERSONAL_MODEL_MD.exists():
+        print("Personal model excerpt:")
+        text = redact(PERSONAL_MODEL_MD.read_text(encoding="utf-8", errors="ignore"))
+        for line in text.splitlines()[: getattr(args, "personal_model_lines", 48)]:
+            print(line)
+        print()
     if PROFILE_NUWA_MD.exists():
         print("Nuwa thinking profile excerpt:")
         text = redact(PROFILE_NUWA_MD.read_text(encoding="utf-8", errors="ignore"))
@@ -1197,6 +1218,7 @@ def command_train(args) -> int:
             "profile-attribution-audit": "last_profile_attribution_audit",
             "profile": "last_profile",
             "profile-nuwa": "last_profile_nuwa",
+            "personal-model": "last_personal_model",
             "people": "last_people_index",
             "relationships": "last_relationship_index",
             "quality": "last_quality",
@@ -1262,6 +1284,7 @@ def command_train(args) -> int:
         [
             ("profile", [sys.executable, str(SKILL_DIR / "profile.py")], False),
             ("profile-nuwa", [sys.executable, str(SKILL_DIR / "profile_nuwa.py")], False),
+            ("personal-model", [sys.executable, str(SKILL_DIR / "personal_model.py"), "build"], False),
             ("people", [sys.executable, str(SKILL_DIR / "people_index.py")], False),
             ("relationships", [sys.executable, str(SKILL_DIR / "relationship_index.py")], False),
             ("quality", [sys.executable, str(SKILL_DIR / "quality_report.py")], False),
@@ -1295,7 +1318,7 @@ def command_train(args) -> int:
             mark_state(name)
             refresh_total_records()
             continue
-        if result.returncode == 2 and name in {"profile-nuwa", "role-distill", "task-compile", "quality", "product"}:
+        if result.returncode == 2 and name in {"profile-nuwa", "personal-model", "role-distill", "task-compile", "quality", "product"}:
             mark_state(name)
             refresh_total_records()
             attention.append(name)
@@ -1383,6 +1406,14 @@ def command_profile_nuwa(args) -> int:
     return code
 
 
+def command_personal_model(args) -> int:
+    code = run_script("personal_model.py", args.personal_model_args)
+    command = args.personal_model_args[0] if args.personal_model_args else "build"
+    if code in {0, 2} and command != "status":
+        write_state_key("last_personal_model", datetime.now(timezone.utc).isoformat())
+    return code
+
+
 def command_role_distill(args) -> int:
     code = run_script("role_distill.py", args.role_distill_args)
     if code in {0, 2}:
@@ -1425,7 +1456,10 @@ def _sanitize_profile_review_args(args: list[str]) -> list[str]:
 
 
 def command_agent_entry(_args) -> int:
-    return run_script("agent_bridge.py", ["entry"])
+    code = run_script("agent_bridge.py", ["entry"])
+    if code == 0:
+        write_state_key("last_agent_entry", datetime.now(timezone.utc).isoformat())
+    return code
 
 
 def command_agent_context(args) -> int:
@@ -1879,6 +1913,20 @@ def build_parser() -> argparse.ArgumentParser:
     distill_profile.add_argument("profile_nuwa_args", nargs=argparse.REMAINDER)
     distill_profile.set_defaults(func=command_profile_nuwa)
 
+    personal_model = sub.add_parser(
+        "personal-model",
+        help="Compile a bounded, auditable task-local model from reviewed derived layers",
+    )
+    personal_model.add_argument("personal_model_args", nargs=argparse.REMAINDER)
+    personal_model.set_defaults(func=command_personal_model)
+
+    personal_skill = sub.add_parser(
+        "personal-skill",
+        help="Alias for personal-model; does not install a persistent Skill",
+    )
+    personal_skill.add_argument("personal_model_args", nargs=argparse.REMAINDER)
+    personal_skill.set_defaults(func=command_personal_model)
+
     role_distill = sub.add_parser(
         "role-distill",
         help="Explicitly promote a high-frequency workflow into a persistent scenario role package",
@@ -2013,6 +2061,7 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--since", default="2026-03-01")
     context.add_argument("--with-recall", action="store_true", help="Also run full recall search; slower on large vaults")
     context.add_argument("--profile-lines", type=int, default=120)
+    context.add_argument("--personal-model-lines", type=int, default=48)
     context.add_argument("--nuwa-lines", type=int, default=80)
     context.add_argument("--digest-lines", type=int, default=80)
     context.add_argument("--people-lines", type=int, default=80)
@@ -2065,6 +2114,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("profile_auto_review.py", argv[1:])
     if argv and argv[0] in {"profile-nuwa", "distill-profile"}:
         return command_profile_nuwa(argparse.Namespace(profile_nuwa_args=argv[1:]))
+    if argv and argv[0] in {"personal-model", "personal-skill"}:
+        return command_personal_model(argparse.Namespace(personal_model_args=argv[1:]))
     if argv and argv[0] in {"role-distill", "agent-build"}:
         return command_role_distill(argparse.Namespace(role_distill_args=argv[1:]))
     if argv and argv[0] in {"task-compile", "agent-session"}:

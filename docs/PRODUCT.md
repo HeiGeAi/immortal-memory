@@ -28,7 +28,10 @@ distills them, and exposes a controlled context bridge to any agent.
 4. Role compilation
    Build scenario agents such as writing reviewer, business advisor, project operator, or meeting analyst from distilled memory.
 
-5. User control
+5. Auditable Personal Model
+   Compile reviewed, evidence-bounded judgment patterns into a task-local work model. Let the owner add or revoke corrections without mutating raw memory.
+
+6. User control
    Keep data local by default. Make collection scopes, identity aliases, account guards, exports, and deletion explicit.
 
 ## Product Boundaries

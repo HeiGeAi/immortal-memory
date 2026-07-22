@@ -11,7 +11,8 @@ The priority order is:
 
 1. Preserve traces so important AI conversations, files, documents, and outputs are not lost.
 2. Clean and distill those traces into a searchable long-term memory vault.
-3. Compile scenario-specific digital agents from the user's own memory when needed.
+3. Compile an auditable Personal Model from reviewed derived layers when task context needs stable judgment rules.
+4. Compile scenario-specific digital agents from the user's own memory when needed.
 
 The live data vault is `~/.immortal/`. The skill folder contains tools and
 workflows only; it should not contain private user data.
@@ -71,6 +72,8 @@ python3 ~/.codex/skills/immortal/immortal.py agent-factory  # compatibility alia
 python3 ~/.codex/skills/immortal/immortal.py goal
 python3 ~/.codex/skills/immortal/immortal.py recall "topic"
 python3 ~/.codex/skills/immortal/immortal.py context "task"
+python3 ~/.codex/skills/immortal/immortal.py personal-model build
+python3 ~/.codex/skills/immortal/immortal.py personal-model status
 python3 ~/.codex/skills/immortal/immortal.py task-compile "target task" --mode auto
 python3 ~/.codex/skills/immortal/immortal.py role-distill "stable repeated workflow" --mode auto --install-skill
 python3 ~/.codex/skills/immortal/immortal.py backup-status

@@ -9,6 +9,7 @@ Source Connectors
   -> Clean Layer
   -> Distilled Memory
   -> Profile / People / Evidence
+  -> Personal Model
   -> Agent Context Bridge
   -> Codex / Claude Code / Generic Agents
 ```
@@ -51,7 +52,16 @@ identity, work context, writing style, relationships, and decision models.
 People and relationship indexes are supporting evidence. They should help
 agents avoid confusing the user with colleagues or counterparties.
 
-## 5. Agent Context Bridge
+## 5. Personal Model
+
+The Personal Model is a derived task-time layer, not a replacement identity.
+It reads reviewed profile output and accepted decision models only. It keeps
+quality checks, source-count summaries, explicit boundaries, and an append-only
+correction ledger. A correction can be revoked through a new event; it never
+rewrites raw memory or profile facts. Local UI metadata is body-free by default
+and a full model needs deliberate local confirmation.
+
+## 6. Agent Context Bridge
 
 Agents should not read the raw vault directly.
 
@@ -61,7 +71,7 @@ The bridge exposes:
 - `immortal-memory agent-context "<task>" --print`: task-local context pack.
 - `immortal-memory recall "<topic>"`: evidence lookup.
 
-## 6. Adapters
+## 7. Adapters
 
 Adapters are intentionally thin:
 
