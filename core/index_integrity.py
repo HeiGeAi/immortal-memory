@@ -11,7 +11,7 @@ import stat as stat_module
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Set, Tuple
 
 from index_locks import (
     database_lock_path,
@@ -59,6 +59,9 @@ class SourceChangedError(IndexIntegrityError):
     """The source changed while a consistency-sensitive scan was running."""
 
 
+TimestampResolver = Callable[[Dict[str, Any]], str]
+
+
 def normalize_timestamp_utc(value: object) -> str:
     """Return a fixed-width UTC key while requiring an aware ISO timestamp."""
     raw = str(value or "").strip()
@@ -69,6 +72,23 @@ def normalize_timestamp_utc(value: object) -> str:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise IndexIntegrityError("record timestamp must include a timezone")
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _timestamp_utc_for_record(
+    row: Dict[str, Any],
+    timestamp_resolver: Optional[TimestampResolver],
+) -> str:
+    """Normalize a record timestamp, resolving only explicitly authorized wall time."""
+    raw_timestamp = str(row.get("timestamp") or "")
+    try:
+        parsed = datetime.fromisoformat(raw_timestamp.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return normalize_timestamp_utc(raw_timestamp)
+    if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+        return normalize_timestamp_utc(raw_timestamp)
+    if timestamp_resolver is None:
+        return normalize_timestamp_utc(raw_timestamp)
+    return normalize_timestamp_utc(timestamp_resolver(dict(row)))
 
 
 def _normalized_source_path(path: Path) -> Path:
@@ -363,12 +383,13 @@ def _insert_record(
     source_offset: int,
     source_length: int,
     line_number: int,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> None:
     content = row.get("content", "") or ""
     content_text = str(content)
     content_sha256 = hashlib.sha256(content_text.encode("utf-8")).hexdigest()
     raw_timestamp = str(row.get("timestamp") or "")
-    timestamp_utc = normalize_timestamp_utc(raw_timestamp)
+    timestamp_utc = _timestamp_utc_for_record(row, timestamp_resolver)
     cur = con.execute(
         "INSERT INTO docs("
         "rec_id,ts,ts_utc,source,role,project,content,"
@@ -412,6 +433,7 @@ def _load_source(
     start_offset: int = 0,
     start_line_number: int = 0,
     known_ids: Optional[Set[str]] = None,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Tuple[int, int, Set[str]]:
     ids = set(known_ids or ())
     added = 0
@@ -441,6 +463,7 @@ def _load_source(
                 source_offset=source_offset,
                 source_length=len(raw),
                 line_number=line_number,
+                timestamp_resolver=timestamp_resolver,
             )
             added += 1
         processed_offset = handle.tell()
@@ -489,6 +512,8 @@ def _database_snapshot(
 def _scan_jsonl_once(
     source: Path,
     connection: Optional[sqlite3.Connection] = None,
+    *,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Tuple[Set[str], Dict[str, object]]:
     source = Path(source)
     path_before = _safe_source_stat(source)
@@ -527,6 +552,7 @@ def _scan_jsonl_once(
                         source_offset=source_offset,
                         source_length=len(raw),
                         line_number=line_number,
+                        timestamp_resolver=timestamp_resolver,
                     )
         except IndexIntegrityError as exc:
             if _stat_signature(_safe_source_stat(source)) != _stat_signature(
@@ -772,13 +798,22 @@ def _cleanup_staging(staging: Path) -> None:
 def _build_staging_once(
     source: Path,
     staging: Path,
+    *,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Tuple[Dict[str, object], Dict[str, object]]:
     with sqlite3.connect(str(staging), timeout=30) as con:
         con.execute("PRAGMA journal_mode=DELETE")
         con.execute("PRAGMA synchronous=FULL")
         _ensure_schema(con)
         con.execute("BEGIN IMMEDIATE")
-        ids, revision = _scan_jsonl_once(source, connection=con)
+        if timestamp_resolver is None:
+            ids, revision = _scan_jsonl_once(source, connection=con)
+        else:
+            ids, revision = _scan_jsonl_once(
+                source,
+                connection=con,
+                timestamp_resolver=timestamp_resolver,
+            )
         _write_metadata(con, revision, ids)
         con.commit()
     result = verify_id_parity(staging, ids)
@@ -791,6 +826,8 @@ def _build_and_replace_staging(
     staging: Path,
     database: Path,
     max_attempts: int = SOURCE_STABILITY_ATTEMPTS,
+    *,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Dict[str, object]:
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
@@ -800,7 +837,14 @@ def _build_and_replace_staging(
     for _attempt in range(max_attempts):
         _cleanup_staging(staging)
         try:
-            result, scanned_revision = _build_staging_once(source, staging)
+            if timestamp_resolver is None:
+                result, scanned_revision = _build_staging_once(source, staging)
+            else:
+                result, scanned_revision = _build_staging_once(
+                    source,
+                    staging,
+                    timestamp_resolver=timestamp_resolver,
+                )
         except SourceChangedError:
             _cleanup_staging(staging)
             continue
@@ -885,19 +929,31 @@ def _incremental_sync(
     expected_revision: Dict[str, object],
     state: Dict[str, object],
     existing_ids: Set[str],
+    *,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Dict:
     with sqlite3.connect(str(database), timeout=30) as con:
         con.execute("PRAGMA busy_timeout=30000")
         con.execute("BEGIN IMMEDIATE")
         last_size = int(state["last_size"])
         last_line = int(state["last_line"])
-        added, processed_offset, ids = _load_source(
-            con,
-            source,
-            start_offset=last_size,
-            start_line_number=last_line,
-            known_ids=existing_ids,
-        )
+        if timestamp_resolver is None:
+            added, processed_offset, ids = _load_source(
+                con,
+                source,
+                start_offset=last_size,
+                start_line_number=last_line,
+                known_ids=existing_ids,
+            )
+        else:
+            added, processed_offset, ids = _load_source(
+                con,
+                source,
+                start_offset=last_size,
+                start_line_number=last_line,
+                known_ids=existing_ids,
+                timestamp_resolver=timestamp_resolver,
+            )
         docs_count = int(con.execute("SELECT count(*) FROM docs").fetchone()[0])
         unique_count = int(
             con.execute("SELECT count(DISTINCT rec_id) FROM docs").fetchone()[0]
@@ -1179,6 +1235,7 @@ def reconcile_index(
     report_only: bool = False,
     staging_path: Optional[Path] = None,
     force_rebuild: bool = False,
+    timestamp_resolver: Optional[TimestampResolver] = None,
 ) -> Dict:
     """Reconcile ``database`` against the authoritative JSONL ``source``."""
     source = Path(source)
@@ -1232,14 +1289,25 @@ def reconcile_index(
                             database_ids,
                         )
                     if append_candidate and reason is None:
-                        incremental = _incremental_sync(
-                            source,
-                            database,
-                            source_ids,
-                            revision,
-                            state,
-                            database_ids,
-                        )
+                        if timestamp_resolver is None:
+                            incremental = _incremental_sync(
+                                source,
+                                database,
+                                source_ids,
+                                revision,
+                                state,
+                                database_ids,
+                            )
+                        else:
+                            incremental = _incremental_sync(
+                                source,
+                                database,
+                                source_ids,
+                                revision,
+                                state,
+                                database_ids,
+                                timestamp_resolver=timestamp_resolver,
+                            )
                     else:
                         if reason is None:
                             reason = "id_set_mismatch"
@@ -1252,7 +1320,15 @@ def reconcile_index(
                         return incremental
                     reason = retry_reason
 
-            parity = _build_and_replace_staging(source, staging, database)
+            if timestamp_resolver is None:
+                parity = _build_and_replace_staging(source, staging, database)
+            else:
+                parity = _build_and_replace_staging(
+                    source,
+                    staging,
+                    database,
+                    timestamp_resolver=timestamp_resolver,
+                )
             return {
                 "mode": "full_rebuild",
                 "action": "rebuilt",

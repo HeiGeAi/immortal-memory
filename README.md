@@ -143,7 +143,7 @@ files have been secret-scanned.
 
 如果旧 `index.jsonl` 含无时区时间戳，`stage-v11-index` 会隔离无法证明时区的记录并拒绝生产切换。只有来源可信、权限为 `0600`、内容哈希匹配的 Hermes 时区合同才能通过 `--timezone-contract /absolute/path/to/contract.json` 提供证据。不要为了让门禁变绿而猜时区。
 
-这一步产生的 `index.staging.jsonl` 还不是已发布的 schema-v3 索引，不能紧接着把 staging 当成生产。正式切换必须走生产发布流程：从已合并 `main` 构建唯一 wheel，在隔离 vault 发布 staging source 并重建 schema-v3 SQLite，运行 `prewarm_index_verification`，再以 `v11_production_switch_gate` 绑定迁移报告、已发布 source、数据库 generation 和 receipt。只有 `production_switch_allowed=true` 才能运行模型阶段并安装同一 wheel 到真实环境；之后还要核对原始哈希、真实 API、浏览器、外置备份和 v1.0 回滚包。仓库目前故意没有提供绕过这些门禁的一键覆盖命令。
+这一步产生的 `index.staging.jsonl` 只用于审计和隔离报告，不能当成事实源或直接发布。`v11-migrate` 会从未改写的原始 `index.jsonl` 重建 schema-v3 SQLite；合同只允许把已证明的 Hermes 本地墙钟时间写入派生字段 `ts_utc`，不会改写原始时间戳。正式切换必须走生产发布流程：从已合并 `main` 构建唯一 wheel，在隔离 vault 完成重建，运行 `prewarm_index_verification`，再以 `v11_production_switch_gate` 同时绑定迁移报告、原始 source 哈希、数据库 generation 和 staging receipt。只有 `production_switch_allowed=true` 才能运行模型阶段并安装同一 wheel 到真实环境；之后还要核对原始哈希、真实 API、浏览器、外置备份和 v1.0 回滚包。仓库目前故意没有提供绕过这些门禁的一键覆盖命令。
 
 v1.1 先派生、后切换，不改写 v1.0 原始文件。需要回滚时，停止 v1.1 服务，恢复 v1.0 安装包和 LaunchAgent，忽略 v1.1 新增派生目录，然后核对原始 vault 哈希并重新运行 v1.0 健康检查。
 

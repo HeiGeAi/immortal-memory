@@ -263,6 +263,59 @@ def test_v10_vault_migrates_without_source_changes(tmp_path):
     assert (vault / "model/living-self/current.md").is_file()
 
 
+def test_v11_migration_builds_strict_index_from_evidence_backed_naive_timestamp(tmp_path):
+    vault = tmp_path / "vault"
+    source = _write_index(
+        vault,
+        [
+            {
+                "id": "h1",
+                "source": "hermes-conversation",
+                "session_id": "s1",
+                "timestamp": "2026-05-07T23:25:55.530342",
+                "content": "kept",
+            },
+            {
+                "id": "aware",
+                "source": "codex",
+                "timestamp": "2026-05-07T16:00:00+00:00",
+                "content": "unchanged",
+            },
+        ],
+    )
+    contract = _contract(tmp_path / "contract.json", source, session_ids=["s1"])
+
+    migration = export_restore.run_v11_migration(
+        vault,
+        timezone_contract=contract,
+    )
+
+    assert migration["ok"] is True
+    assert (vault / "index.jsonl").read_bytes() == source
+    assert (vault / "search_index.db").is_file()
+    with sqlite3.connect(vault / "search_index.db") as connection:
+        row = connection.execute(
+            "SELECT ts,ts_utc FROM docs WHERE rec_id='h1'"
+        ).fetchone()
+    assert row == (
+        "2026-05-07T23:25:55.530342",
+        "2026-05-07T15:25:55.530342Z",
+    )
+    assert migration["index_staging"]["source_sha256"] == hashlib.sha256(
+        source
+    ).hexdigest()
+    assert migration["index_staging"]["staging_sha256"] != hashlib.sha256(
+        source
+    ).hexdigest()
+
+    prewarm = export_restore.prewarm_index_verification(vault)
+    gate = export_restore.v11_production_switch_gate(vault, migration, prewarm)
+
+    assert prewarm["ok"] is True
+    assert gate["ok"] is True
+    assert gate["production_switch_allowed"] is True
+
+
 def test_v11_migration_stops_before_model_writes_when_index_has_quarantine(tmp_path):
     vault = tmp_path / "vault"
     source = _write_index(
@@ -386,7 +439,7 @@ def test_production_switch_gate_binds_staged_source_and_exact_prewarmed_db(tmp_p
     ).hexdigest()
 
 
-def test_production_switch_gate_rejects_unbound_migration_generation(tmp_path):
+def test_production_switch_gate_rejects_tampered_staging_receipt_binding(tmp_path):
     vault = tmp_path / "vault"
     _seed_trusted_index(vault)
     staged = export_restore.stage_v11_index(vault)
@@ -396,4 +449,4 @@ def test_production_switch_gate_rejects_unbound_migration_generation(tmp_path):
     result = export_restore.v11_production_switch_gate(vault, staged, prewarm)
 
     assert result["ok"] is False
-    assert "published_source_generation_mismatch" in result["blockers"]
+    assert "migration_staging_receipt_mismatch" in result["blockers"]

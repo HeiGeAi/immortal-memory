@@ -69,7 +69,7 @@ The source and database share one source-to-database snapshot lock during valida
 
 ## Migration and rollback
 
-v1.1 follows `audit -> external backup -> isolated restore -> stage -> migrate -> prewarm -> production gate -> switch`. The migration preserves v1.0 files and writes only new derived paths. A production switch is forbidden when source identity changes, index parity fails, a timestamp lacks trusted timezone evidence, event replay fails, or the prewarm receipt is not fresh.
+v1.1 follows `audit -> external backup -> isolated restore -> stage -> migrate -> prewarm -> production gate -> switch`. The migration preserves v1.0 files and writes only new derived paths. `index.staging.jsonl` is an audit artifact, while the schema-v3 database is rebuilt from the immutable raw source; a verified timezone contract may resolve a legacy wall-time record only into derived `ts_utc`. A production switch is forbidden when source identity changes, index parity fails, a timestamp lacks trusted timezone evidence, the raw-source or staging-receipt binding fails, event replay fails, or the prewarm receipt is not fresh.
 
 Rollback stops v1.1 services, reinstalls the retained v1.0 package and LaunchAgent configuration, ignores v1.1 derived directories, verifies original vault hashes, and reruns v1.0 health, preflight, restore, and Agent Context checks. Deleting v1.1 directories is not required.
 

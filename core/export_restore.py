@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -20,7 +21,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -1017,6 +1018,38 @@ def _aware_wall_time(
     return selected.isoformat(), None
 
 
+def _timezone_contract_resolver(
+    contract: dict[str, Any],
+) -> Callable[[dict[str, Any]], str]:
+    """Resolve only the naive Hermes rows covered by one verified contract."""
+    from index_integrity import IndexIntegrityError
+
+    source_name = str(contract["source"])
+    session_ids = set(contract["session_ids"])
+    folds = contract.get("fold_by_record_id", {})
+    if not isinstance(folds, dict):
+        raise IndexIntegrityError("timezone contract fold map is invalid")
+    zone = ZoneInfo(str(contract["timezone"]))
+
+    def resolve(record: dict[str, Any]) -> str:
+        if str(record.get("source") or "") != source_name:
+            raise IndexIntegrityError("timezone contract does not cover record source")
+        if str(record.get("session_id") or "") not in session_ids:
+            raise IndexIntegrityError("timezone contract does not cover record session")
+        resolved, error = _aware_wall_time(
+            str(record.get("timestamp") or ""),
+            zone,
+            fold=folds.get(str(record.get("id") or "")),
+        )
+        if error or resolved is None:
+            raise IndexIntegrityError(
+                f"timezone contract cannot resolve record timestamp: {error or 'unknown'}"
+            )
+        return resolved
+
+    return resolve
+
+
 def _write_private_json(path: Path, value: dict[str, Any]) -> None:
     write_json_atomic(path, value)
     path.chmod(0o600)
@@ -1211,6 +1244,7 @@ def stage_v11_index(
         "source_size": source_size,
         "staging_source": str(staging),
         "staging_sha256": receipt["staging_sha256"],
+        "timezone_contract_sha256": contract_sha256,
         "quarantine_report": str(quarantine_path),
         "receipt": str(receipt_path),
         "total_records": total,
@@ -1272,7 +1306,7 @@ def run_v11_migration(
     *,
     timezone_contract: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Materialize v1.1 event layers only after the index staging gate passes."""
+    """Build v1.1 layers only after evidence-backed index reconciliation passes."""
     vault = vault_path(vault_dir).absolute()
     if vault.resolve() == IMMORTAL_DIR.resolve():
         return {
@@ -1287,6 +1321,76 @@ def run_v11_migration(
             **staged,
             "model_layers_written": False,
             "production_switch_allowed": False,
+        }
+    source = vault / "index.jsonl"
+    verified_source = _secure_file_size_and_sha256(source)
+    if (
+        verified_source is None
+        or verified_source[1] != staged.get("source_sha256")
+    ):
+        return {
+            **staged,
+            "ok": False,
+            "model_layers_written": False,
+            "production_switch_allowed": False,
+            "blockers": ["source_changed_after_staging"],
+        }
+    contract, contract_blockers, contract_sha256 = _load_timezone_contract(
+        timezone_contract,
+        source_sha256=verified_source[1],
+    )
+    if contract_blockers or contract_sha256 != staged.get("timezone_contract_sha256"):
+        return {
+            **staged,
+            "ok": False,
+            "model_layers_written": False,
+            "production_switch_allowed": False,
+            "blockers": list(
+                dict.fromkeys(
+                    [
+                        *contract_blockers,
+                        *(
+                            ["timezone_contract_changed_after_staging"]
+                            if contract_sha256
+                            != staged.get("timezone_contract_sha256")
+                            else []
+                        ),
+                    ]
+                )
+            ),
+        }
+    try:
+        from index_integrity import IndexIntegrityError, reconcile_index
+
+        index_reconciliation = reconcile_index(
+            source,
+            vault / "search_index.db",
+            force_rebuild=True,
+            timestamp_resolver=(
+                _timezone_contract_resolver(contract) if contract is not None else None
+            ),
+        )
+    except (IndexIntegrityError, OSError, sqlite3.DatabaseError):
+        return {
+            **staged,
+            "ok": False,
+            "model_layers_written": False,
+            "production_switch_allowed": False,
+            "blockers": ["strict_index_rebuild_failed"],
+            "index_reconciliation": {"ok": False},
+        }
+    source_after_reconciliation = _secure_file_size_and_sha256(source)
+    if (
+        source_after_reconciliation is None
+        or source_after_reconciliation[1] != staged.get("source_sha256")
+    ):
+        return {
+            **staged,
+            "ok": False,
+            "model_layers_written": False,
+            "production_switch_allowed": False,
+            "blockers": ["source_changed_during_index_rebuild"],
+            "index_reconciliation": index_reconciliation,
         }
     legacy_result: dict[str, Any] = {"ok": True, "created": 0, "skipped": 0}
     if (
@@ -1304,6 +1408,7 @@ def run_v11_migration(
         "blockers": ["production_prewarm_pending"],
         "model_layers_written": True,
         "index_staging": staged,
+        "index_reconciliation": index_reconciliation,
         "claims_migration": legacy_result,
         "living_self_version_id": living_self["version_id"],
     }
@@ -1443,8 +1548,29 @@ def v11_production_switch_gate(
         not staged.get("ok")
         or staged.get("quarantined") != 0
         or not isinstance(staged.get("staging_sha256"), str)
+        or not isinstance(staged.get("source_sha256"), str)
     ):
         blockers.append("migration_staging_not_ready")
+    receipt_path = vault / V11_MIGRATION_DIR / "index-staging-receipt.json"
+    supplied_receipt = Path(str(staged.get("receipt") or "")).expanduser().absolute()
+    receipt_generation = (
+        _read_private_json_generation(receipt_path, max_bytes=1024 * 1024)
+        if supplied_receipt == receipt_path.absolute()
+        else None
+    )
+    if receipt_generation is None:
+        blockers.append("migration_staging_receipt_unsafe")
+    else:
+        receipt = receipt_generation[0]
+        if (
+            receipt.get("schema_version") != 1
+            or receipt.get("source_index_sha256") != staged.get("source_sha256")
+            or receipt.get("staging_sha256") != staged.get("staging_sha256")
+            or receipt.get("quarantined") != staged.get("quarantined")
+            or receipt.get("timezone_contract_sha256")
+            != staged.get("timezone_contract_sha256")
+        ):
+            blockers.append("migration_staging_receipt_mismatch")
     if (
         not warm.get("ok")
         or full.get("mode") != "generated"
@@ -1475,7 +1601,7 @@ def v11_production_switch_gate(
             source_stat.st_ctime_ns,
         ]
         if (
-            source_verified[1] != staged.get("staging_sha256")
+            source_verified[1] != staged.get("source_sha256")
             or source_verified[1] != full.get("source_sha256")
             or source_verified[1] != fresh.get("source_sha256")
         ):

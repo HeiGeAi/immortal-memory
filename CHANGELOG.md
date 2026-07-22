@@ -5,6 +5,7 @@
 - Add versioned Claim, Living Self, Judgment, Context, and Outcome authorities.
 - Replace the monitoring-first surface with seven evidence-backed product modules.
 - Add strict index, migration, backup, restore, privacy, browser, and release gates.
+- Rebuild the isolated schema-v3 index from the immutable raw source, resolving legacy Hermes wall time only into derived `ts_utc` through a hash-bound contract and separately binding the raw source and staging receipt at the production gate.
 - Retire the unsafe live-runtime `package` workflow in favor of clean-commit release artifacts.
 - Move the legacy personal Obsidian `project` workflow behind a separately audited local extension boundary.
 
