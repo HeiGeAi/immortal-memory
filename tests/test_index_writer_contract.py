@@ -4,8 +4,8 @@ import ast
 import json
 import multiprocessing
 import os
+import re
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
 
@@ -156,25 +156,17 @@ def test_public_index_writers_delegate_to_one_durable_helper() -> None:
 
 
 def test_public_index_writers_have_no_legacy_direct_append_pattern() -> None:
-    result = subprocess.run(
-        [
-            "rg",
-            "-U",
-            "-n",
-            (
-                r"source_lock\(\s*INDEX_FILE|open\(INDEX_FILE,\s*[\"']a[\"']|"
-                r"paths\[\"index\"\]\.open\([\"']a[\"']|"
-                r"\(\s*vault\s*/\s*[\"']index\.jsonl[\"']\s*\)\.open\([\"']a[\"']"
-            ),
-            "--glob",
-            "*.py",
-            str(CORE_DIR),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
+    pattern = re.compile(
+        r"source_lock\(\s*INDEX_FILE|open\(INDEX_FILE,\s*[\"']a[\"']|"
+        r"paths\[\"index\"\]\.open\([\"']a[\"']|"
+        r"\(\s*vault\s*/\s*[\"']index\.jsonl[\"']\s*\)\.open\([\"']a[\"']"
     )
-    assert result.returncode == 1, result.stdout
+    violations = [
+        f"{path.name}:{match.start()}"
+        for path in sorted(CORE_DIR.glob("*.py"))
+        if (match := pattern.search(path.read_text(encoding="utf-8")))
+    ]
+    assert violations == []
 
 
 def test_core_has_no_ast_visible_direct_authoritative_index_append() -> None:
