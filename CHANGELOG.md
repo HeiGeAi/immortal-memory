@@ -6,6 +6,8 @@
 - Keep `immortal-memory agent-factory` as a compatibility alias during v1.1.
 - Limit `immortal-memory dashboard-export` to an explicit non-live legacy static snapshot.
 - Reject non-loopback binding to protect the private vault from accidental exposure.
+- Show a truthful v1.1 upgrade gate for legacy or unverified indexes: preserve real system evidence, block model reads and v2 writes, and never mislabel existing memory as an empty archive.
+- Make a vault that was empty at `init` build its trusted SQLite derived index during first training, while excluding every pre-existing vault from automatic reindexing.
 
 ## 1.1.1
 

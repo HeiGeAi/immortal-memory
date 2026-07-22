@@ -49,6 +49,7 @@ SAFE_UNAVAILABLE_CODES = {
     "cursor_key_unavailable",
     "index_unavailable",
     "judgment_unavailable",
+    "migration_required",
     "model_unavailable",
     "outcome_unavailable",
     "self_model_unavailable",

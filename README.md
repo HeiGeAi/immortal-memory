@@ -120,7 +120,11 @@ immortal-memory dashboard --open
 
 `immortal-memory agent-factory` 是 v1.1 的兼容别名。只有明确需要 legacy static HTML snapshot 时才使用 `immortal-memory dashboard-export`。该文件不是实时看板，不能证明当前健康状态。
 
+全新执行 `init` 的空 vault 会留下首次启用标记，`train` 会在采集完成后自动建立受信 SQLite 派生索引，因此首次启动看板不是 `503` 或假空状态。已有 vault 不会因这条逻辑被自动重建索引，仍须走隔离恢复、升级和生产门禁。
+
 看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack；「信任」解释归因、隐私排除和纠正；「系统」展示采集、索引、备份、服务与版本健康。
+
+如果本地 vault 仍是旧索引代际，首页和「系统」仍会显示可复核的运行、来源、备份和恢复状态，但会把 v1.1 依赖的记忆、自我、判断、Context 与写操作明确标为「受信索引待建立」。它不会把现有记忆伪装成零条，也不会允许绕过隔离迁移和恢复门禁的写入。
 
 ### 从 v1.0 做隔离迁移演练
 
@@ -389,6 +393,8 @@ immortal-memory dashboard --open
 This command starts a loopback-only service and opens the real seven-module product. It uses live local APIs, so System can show current, partial, failed, and unknown evidence rather than a generated success card.
 
 `immortal-memory agent-factory` is the v1.1 compatibility alias. Use `immortal-memory dashboard-export` only when you deliberately need a legacy static HTML snapshot. That file is not the live dashboard and cannot prove current health.
+
+A vault that was empty when `init` ran receives a first-use marker. Its first `train` creates the trusted SQLite derived index before the product pipeline continues, so a fresh dashboard is usable rather than a `503` or a fabricated empty state. Existing vaults are never auto-reindexed by this path and remain behind the isolated migration and production gate.
 
 The dashboard has seven real modules: Home, Memory, Self, Judgment, Use, Trust, and System. v1.0 reading paths, health checks, Agent Bridge, and the legacy Control Center remain compatible for one release cycle. See [Architecture](./docs/ARCHITECTURE.md), [Product](./docs/PRODUCT.md), and [Privacy](./docs/PRIVACY.md) for migration, rollback, health, and privacy contracts.
 

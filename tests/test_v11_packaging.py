@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
+import re
+import signal
 import subprocess
 import sys
+import urllib.request
 import venv
 import zipfile
 from pathlib import Path
@@ -101,6 +105,52 @@ def test_clean_wheel_installs_complete_v11_cli(tmp_path):
     )
     assert initialized.returncode == 0
     assert "Immortal config initialized" in initialized.stdout
+    trained = _run([cli, "train", "--smoke"], cwd=tmp_path, env=runtime_env)
+    assert trained.returncode == 0, trained.stdout + trained.stderr
+    marker = json.loads(
+        (home / ".immortal" / "product" / "bootstrap-v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert marker["state"] == "active"
+    assert (home / ".immortal" / "search_index.db").is_file()
+
+    dashboard_env = {**runtime_env, "PYTHONUNBUFFERED": "1"}
+    dashboard = subprocess.Popen(
+        [cli, "dashboard", "--port", "0"],
+        cwd=tmp_path,
+        env=dashboard_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=(os.name == "posix"),
+    )
+    output = ""
+    try:
+        assert dashboard.stdout is not None
+        first_line = dashboard.stdout.readline().strip()
+        match = re.fullmatch(r"Immortal dashboard: (http://127\.0\.0\.1:\d+/)", first_line)
+        assert match, first_line
+        with urllib.request.urlopen(match.group(1) + "api/v2/home", timeout=10) as response:
+            home_payload = json.loads(response.read())
+        assert len(home_payload["remembered_today"]) == 1
+        assert "error" not in home_payload
+    finally:
+        if dashboard.poll() is None:
+            if os.name == "posix":
+                os.killpg(dashboard.pid, signal.SIGINT)
+            else:
+                dashboard.terminate()
+        try:
+            output, _ = dashboard.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                os.killpg(dashboard.pid, signal.SIGKILL)
+            else:
+                dashboard.kill()
+            output, _ = dashboard.communicate(timeout=30)
+    assert "Traceback" not in first_line + output
+
     commands = (
         (("claims-migrate", "--help"), 0, "usage:"),
         (("cards", "stats"), 0, '"total": 0'),

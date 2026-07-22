@@ -180,6 +180,21 @@ function cloudRecoveryCard(cloud = {}) {
   return card;
 }
 
+function productCompatibilityCard(compatibility = {}) {
+  if (compatibility.status !== "migration_required") return null;
+  const card = document.createElement("section");
+  card.className = "state-panel";
+  card.dataset.status = "attention";
+  card.append(
+    node("p", "SAFE UPGRADE GATE · 安全升级门禁", "kicker"),
+    node("h2", "产品读模型升级门禁"),
+    node("p", compatibility.status_label || "受信索引待建立", "coverage-warning"),
+    node("p", compatibility.detail || "产品读模型暂不读取未经核验的旧索引。", "state-message"),
+    node("p", `下一步：${compatibility.next_step || "先完成恢复演练和隔离升级核对。"}`, "state-message"),
+  );
+  return card;
+}
+
 function feedbackEvidenceValue(evidence = "", key) {
   const prefix = `${key}=`;
   const part = String(evidence)
@@ -450,6 +465,8 @@ export async function renderSystem(root, { signal, isCurrent, navigate, updateHe
     evidenceHeading.className = "view-heading";
     evidenceHeading.append(node("p", "VERIFIABLE EVIDENCE · 可复核依据", "kicker"), node("h2", "五类依据彼此独立"));
     fragment.append(evidenceHeading);
+    const compatibilityCard = productCompatibilityCard(data.product_compatibility || {});
+    if (compatibilityCard) fragment.append(compatibilityCard);
     fragment.append(automationFeedbackCard(data.health?.feedback || {}));
     fragment.append(cloudRecoveryCard(data.backups?.cloud_recovery || {}));
     const grid = document.createElement("div");

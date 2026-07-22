@@ -219,6 +219,41 @@ def test_real_product_data_rejects_repeated_query_before_index_access(tmp_path):
     assert payload["error"]["code"] == "invalid_query"
 
 
+def test_migration_required_vault_keeps_system_and_home_readable_but_blocks_v2_writes(
+    tmp_path, monkeypatch
+):
+    server, base = start_v2_server(tmp_path)
+
+    def migration_required(*_args, **_kwargs):
+        raise ProductDataError(
+            "migration_required",
+            "private legacy catalog detail must not escape",
+        )
+
+    del server.product_data
+    monkeypatch.setattr(profile_review, "ProductData", migration_required)
+    try:
+        home_status, _, home = get_json(base + "/api/v2/home")
+        system_status, _, system = get_json(base + "/api/v2/system")
+        write_status, _, write = post_json(
+            base,
+            "/api/v2/self/items/self_1/actions",
+            {"action": "confirm", "expected_version": 1},
+        )
+    finally:
+        stop(server)
+
+    assert home_status == 200
+    assert home["migration"]["status"] == "migration_required"
+    assert system_status == 200
+    assert system["product_compatibility"]["status"] == "migration_required"
+    assert write_status == 503
+    assert write["error"]["code"] == "migration_required"
+    assert "private" not in json.dumps(home)
+    assert "private" not in json.dumps(system)
+    assert server.product_mutations.calls == []
+
+
 def test_v2_post_uses_strict_metadata_and_real_mutation_router(tmp_path):
     server, base = start_v2_server(tmp_path)
     try:

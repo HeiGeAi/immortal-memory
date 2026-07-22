@@ -45,6 +45,7 @@ from export_restore import (
     migration_backup_gate,
     restore_check,
 )
+from event_store import EventPathError, safe_atomic_write_text, safe_read_text
 from index_writer import append_jsonl_records
 from judgment_store import InvalidJudgmentOperation, JudgmentStore
 from maintenance_gate import writer_access
@@ -79,6 +80,8 @@ DIGEST_MD = IMMORTAL_DIR / "digests" / "latest.md"
 CARDS_COMPACT_MD = IMMORTAL_DIR / "cards" / "cards_compact.md"
 PRODUCT_GOAL_JSON = IMMORTAL_DIR / "product" / "goal.json"
 PRODUCT_GOAL_MD = IMMORTAL_DIR / "product" / "goal.md"
+PRODUCT_BOOTSTRAP_RELATIVE = Path("product") / "bootstrap-v1.json"
+PRODUCT_BOOTSTRAP_SCHEMA_VERSION = 1
 DASHBOARD_HTML = IMMORTAL_DIR / "dashboard.html"
 TIMELINE_HTML = IMMORTAL_DIR / "timeline.html"
 FEISHU_CLEAN_COVERAGE = IMMORTAL_DIR / "feishu" / "clean" / "coverage.json"
@@ -218,6 +221,93 @@ def run_script(script: str, args: list[str] | None = None) -> int:
     if args:
         cmd.extend(args)
     return subprocess.call(cmd)
+
+
+def _canonical_system_alias_path(path: Path) -> Path:
+    """Normalize macOS system aliases without following arbitrary symlinks."""
+    absolute = Path(os.path.abspath(str(path.expanduser())))
+    for alias_text in ("/var", "/tmp", "/etc"):
+        alias = Path(alias_text)
+        try:
+            if alias.is_symlink() and (absolute == alias or alias in absolute.parents):
+                return alias.resolve(strict=True) / absolute.relative_to(alias)
+        except (OSError, ValueError):
+            continue
+    return absolute
+
+
+def _product_bootstrap_path(vault: Path) -> Path:
+    return _canonical_system_alias_path(vault) / PRODUCT_BOOTSTRAP_RELATIVE
+
+
+def _is_pristine_product_vault(vault: Path) -> bool:
+    """Allow automatic index creation only for a vault empty before `init`."""
+    try:
+        if not os.path.lexists(str(vault)):
+            return True
+        if vault.is_symlink() or not vault.is_dir():
+            return False
+        return not any(vault.iterdir())
+    except OSError:
+        return False
+
+
+def _write_product_bootstrap(vault: Path, state: str) -> None:
+    if state not in {"pending", "active"}:
+        raise ValueError("unsupported product bootstrap state")
+    safe_atomic_write_text(
+        _product_bootstrap_path(vault),
+        json.dumps(
+            {
+                "kind": "first_use",
+                "schema_version": PRODUCT_BOOTSTRAP_SCHEMA_VERSION,
+                "state": state,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+    )
+
+
+def _product_bootstrap_state(vault: Path) -> str:
+    try:
+        raw = safe_read_text(_product_bootstrap_path(vault))
+    except (EventPathError, OSError):
+        return ""
+    if raw is None:
+        return ""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(value, dict):
+        return ""
+    if (
+        value.get("kind") != "first_use"
+        or value.get("schema_version") != PRODUCT_BOOTSTRAP_SCHEMA_VERSION
+        or value.get("state") not in {"pending", "active"}
+    ):
+        return ""
+    return str(value["state"])
+
+
+def _sync_bootstrapped_product_index(vault: Path) -> dict | None:
+    """Build a trusted derived index only for a vault created by this release."""
+    source = vault / "index.jsonl"
+    database = vault / "search_index.db"
+    if not source.is_file() or source.is_symlink():
+        return None
+    try:
+        from index_integrity import reconcile_index
+
+        with writer_access(vault):
+            result = reconcile_index(source, database)
+        _write_product_bootstrap(vault, "active")
+        return result
+    except (OSError, RuntimeError, TimeoutError, ValueError, sqlite3.Error):
+        return None
 
 
 def command_run(_args=None) -> int:
@@ -1216,8 +1306,9 @@ def command_init(args) -> int:
     if not changed and not CONFIG_FILE.exists():
         changed = True
 
-    path = save_config(config)
     vault = configured_vault_dir(config)
+    first_use_product_bootstrap = _is_pristine_product_vault(vault)
+    path = save_config(config)
     for rel in [
         "daily",
         "summaries",
@@ -1238,6 +1329,8 @@ def command_init(args) -> int:
     sources = vault / "sources.json"
     if not sources.exists():
         sources.write_text(json.dumps({"sources": []}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if first_use_product_bootstrap:
+        _write_product_bootstrap(vault, "pending")
 
     print("Immortal config initialized")
     print()
@@ -1248,6 +1341,8 @@ def command_init(args) -> int:
     print(f"Aliases: {', '.join(aliases) if aliases else 'missing'}")
     guards = feishu_guard_args(config)
     print(f"Feishu guard: {'configured' if guards else 'not configured'}")
+    if first_use_product_bootstrap:
+        print("Product bootstrap: trusted index will be created during first training")
     print()
     print("Next:")
     print(f"  {cli_command('train', '--smoke')}")
@@ -1260,6 +1355,7 @@ def command_train(args) -> int:
     vault = configured_vault_dir(config)
     vault.mkdir(parents=True, exist_ok=True)
     state = read_json(STATE_FILE, {})
+    bootstrap_product_index = _product_bootstrap_state(vault) in {"pending", "active"}
 
     def mark_state(name: str) -> None:
         mapping = {
@@ -1277,6 +1373,7 @@ def command_train(args) -> int:
             "quality": "last_quality",
             "digest": "last_digest",
             "product": "last_product_brief",
+            "product-index": "last_product_index",
             "role-distill": "last_role_distill",
             "task-compile": "last_task_compile",
         }
@@ -1369,7 +1466,27 @@ def command_train(args) -> int:
     print()
     failures: list[str] = []
     attention: list[str] = []
+    product_index_synced = False
     for name, cmd, required in steps:
+        if (
+            name == "profile"
+            and bootstrap_product_index
+            and not product_index_synced
+        ):
+            print("==> product-index")
+            index_result = _sync_bootstrapped_product_index(vault)
+            if index_result is None:
+                failures.append("product-index")
+                break
+            mark_state("product-index")
+            refresh_total_records()
+            product_index_synced = True
+            print(
+                "Trusted product index: "
+                + str(index_result.get("mode") or "ready")
+                + " · added="
+                + str(int(index_result.get("added") or 0))
+            )
         print(f"==> {name}")
         result = subprocess.run(cmd, text=True, cwd=str(SKILL_DIR))
         if result.returncode == 0:

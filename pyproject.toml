@@ -18,7 +18,12 @@ Repository = "https://github.com/HeiGeAi/immortal-memory"
 immortal-memory = "immortal_memory.cli:main"
 
 [tool.setuptools]
-packages = ["immortal_memory"]
+packages = [
+  "immortal_memory",
+  "immortal_memory.agents",
+  "immortal_memory.product_assets",
+  "immortal_memory.product_assets.views",
+]
 include-package-data = true
 
 [tool.setuptools.package-dir]

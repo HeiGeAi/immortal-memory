@@ -56,6 +56,28 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
       text("p", "这里不替你编造完整。它只呈现系统确实保存、能够追溯、仍在延续的部分。", "lede"),
     );
     fragment.append(hero);
+    const migration = data.migration || {};
+    const migrationRequired = migration.status === "migration_required";
+    if (migrationRequired) {
+      const gate = document.createElement("section");
+      gate.className = "state-panel";
+      gate.dataset.status = "attention";
+      gate.append(
+        text("p", "SAFE UPGRADE GATE · 安全升级门禁", "kicker"),
+        text("h2", migration.status_label || "受信索引待建立"),
+        text("p", migration.detail || "为保护来源可追溯性，产品不会把旧索引伪装成空记忆库。", "coverage-warning"),
+        text("p", `下一步：${migration.next_step || "先完成恢复演练和隔离升级核对。"}`, "state-message"),
+      );
+      const gateActions = document.createElement("div");
+      gateActions.className = "honest-actions";
+      const gateSystem = document.createElement("button");
+      gateSystem.type = "button";
+      gateSystem.textContent = "查看系统依据";
+      gateSystem.addEventListener("click", () => navigate("system"));
+      gateActions.append(gateSystem);
+      gate.append(gateActions);
+      fragment.append(gate);
+    }
     const facts = document.createElement("section");
     facts.className = "fact-grid";
     facts.setAttribute("aria-label", "当前档案摘要");
@@ -73,11 +95,11 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
       card.append(text("span", label, "fact-label"), text("strong", value, "fact-value"), text("small", note, "fact-note"));
       facts.append(card);
     };
-    fact("今日记忆", String(remembered.length), newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录");
-    fact("理解变化", String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)), `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`);
-    fact("待确认", String(confirmations.length), confirmations[0]?.summary || "没有待确认项目");
-    fact("最近 Context", context.context_id ? "已使用" : "无", context.task || context.goal || context.context_id || "暂无已使用 Context");
-    fact("最近 Outcome", outcome.outcome_id ? "已记录" : "无", outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果");
+    fact("今日记忆", migrationRequired ? "未读取" : String(remembered.length), migrationRequired ? "等待 v1.1 受信索引建立" : (newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录"));
+    fact("理解变化", migrationRequired ? "未读取" : String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)), migrationRequired ? "升级前不推断变化数量" : `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`);
+    fact("待确认", migrationRequired ? "未读取" : String(confirmations.length), migrationRequired ? "升级前不推断待确认项目" : (confirmations[0]?.summary || "没有待确认项目"));
+    fact("最近 Context", migrationRequired ? "未读取" : (context.context_id ? "已使用" : "无"), migrationRequired ? "升级前不推断 Context 使用记录" : (context.task || context.goal || context.context_id || "暂无已使用 Context"));
+    fact("最近 Outcome", migrationRequired ? "未读取" : (outcome.outcome_id ? "已记录" : "无"), migrationRequired ? "升级前不推断任务结果" : (outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果"));
     fact("系统连续性", health.status_label || health.status || "未知", `版本 ${health.version || "未知"} · 关注项 ${health.attention_count ?? "未知"}`);
     fragment.append(facts);
     const claimConfirmations = confirmations.filter((item) => item.kind === "claim");
@@ -104,8 +126,12 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     actions.className = "honest-actions";
     const memoryButton = document.createElement("button");
     memoryButton.type = "button";
-    memoryButton.textContent = "进入记忆档案";
-    memoryButton.addEventListener("click", () => navigate("memories"));
+    memoryButton.textContent = migrationRequired ? "受信索引建立后可查看记忆" : "进入记忆档案";
+    if (migrationRequired) {
+      memoryButton.disabled = true;
+    } else {
+      memoryButton.addEventListener("click", () => navigate("memories"));
+    }
     const systemButton = document.createElement("button");
     systemButton.type = "button";
     systemButton.className = "secondary";

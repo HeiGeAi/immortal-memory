@@ -9,8 +9,14 @@ from pathlib import Path
 import pytest
 from zoneinfo import ZoneInfo
 
+from evidence_catalog import EvidenceCatalogError
 from index_integrity import INDEX_SCHEMA_VERSION, ids_sha256
-from product_data import ProductData, ProductDataError, ProductIndexIntegrity
+from product_data import (
+    MigrationRequiredProductData,
+    ProductData,
+    ProductDataError,
+    ProductIndexIntegrity,
+)
 
 
 def test_product_data_module_exposes_stable_error_contract(tmp_path):
@@ -755,6 +761,55 @@ def test_system_delegates_to_existing_authoritative_probes(tmp_path):
     assert center.calls == 1
     assert result["health"]["status"] == "healthy"
     assert result["diagnostics"]["version"] == "1.1.0"
+    assert result["product_compatibility"]["status"] == "ready"
+
+
+def test_migration_required_product_data_keeps_system_truthful_and_blocks_v2_models():
+    control = FakeControlData()
+    center = FakeControlCenter()
+    data = MigrationRequiredProductData(
+        control_data=control,
+        control_center=center,
+    )
+
+    home = data.home()
+    system = data.system()
+
+    assert home["migration"]["status"] == "migration_required"
+    assert home["remembered_today"] == []
+    assert home["system_health"]["status"] == "healthy"
+    assert system["product_compatibility"]["status"] == "migration_required"
+    memories_capability = next(
+        item for item in system["capabilities"]["modules"] if item["id"] == "memories"
+    )
+    assert memories_capability == {
+        "id": "memories",
+        "available": False,
+        "reason": "v1.1 受信索引尚未建立",
+    }
+    assert control.calls == [
+        "capabilities",
+        "sources",
+        "backups",
+        "diagnostics",
+    ]
+    with pytest.raises(ProductDataError) as raised:
+        data.memories({"limit": ["20"]})
+    assert raised.value.code == "migration_required"
+
+
+def test_product_data_does_not_disguise_unsafe_catalog_failures_as_migration(
+    tmp_path, monkeypatch
+):
+    class UnsafeOutcomeStore:
+        def __init__(self, *_args, **_kwargs):
+            raise EvidenceCatalogError("unsafe_path", "private filesystem detail")
+
+    monkeypatch.setattr("product_data.OutcomeStore", UnsafeOutcomeStore)
+    with pytest.raises(ProductDataError) as raised:
+        ProductData(tmp_path)
+    assert raised.value.code == "index_unavailable"
+    assert "private" not in str(raised.value)
 
 
 def test_product_data_source_has_no_offset_or_jsonl_scan_fallback():

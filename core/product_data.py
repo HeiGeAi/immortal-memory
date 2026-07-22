@@ -20,6 +20,7 @@ from context_compiler import ContextCompiler
 from context_store import ContextStore
 from control_center import ControlCenter
 from control_data import ControlData
+from evidence_catalog import EvidenceCatalogError
 from event_store import (
     EventPathError,
     _exclusive_lock,
@@ -225,6 +226,153 @@ def _safe_product_tree(value: Any, depth: int = 0) -> Any:
             result[key] = _safe_product_tree(item, depth + 1)
         return result
     return None
+
+
+MIGRATION_REQUIRED_MESSAGE = (
+    "当前记忆库尚未具备可验证的 v1.1 索引；为保护来源可追溯性，相关读写功能保持关闭。"
+)
+
+
+class MigrationRequiredProductData:
+    """Truthful v2 read surface while a legacy vault awaits verified upgrade.
+
+    A dashboard must never invent an empty memory archive merely because its
+    legacy index cannot satisfy v1.1's evidence contract.  This adapter keeps
+    independently verifiable operational evidence available, exposes the gate
+    explicitly, and refuses all model-dependent reads and writes.
+    """
+
+    def __init__(
+        self,
+        *,
+        control_data: ControlData,
+        control_center: ControlCenter,
+    ) -> None:
+        self.control_data = control_data
+        self.control_center = control_center
+
+    @staticmethod
+    def compatibility() -> Dict[str, Any]:
+        return {
+            "status": "migration_required",
+            "status_label": "受信索引待建立",
+            "reason_code": "verified_index_required",
+            "detail": "当前库仍在旧索引代际，不能把未核验的数据当作 v1.1 产品记忆。",
+            "next_step": "先完成外部加密恢复演练，再在隔离环境执行升级、索引预热和生产门禁核对。",
+        }
+
+    @staticmethod
+    def require_migration() -> None:
+        raise ProductDataError("migration_required", MIGRATION_REQUIRED_MESSAGE)
+
+    def _snapshot(self) -> Dict[str, Any]:
+        try:
+            value = self.control_center.build_snapshot()
+        except Exception as exc:
+            raise ProductDataError(
+                "system_unavailable", "系统健康信息当前不可用"
+            ) from exc
+        if not isinstance(value, Mapping):
+            raise ProductDataError("system_unavailable", "系统健康信息当前不可用")
+        return dict(value)
+
+    def _capabilities(self) -> Dict[str, Any]:
+        value = self.control_data.capabilities()
+        if not isinstance(value, Mapping):
+            raise ProductDataError("system_unavailable", "系统能力信息当前不可用")
+        result = dict(value)
+        modules = value.get("modules")
+        if not isinstance(modules, list):
+            return result
+        normalized = []
+        for module in modules:
+            if not isinstance(module, Mapping):
+                continue
+            item = dict(module)
+            if item.get("id") == "memories":
+                item["available"] = False
+                item["reason"] = "v1.1 受信索引尚未建立"
+            normalized.append(item)
+        result["modules"] = normalized
+        return result
+
+    def home(self) -> Dict[str, Any]:
+        snapshot = self._snapshot()
+        return _safe_product_tree(
+            {
+                "remembered_today": [],
+                "understanding_changes": {
+                    "kind": "migration_required",
+                    "from_version_id": None,
+                    "to_version_id": None,
+                    "counts": {"added": 0, "changed": 0, "removed": 0},
+                    "added": [],
+                    "changed": [],
+                    "removed": [],
+                },
+                "needs_confirmation": [],
+                "latest_context_use": None,
+                "latest_outcome": None,
+                "system_health": {
+                    "status": str(snapshot.get("status") or "unknown"),
+                    "status_label": _compact_text(snapshot.get("status_label"), 80),
+                    "version": _compact_text(snapshot.get("version"), 40),
+                    "attention_count": len(snapshot.get("attention") or []),
+                },
+                "migration": self.compatibility(),
+            }
+        )
+
+    def system(self) -> Dict[str, Any]:
+        try:
+            value = {
+                "health": self._snapshot(),
+                "capabilities": self._capabilities(),
+                "sources": self.control_data.sources(),
+                "backups": self.control_data.backups(),
+                "diagnostics": self.control_data.diagnostics(),
+                "product_compatibility": self.compatibility(),
+            }
+        except ProductDataError:
+            raise
+        except Exception as exc:
+            raise ProductDataError(
+                "system_unavailable", "系统信息当前不可用"
+            ) from exc
+        return _safe_product_tree(value)
+
+    def memories(self, _query: Mapping[str, Sequence[str]]) -> Dict[str, Any]:
+        self.require_migration()
+
+    def memory_detail(self, _memory_id: str) -> Dict[str, Any]:
+        self.require_migration()
+
+    def self_model(self) -> Dict[str, Any]:
+        self.require_migration()
+
+    def self_item(self, _item_id: str) -> Dict[str, Any]:
+        self.require_migration()
+
+    def self_versions(self, _query: Mapping[str, Sequence[str]]) -> Dict[str, Any]:
+        self.require_migration()
+
+    def self_diff(self, _from_version_id: str, _to_version_id: str) -> Dict[str, Any]:
+        self.require_migration()
+
+    def judgments(self, _query: Mapping[str, Sequence[str]]) -> Dict[str, Any]:
+        self.require_migration()
+
+    def judgment_detail(self, _card_id: str) -> Dict[str, Any]:
+        self.require_migration()
+
+    def contexts(self, _query: Mapping[str, Sequence[str]]) -> Dict[str, Any]:
+        self.require_migration()
+
+    def context_detail(self, _context_id: str) -> Dict[str, Any]:
+        self.require_migration()
+
+    def trust(self) -> Dict[str, Any]:
+        self.require_migration()
 
 
 class ProductIndexIntegrity:
@@ -531,10 +679,19 @@ class ProductData:
         self.judgment_store = judgment_store or JudgmentStore(self.vault_dir)
         self.context_store = context_store or ContextStore(self.vault_dir)
         self._context_compiler = context_compiler
-        self.outcome_store = outcome_store or OutcomeStore(
-            self.vault_dir,
-            context_store=self.context_store,
-        )
+        try:
+            self.outcome_store = outcome_store or OutcomeStore(
+                self.vault_dir,
+                context_store=self.context_store,
+            )
+        except EvidenceCatalogError as exc:
+            if exc.code == "database_untrusted":
+                raise ProductDataError(
+                    "migration_required", MIGRATION_REQUIRED_MESSAGE
+                ) from exc
+            raise ProductDataError(
+                "index_unavailable", "记忆索引当前不可用"
+            ) from exc
         self.index_integrity = index_integrity or ProductIndexIntegrity(
             self.vault_dir
         )
@@ -1751,6 +1908,13 @@ class ProductData:
                 "sources": self.control_data.sources(),
                 "backups": self.control_data.backups(),
                 "diagnostics": self.control_data.diagnostics(),
+                "product_compatibility": {
+                    "status": "ready",
+                    "status_label": "实时读模型可用",
+                    "reason_code": "",
+                    "detail": "v1.1 受信索引和产品读模型已经就绪。",
+                    "next_step": "",
+                },
             }
         except ProductDataError:
             raise

@@ -31,6 +31,10 @@ The local dashboard uses seven stable, deep-linkable modules:
 
 The canonical entrypoint is `immortal-memory dashboard`. It starts a loopback HTTP service bound only to `127.0.0.1` and renders current `/api/v2` evidence. `immortal-memory agent-factory` is a compatibility alias during v1.1. `immortal-memory dashboard-export` creates only an explicit legacy static HTML snapshot; it is never health proof or the current product surface.
 
+When a vault still has an unverified legacy index, the live product enters an explicit upgrade-gate mode. Home and System retain independently verifiable operational evidence, while v1.1 model-dependent reads and all v2 writes return `migration_required`. The interface must say `受信索引待建立`, never render legacy data as an empty v1.1 archive or silently permit a model mutation.
+
+For a vault that was empty before `init`, the CLI writes a first-use marker. Its subsequent `train` builds the current trusted SQLite derived index after collection and before product derivation. The marker is deliberately absent for a pre-existing vault, so this convenience path cannot silently rebuild a user's legacy index or bypass the migration and recovery gate.
+
 The Living Self inside the Self module has eight sections: identity and commitments, values, expression DNA, mental models, decision heuristics, anti-patterns, tensions, and honest boundaries. These eight sections must not be confused with the seven dashboard modules.
 
 ## Authoritative layers

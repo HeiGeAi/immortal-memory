@@ -42,7 +42,7 @@ from control_http import (
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
 from process_utils import run_process
 from pipeline_capabilities import missing_pipeline_stages
-from product_data import ProductData
+from product_data import MigrationRequiredProductData, ProductData, ProductDataError
 from product_http import (
     ProductHttpError,
     error_body,
@@ -1970,16 +1970,30 @@ class ReviewHandler(BaseHTTPRequestHandler):
         return value
 
     @property
-    def product_data(self) -> ProductData:
+    def product_data(self) -> Any:
         value = getattr(self.server, "product_data", None)
         if value is None:
-            value = ProductData(
-                self.control_center.immortal_dir,
-                control_data=self.control_data,
-                control_center=self.control_center,
-            )
+            try:
+                value = ProductData(
+                    self.control_center.immortal_dir,
+                    control_data=self.control_data,
+                    control_center=self.control_center,
+                )
+            except ProductDataError as exc:
+                if exc.code != "migration_required":
+                    raise
+                value = MigrationRequiredProductData(
+                    control_data=self.control_data,
+                    control_center=self.control_center,
+                )
             self.server.product_data = value  # type: ignore[attr-defined]
         return value
+
+    def product_mutations_for_v2(self) -> ProductMutationCoordinator:
+        product_data = self.product_data
+        if isinstance(product_data, MigrationRequiredProductData):
+            product_data.require_migration()
+        return self.product_mutations
 
     @property
     def product_mutations(self) -> ProductMutationCoordinator:
@@ -2314,7 +2328,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     self.path,
                     body,
                     metadata,
-                    lambda: self.product_mutations,
+                    self.product_mutations_for_v2,
                 )
                 self.send_json(payload, status=status)
                 return

@@ -209,6 +209,17 @@ def test_home_ui_can_confirm_or_reject_candidate_claims():
     assert "createMutationAttempt" in home
 
 
+def test_product_ui_surfaces_the_upgrade_gate_instead_of_a_fake_empty_vault():
+    home = (ASSETS / "views" / "home.js").read_text(encoding="utf-8")
+    system = (ASSETS / "views" / "system.js").read_text(encoding="utf-8")
+    assert "migration_required" in home
+    assert "受信索引待建立" in home
+    assert "migrationRequired" in home
+    assert "未读取" in home
+    assert "productCompatibilityCard" in system
+    assert "产品读模型升级门禁" in system
+
+
 def test_judgment_and_trust_are_real_and_coverage_honest():
     judgments = (ASSETS / "views" / "judgments.js").read_text(encoding="utf-8")
     trust = (ASSETS / "views" / "trust.js").read_text(encoding="utf-8")
