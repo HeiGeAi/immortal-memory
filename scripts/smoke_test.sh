@@ -80,8 +80,8 @@ assert {item["id"] for item in capabilities["modules"]} == {
     "overview", "runs", "sources", "memories", "profile", "agent", "backup", "diagnostics"
 }
 page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
-assert 'data-view="overview"' in page
-assert 'data-view="diagnostics"' in page
+assert 'data-view="home"' in page
+assert 'data-view="system"' in page
 PY
 kill "$CONTROL_PID" 2>/dev/null || true
 wait "$CONTROL_PID" 2>/dev/null || true
