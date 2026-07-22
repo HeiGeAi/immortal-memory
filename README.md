@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.1.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.1.1-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -197,6 +197,7 @@ immortal-memory migration-preflight \
 
 ```bash
 immortal-memory daily-status
+immortal-memory feedback --print
 immortal-memory backup-status --verify --max-age-hours 168 --json
 immortal-memory health --max-age-hours 72
 immortal-memory doctor
@@ -204,12 +205,14 @@ immortal-memory preflight
 immortal-memory agent-context "release acceptance" --print
 ```
 
+系统看板会把主流程、自动反馈和本机通知分开显示。`run` 成功不等于整条自动化成功：飞书来源部分失败或通知未送达时，反馈卡和调度器都会明确标为需要关注。
+
 全新安装应在隔离的 `HOME` 中从 wheel 安装，执行 `init`、`train --smoke`、上述健康命令和一次 `agent-context`，确认没有借用旧机器的 vault 或配置。v1.0 的读取、健康检查、Agent Bridge 和旧 Control Center 在 v1.1 中保留一个版本周期；新目录是派生层，v1.0 可以安全忽略。
 
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.0-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.1-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke

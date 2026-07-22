@@ -192,6 +192,10 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
             "recently_updated": recent_people,
         },
         "attention": [str(item) for item in attention[:8]],
+        "notification": {
+            "requested": False,
+            "status": "skipped",
+        },
         "paths": {
             "quality_json": str(vault / "quality" / "latest.json"),
             "feishu_state": str(vault / "feishu" / "state.json"),
@@ -207,6 +211,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     quality = report["quality"]
     errors = report["errors"]
     people = report["people"]
+    notification = report.get("notification") if isinstance(report.get("notification"), dict) else {}
+    notification_status = str(notification.get("status") or "unknown")
+    notification_label = {
+        "sent": "已送达",
+        "skipped": "未请求",
+        "failed": "未送达",
+    }.get(notification_status, "状态未知")
     lines = [
         "# 永生记忆库运行反馈",
         "",
@@ -226,6 +237,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- 飞书最近采集：{local_time(feishu.get('last_collect'))}（{feishu.get('last_status') or 'unknown'}；源级错误 {int(feishu.get('source_errors') or 0)} 个）",
         f"- 飞书 Clean：{local_time(feishu.get('last_clean'))}",
         f"- 飞书 Distill：{local_time(feishu.get('last_distill'))}",
+        f"- 本机通知：{notification_label}",
         "",
         "## 质量关注",
     ]
@@ -278,7 +290,7 @@ def send_notification(report: dict[str, Any]) -> tuple[bool, str]:
     if report["status"] == "failed":
         title = "永生记忆库运行异常"
         message = f"自动任务未完全成功；质量 {quality['score']}/100，问题 {quality['issue_count']} 个。"
-    elif report["status"] == "attention":
+    elif report["status"] in {"attention", "partial"}:
         title = "永生记忆库已更新：需要关注"
         message = f"新增 {summary['new_records']:,} 条，飞书 {summary['feishu_new_records']:,} 条，质量 {quality['score']}/100。"
     else:
@@ -305,6 +317,13 @@ def main() -> int:
     config = load_config()
     vault = Path(args.vault_dir).expanduser() if args.vault_dir else configured_vault_dir(config)
     report = build_report(vault, run_status=args.run_status)
+    notification = {"requested": bool(args.notify), "status": "skipped"}
+    notification_failed = False
+    if args.notify:
+        ok, _detail = send_notification(report)
+        notification["status"] = "sent" if ok else "failed"
+        notification_failed = not ok
+    report["notification"] = notification
     markdown = render_markdown(report)
 
     feedback_dir = vault / "feedback"
@@ -317,18 +336,11 @@ def main() -> int:
     latest_md.write_text(markdown, encoding="utf-8")
     history_md.write_text(markdown, encoding="utf-8")
 
-    notification_status = "skipped"
-    notification_failed = False
-    if args.notify:
-        ok, detail = send_notification(report)
-        notification_status = detail if ok else f"failed: {detail}"
-        notification_failed = not ok
-
     print("Immortal feedback report")
     print(f"Status: {report['status_label']}")
     print(f"Summary: new={report['summary']['new_records']} feishu_new={report['summary']['feishu_new_records']} total={report['summary']['total_records']} quality={report['quality']['score']} issues={report['quality']['issue_count']}")
     print(f"Report: {latest_md}")
-    print(f"Notification: {notification_status}")
+    print(f"Notification: {notification['status']}")
     if args.print:
         print()
         print(markdown)
