@@ -226,6 +226,48 @@ def test_agent_factory_forwards_explicit_vault_to_dashboard(tmp_path, monkeypatc
     }
 
 
+def test_dashboard_forwards_live_server_args_without_static_snapshot(tmp_path, monkeypatch, capsys):
+    vault = tmp_path / "isolated-vault"
+    captured = {}
+
+    def fake_run_script(script, args=None):
+        captured["script"] = script
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(immortal, "run_script", fake_run_script)
+    args = immortal.build_parser().parse_args(
+        ["dashboard", "--vault-dir", str(vault), "--port", "0", "--open"]
+    )
+
+    assert args.func(args) == 0
+    assert captured == {
+        "script": "profile_review.py",
+        "args": ["--host", "127.0.0.1", "--port", "0", "--vault-dir", str(vault), "--open"],
+    }
+    assert "dashboard.html" not in capsys.readouterr().out
+
+
+def test_dashboard_export_refreshes_and_labels_the_legacy_snapshot(tmp_path, monkeypatch, capsys):
+    captured = {}
+
+    def fake_run_script(script, args=None):
+        captured["script"] = script
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(immortal, "IMMORTAL_DIR", tmp_path / "vault")
+    monkeypatch.setattr(immortal, "run_script", fake_run_script)
+    args = immortal.build_parser().parse_args(["dashboard-export"])
+
+    assert args.func(args) == 0
+    assert captured == {"script": "dashboard.py", "args": None}
+    output = capsys.readouterr().out
+    assert "Legacy dashboard snapshot" in output
+    assert "not live" in output
+    assert str(tmp_path / "vault" / "dashboard.html") in output
+
+
 def test_v1_overview_reuses_truth_snapshot(tmp_path):
     server, base = start_server(tmp_path)
     try:

@@ -945,11 +945,24 @@ def command_context(args) -> int:
     return 0
 
 
-def command_dashboard(_args) -> int:
-    path = IMMORTAL_DIR / "dashboard.html"
-    if not path.exists():
-        run_script("dashboard.py")
-    print(path)
+def dashboard_server_args(args: argparse.Namespace) -> list[str]:
+    server_args = ["--host", args.host, "--port", str(args.port)]
+    if args.vault_dir:
+        server_args.extend(["--vault-dir", args.vault_dir])
+    if args.open:
+        server_args.append("--open")
+    return server_args
+
+
+def command_dashboard(args) -> int:
+    return run_script("profile_review.py", dashboard_server_args(args))
+
+
+def command_dashboard_export(_args) -> int:
+    code = run_script("dashboard.py")
+    if code != 0:
+        return code
+    print(f"Legacy dashboard snapshot (not live): {IMMORTAL_DIR / 'dashboard.html'}")
     return 0
 
 
@@ -1499,13 +1512,7 @@ def command_profile_review(args) -> int:
 
 
 def command_agent_factory(args) -> int:
-    server_args = ["--host", args.host, "--port", str(args.port)]
-    if args.vault_dir:
-        server_args.extend(["--vault-dir", args.vault_dir])
-    if args.open:
-        server_args.append("--open")
-    print(f"Task context compiler: http://{args.host}:{args.port}/agent-factory")
-    return run_script("profile_review.py", server_args)
+    return run_script("profile_review.py", dashboard_server_args(args))
 
 
 def command_agent_entry(_args) -> int:
@@ -2039,7 +2046,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("cleanup", help="Run cleanup").set_defaults(func=lambda args: run_script("cleanup.py"))
     sub.add_parser("cron", help="Check cron health").set_defaults(func=lambda args: run_script("cron_check.py"))
     sub.add_parser("soul", help="Print digital soul").set_defaults(func=lambda args: run_script("soul.py"))
-    sub.add_parser("dashboard", help="Print dashboard path, generating it if needed").set_defaults(func=command_dashboard)
+    dashboard = sub.add_parser(
+        "dashboard",
+        help="Start local dashboard server on loopback for the live product",
+    )
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--vault-dir", default="", help="Override dashboard vault for isolated verification")
+    dashboard.add_argument("--open", action="store_true", help="Open live dashboard URL after startup")
+    dashboard.set_defaults(func=command_dashboard)
+    dashboard_export = sub.add_parser(
+        "dashboard-export",
+        help="Regenerate and print legacy static dashboard snapshot path (not live)",
+    )
+    dashboard_export.set_defaults(func=command_dashboard_export)
     sub.add_parser("daily-install", help="Install or refresh the local daily LaunchAgent automation").set_defaults(func=command_daily_install)
     sub.add_parser("daily-status", help="Show local daily LaunchAgent automation status").set_defaults(func=command_daily_status)
     sub.add_parser("daily-uninstall", help="Remove the configured local daily LaunchAgent automation").set_defaults(func=command_daily_uninstall)
