@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1
+
+- Mark a loaded daily LaunchAgent as requiring attention when its most recent exit code is nonzero, and expose the code as bounded scheduler evidence instead of showing a false healthy state.
+- Preserve and display the distinct statuses of the main run, feedback report, and desktop notification so partial source failures or failed notifications cannot be presented as a fully healthy automation.
+
 ## 1.1.0
 
 - Add versioned Claim, Living Self, Judgment, Context, and Outcome authorities.

@@ -23,6 +23,11 @@ const VALUES = {
   verified: "已经核验",
   unknown: "暂时未知",
   unavailable: "当前不可用",
+  partial: "部分成功",
+  attention: "需要关注",
+  failed: "运行失败",
+  sent: "已送达",
+  skipped: "未请求",
 };
 
 const JOB_KINDS = {
@@ -67,6 +72,21 @@ const CLOUD_RECOVERY_BINDING = {
   matched: "与当前记忆一致",
   mismatch: "当前记忆已变化",
   missing: "尚未建立",
+};
+
+const AUTOMATION_PIPELINE_STATUS = {
+  ok: "正常",
+  partial: "部分成功",
+  attention: "需要关注",
+  failed: "运行失败",
+  unknown: "证据不足",
+};
+
+const NOTIFICATION_STATUS = {
+  sent: "已送达",
+  skipped: "未请求",
+  failed: "未送达",
+  unknown: "不可核验",
 };
 
 function node(tag, value = "", className = "") {
@@ -156,6 +176,40 @@ function cloudRecoveryCard(cloud = {}) {
     node("p", reason || "恢复点已通过远端下载和真实恢复演练核验。", "state-message"),
     details,
     node("p", `下一步：${cloud.action || "读取最新证据"}`, "state-message"),
+  );
+  return card;
+}
+
+function feedbackEvidenceValue(evidence = "", key) {
+  const prefix = `${key}=`;
+  const part = String(evidence)
+    .split(";")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(prefix));
+  return part ? part.slice(prefix.length) : "unknown";
+}
+
+function automationFeedbackCard(feedback = {}) {
+  const card = document.createElement("section");
+  const status = feedback.status || "unknown";
+  const pipeline = feedbackEvidenceValue(feedback.evidence, "pipeline");
+  const notification = feedbackEvidenceValue(feedback.evidence, "notification");
+  const runStatus = feedbackEvidenceValue(feedback.evidence, "run_status");
+  card.className = "state-panel automation-feedback-card";
+  card.dataset.status = status;
+  const details = document.createElement("dl");
+  details.className = "detail-list";
+  appendFact(details, "自动化反馈", VALUES[status] || status);
+  appendFact(details, "最近报告", feedback.observed_at ? formatTimestamp(feedback.observed_at) : "尚未生成");
+  appendFact(details, "主流程结果", AUTOMATION_PIPELINE_STATUS[pipeline] || "证据不足");
+  appendFact(details, "主流程退出码", runStatus === "unknown" ? "未记录" : runStatus);
+  appendFact(details, "通知投递", NOTIFICATION_STATUS[notification] || "不可核验");
+  card.append(
+    node("p", "AUTOMATION FEEDBACK · 自动化反馈", "kicker"),
+    node("h2", "最后一次自动化结果"),
+    node("p", feedback.detail || "尚未生成可复核的自动化反馈。", status === "healthy" ? "state-message" : "coverage-warning"),
+    details,
+    node("p", "采集、反馈和通知各自保留状态，不会把主流程成功误作整条自动化成功。", "state-message"),
   );
   return card;
 }
@@ -396,6 +450,7 @@ export async function renderSystem(root, { signal, isCurrent, navigate, updateHe
     evidenceHeading.className = "view-heading";
     evidenceHeading.append(node("p", "VERIFIABLE EVIDENCE · 可复核依据", "kicker"), node("h2", "五类依据彼此独立"));
     fragment.append(evidenceHeading);
+    fragment.append(automationFeedbackCard(data.health?.feedback || {}));
     fragment.append(cloudRecoveryCard(data.backups?.cloud_recovery || {}));
     const grid = document.createElement("div");
     grid.className = "system-grid";

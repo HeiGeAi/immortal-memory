@@ -144,6 +144,13 @@ def test_system_ui_shows_cloud_recovery_evidence_without_upload_action():
     assert "feishu-recovery upload" not in page
 
 
+def test_system_ui_shows_automation_feedback_as_a_separate_evidence_card():
+    page = (ASSETS / "views" / "system.js").read_text(encoding="utf-8")
+    for label in ("自动化反馈", "主流程退出码", "通知投递", "不会把主流程成功误作整条自动化成功"):
+        assert label in page
+    assert "automationFeedbackCard" in page
+
+
 def test_self_ui_exposes_evidence_versions_and_real_correction():
     self_js = (ASSETS / "views" / "self.js").read_text(encoding="utf-8")
     api_js = (ASSETS / "api.js").read_text(encoding="utf-8")

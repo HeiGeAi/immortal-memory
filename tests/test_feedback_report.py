@@ -105,10 +105,38 @@ class MainExitCodeTest(unittest.TestCase):
             with mock.patch.object(feedback_report, "send_notification", return_value=(False, "osascript missing")):
                 self.assertEqual(self._main(vault, ["--notify"]), 1)
 
+    def test_feedback_persists_bounded_notification_delivery_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = make_vault(tmp)
+            with mock.patch.object(feedback_report, "send_notification", return_value=(False, "osascript missing")):
+                self.assertEqual(self._main(vault, ["--notify"]), 1)
+
+            latest = json.loads((vault / "feedback" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                latest["notification"],
+                {"requested": True, "status": "failed"},
+            )
+
     def test_feedback_success_returns_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             vault = make_vault(tmp)
             self.assertEqual(self._main(vault, []), 0)
+
+    def test_partial_feedback_notification_is_marked_for_attention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = make_vault(tmp, feishu_errors=[{"source": "feishu-im", "message": "denied"}])
+            report = feedback_report.build_report(vault, run_status=0)
+            captured = []
+
+            def fake_run(args, **_kwargs):
+                captured.append(args)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(feedback_report.subprocess, "run", side_effect=fake_run):
+                sent, _detail = feedback_report.send_notification(report)
+
+            self.assertTrue(sent)
+            self.assertIn("需要关注", captured[0][-1])
 
 
 if __name__ == "__main__":

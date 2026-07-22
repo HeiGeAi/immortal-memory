@@ -972,7 +972,10 @@ def write_daily_backup_script(config: dict) -> Path:
                 "FEEDBACK_STATUS=$?",
                 'echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] === finished status=$STATUS feedback_status=$FEEDBACK_STATUS ===" >> "$LOG"',
                 'echo "" >> "$LOG"',
-                'exit "$STATUS"',
+                'if [ "$STATUS" -ne 0 ]; then',
+                '  exit "$STATUS"',
+                "fi",
+                'exit "$FEEDBACK_STATUS"',
                 "",
             ]
         ),
