@@ -5,9 +5,13 @@ import sqlite3
 import threading
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 import pytest
 
+import export_restore
+import immortal
+import profile_review
 from control_center import ControlCenter
 from control_data import ControlData
 from profile_review import FactoryStore, ReviewHandler, ReviewStore, ThreadingHTTPServer
@@ -84,6 +88,144 @@ def test_readyz_returns_503_when_vault_is_missing(tmp_path):
     assert payload["checks"]["vault_readable"] is False
 
 
+def test_backups_exposes_redacted_cloud_recovery_state(tmp_path, monkeypatch):
+    data = ControlData(tmp_path, skill_dir=tmp_path)
+    monkeypatch.setattr(
+        export_restore,
+        "get_feishu_recovery_backup_status",
+        lambda _vault: {
+            "ok": True,
+            "storage_location": "external_cloud",
+            "provider": "feishu_drive",
+            "generated_at": "2026-07-22T00:00:00Z",
+            "verification": {
+                "mode": "remote-download-sha256+decrypt-restore",
+                "ok": True,
+            },
+            "recovery_drill": {"ok": True, "mode": "decrypt-restore"},
+            "source_binding": {"ok": True},
+            "warnings": [],
+        },
+    )
+
+    cloud = data.backups()["cloud_recovery"]
+
+    assert cloud == {
+        "status": "verified",
+        "provider": "Feishu Drive",
+        "last_verified_at": "2026-07-22T00:00:00Z",
+        "verification": "remote-download-sha256+decrypt-restore",
+        "source_binding": "matched",
+        "reason_code": "",
+        "action": "无需操作",
+    }
+    encoded = json.dumps(cloud, ensure_ascii=False)
+    assert "folder_token" not in encoded
+    assert "path" not in encoded
+
+
+def test_backups_marks_pending_drill_without_exposing_remote_receipt(tmp_path, monkeypatch):
+    data = ControlData(tmp_path, skill_dir=tmp_path)
+    monkeypatch.setattr(
+        export_restore,
+        "get_feishu_recovery_backup_status",
+        lambda _vault: {
+            "ok": False,
+            "storage_location": "external_cloud",
+            "provider": "feishu_drive",
+            "generated_at": "2026-07-22T00:00:00Z",
+            "verification": {
+                "mode": "remote-download-sha256+decrypt-restore",
+                "ok": False,
+            },
+            "recovery_drill": {"ok": False, "mode": "decrypt-restore"},
+            "source_binding": {"ok": False},
+            "warnings": ["cloud_recovery_drill_pending"],
+        },
+    )
+
+    cloud = data.backups()["cloud_recovery"]
+
+    assert cloud["status"] == "attention"
+    assert cloud["reason_code"] == "cloud_recovery_drill_pending"
+    assert cloud["action"] == "在终端执行恢复演练"
+
+
+def test_dashboard_server_scopes_default_paths_to_requested_vault(tmp_path):
+    vault = tmp_path / "isolated-vault"
+    vault.mkdir()
+    (vault / "runtime").mkdir()
+    (vault / "index.jsonl").write_text(
+        '{"id":"m1","timestamp":"2026-07-22T00:00:00Z","content":"safe"}\n',
+        encoding="utf-8",
+    )
+    args = profile_review.build_parser().parse_args(
+        ["--vault-dir", str(vault), "--port", "0"]
+    )
+
+    server = profile_review.create_server(args)
+    try:
+        assert server.control_center.immortal_dir == vault
+        assert server.control_data.immortal_dir == vault
+        assert server.factory.immortal_dir == vault
+        assert server.store.proposal == vault / "feishu/distilled/profile_merge_proposal.md"
+        assert server.store.memories == vault / "feishu/distilled/profile_memories.jsonl"
+        assert server.store.reviewed == vault / "reviewed/profile_memories.jsonl"
+        assert server.store.review_state == vault / "reviewed/profile_review_state.json"
+        assert server.factory.allow_commands is False
+        assert server.control_data.capabilities()["actions"] == []
+        assert server.factory.snapshot()["commands"] == {}
+        with pytest.raises(profile_review.JobConflict, match="隔离 vault"):
+            server.factory.start_job("health", {})
+        scheduler = server.control_center.build_snapshot()["scheduler"]
+        assert scheduler["status"] == "unknown"
+        assert scheduler["source"] == "isolated_vault"
+    finally:
+        server.server_close()
+
+
+def test_factory_snapshot_reads_its_configured_vault(tmp_path, monkeypatch):
+    vault = tmp_path / "isolated-vault"
+    vault.mkdir()
+    (vault / "index.jsonl").write_text(
+        '{"id":"m1","timestamp":"2026-07-22T00:00:00Z","content":"safe"}\n',
+        encoding="utf-8",
+    )
+    other = tmp_path / "other-vault"
+    other.mkdir()
+    monkeypatch.setattr(profile_review, "IMMORTAL_DIR", other)
+    monkeypatch.setattr(profile_review, "DEFAULT_SESSIONS_DIR", other / "sessions")
+
+    snapshot = profile_review.FactoryStore(
+        history_path=vault / "runtime/control_jobs.json",
+        immortal_dir=vault,
+        skill_dir=tmp_path,
+    ).snapshot()
+
+    assert snapshot["layers"]["index"]["exists"] is True
+
+
+def test_agent_factory_forwards_explicit_vault_to_dashboard(tmp_path, monkeypatch):
+    vault = tmp_path / "isolated-vault"
+    captured = {}
+
+    def fake_run_script(script, args=None):
+        captured["script"] = script
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(immortal, "run_script", fake_run_script)
+    args = immortal.build_parser().parse_args(
+        ["agent-factory", "--vault-dir", str(vault), "--port", "0"]
+    )
+
+    assert immortal.command_agent_factory(args) == 0
+    assert captured == {
+        "script": "profile_review.py",
+        "args": ["--host", "127.0.0.1", "--port", "0", "--vault-dir", str(vault)],
+    }
+
+
 def test_v1_overview_reuses_truth_snapshot(tmp_path):
     server, base = start_server(tmp_path)
     try:
@@ -95,7 +237,10 @@ def test_v1_overview_reuses_truth_snapshot(tmp_path):
 
     assert legacy_status == 200
     assert v1_status == 200
+    legacy_generated_at = datetime.fromisoformat(legacy.pop("generated_at"))
+    v1_generated_at = datetime.fromisoformat(v1.pop("generated_at"))
     assert v1 == legacy
+    assert abs((v1_generated_at - legacy_generated_at).total_seconds()) <= 2
 
 
 def write_index(root, count=60):

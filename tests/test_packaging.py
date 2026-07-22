@@ -190,6 +190,17 @@ class PackagingTest(unittest.TestCase):
             self.assertNotIn("python3 install.py", restore_guide.stdout)
             self.assertNotIn("~/.codex/skills/immortal/immortal.py", restore_guide.stdout)
 
+            cards = subprocess.run(
+                [str(command), "cards", "stats"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            self.assertEqual(cards.returncode, 0, msg=cards.stderr)
+            self.assertEqual(json.loads(cards.stdout)["total"], 0)
+            self.assertNotIn("cards.py", cards.stdout + cards.stderr)
+
             product = subprocess.run(
                 [str(command), "product"],
                 env=env,

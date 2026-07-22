@@ -7,9 +7,10 @@ import json
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, Set, TextIO, Tuple
+from typing import Dict, Iterable, Optional, Set, TextIO, Tuple
 
 from file_utils import atomic_write_json, atomic_write_text
+from index_integrity import IndexIntegrityError, report_index_integrity
 from ranking_common import local_date
 
 
@@ -75,7 +76,42 @@ def _scan(paths: Iterable[Path]) -> Tuple[Dict, Set[str]]:
     return stats, ids
 
 
-def audit(daily_dir: Path, index_file: Path) -> Dict:
+def _search_index_summary(index_file: Path, database: Path) -> Dict:
+    try:
+        report = report_index_integrity(index_file, database)
+    except (IndexIntegrityError, OSError) as exc:
+        return {
+            "status": "error",
+            "check_status": "error",
+            "integrity_status": "error",
+            "database_exists": database.exists(),
+            "error": str(exc),
+        }
+    healthy = (
+        bool(report["database_exists"])
+        and report["reason"] == "in_sync"
+        and int(report["missing_in_sqlite_count"]) == 0
+        and int(report["missing_in_jsonl_count"]) == 0
+    )
+    integrity_status = "healthy" if healthy else "degraded"
+    return {
+        "status": integrity_status,
+        "check_status": "ok",
+        "integrity_status": integrity_status,
+        "database_exists": bool(report["database_exists"]),
+        "reason": report["reason"],
+        "jsonl_unique_ids": int(report["jsonl_unique_ids"]),
+        "sqlite_ids": int(report["sqlite_ids"]),
+        "missing_in_sqlite_count": int(report["missing_in_sqlite_count"]),
+        "missing_in_jsonl_count": int(report["missing_in_jsonl_count"]),
+    }
+
+
+def audit(
+    daily_dir: Path,
+    index_file: Path,
+    search_database: Optional[Path] = None,
+) -> Dict:
     daily_paths = []
     if daily_dir.exists():
         daily_paths = sorted(
@@ -87,6 +123,11 @@ def audit(daily_dir: Path, index_file: Path) -> Dict:
     index_paths = [index_file] if index_file.exists() else []
     daily_stats, daily_ids = _scan(daily_paths)
     index_stats, index_ids = _scan(index_paths)
+    database = (
+        Path(search_database)
+        if search_database is not None
+        else index_file.parent / "search_index.db"
+    )
     return {
         "generated_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "scope": {
@@ -102,6 +143,7 @@ def audit(daily_dir: Path, index_file: Path) -> Dict:
             "daily_only_ids": len(daily_ids - index_ids),
             "index_only_ids": len(index_ids - daily_ids),
         },
+        "search_index": _search_index_summary(index_file, database),
     }
 
 
@@ -109,6 +151,7 @@ def render_markdown(report: Dict) -> str:
     daily = report["daily"]
     index = report["index"]
     comparison = report["comparison"]
+    search_index = report["search_index"]
     lines = [
         "# Immortal Fact-Layer Integrity Audit",
         "",
@@ -129,11 +172,33 @@ def render_markdown(report: Dict) -> str:
         f"- Daily-only IDs: {comparison['daily_only_ids']}",
         f"- Index-only IDs: {comparison['index_only_ids']}",
         "",
-        "## Monthly coverage",
+        "## Search index read model",
         "",
-        "| Month | Daily rows | Index rows |",
-        "|---|---:|---:|",
+        f"- Check status: {search_index['check_status']}",
+        f"- Integrity status: {search_index['integrity_status']}",
+        f"- Database exists: {search_index['database_exists']}",
     ]
+    if search_index["check_status"] == "ok":
+        lines.extend(
+            [
+                f"- Reason: {search_index['reason']}",
+                f"- JSONL unique IDs: {search_index['jsonl_unique_ids']}",
+                f"- SQLite IDs: {search_index['sqlite_ids']}",
+                f"- Missing in SQLite: {search_index['missing_in_sqlite_count']}",
+                f"- Missing in JSONL: {search_index['missing_in_jsonl_count']}",
+            ]
+        )
+    else:
+        lines.append(f"- Error: {search_index['error']}")
+    lines.extend(
+        [
+            "",
+            "## Monthly coverage",
+            "",
+            "| Month | Daily rows | Index rows |",
+            "|---|---:|---:|",
+        ]
+    )
     months = sorted(set(daily["months"]) | set(index["months"]))
     for month in months:
         lines.append(
@@ -145,11 +210,17 @@ def render_markdown(report: Dict) -> str:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vault-dir", default=str(Path.home() / ".immortal"))
+    parser.add_argument("--search-database")
     parser.add_argument("--json-output")
     parser.add_argument("--markdown-output")
     args = parser.parse_args(argv)
     vault = Path(args.vault_dir).expanduser()
-    report = audit(vault / "daily", vault / "index.jsonl")
+    search_database = (
+        Path(args.search_database).expanduser()
+        if args.search_database
+        else vault / "search_index.db"
+    )
+    report = audit(vault / "daily", vault / "index.jsonl", search_database)
     if args.json_output:
         atomic_write_json(Path(args.json_output).expanduser(), report)
     if args.markdown_output:

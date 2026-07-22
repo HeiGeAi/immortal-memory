@@ -37,7 +37,18 @@ from config import (
     slug_prefix,
 )
 from command_hints import cli_command
-from export_restore import create_export, get_backup_status, restore_check
+from export_restore import (
+    create_export,
+    get_backup_status,
+    get_feishu_recovery_backup_status,
+    get_migration_backup_status,
+    migration_backup_gate,
+    restore_check,
+)
+from index_writer import append_jsonl_records
+from judgment_store import InvalidJudgmentOperation, JudgmentStore
+from maintenance_gate import writer_access
+from model_migration import MigrationError, migrate_legacy_profile
 from state_store import mutate_state_atomic, update_state_atomic
 
 
@@ -207,6 +218,54 @@ def run_script(script: str, args: list[str] | None = None) -> int:
     if args:
         cmd.extend(args)
     return subprocess.call(cmd)
+
+
+def command_run(_args=None) -> int:
+    return run_script("orchestrator.py")
+
+
+def command_cards(args) -> int:
+    try:
+        store = JudgmentStore(configured_vault_dir())
+        if args.extra is not None and args.action != "list":
+            raise InvalidJudgmentOperation(
+                "invalid_argument",
+                "only cards list accepts a limit",
+            )
+        if args.action == "build":
+            return store.cli_build()
+        if args.action == "list":
+            return store.cli_list(limit=int(args.extra or 20))
+        return store.cli_stats()
+    except Exception as exc:
+        is_input_error = isinstance(exc, (InvalidJudgmentOperation, ValueError))
+        print(
+            json.dumps(
+                {
+                    "error": getattr(
+                        exc,
+                        "code",
+                        "invalid_argument" if is_input_error else "cards_failed",
+                    ),
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2 if is_input_error else 1
+
+
+def command_cards_build(args) -> int:
+    """Pipeline capability alias for the legacy cards-build stage name."""
+    return command_cards(args)
+
+
+PIPELINE_CAPABILITIES = {
+    "run": command_run,
+    "cards-build": command_cards_build,
+}
 
 
 def iter_daily_files(days: int = 2) -> Iterable[Path]:
@@ -788,6 +847,20 @@ def _recall_json(args) -> int:
         source_prefix=source_prefix, since=args.since)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
+    if mode == "index_unavailable":
+        print(json.dumps({
+            "ok": False,
+            "engine": "unavailable",
+            "elapsed_ms": elapsed_ms,
+            "hits": [],
+            "error": {
+                "code": "index_unavailable",
+                "message": search_engine.INDEX_UNAVAILABLE_MESSAGE,
+                "retryable": True,
+            },
+        }, ensure_ascii=False))
+        return 2
+
     engine = "fusion" if mode.startswith("fusion") else "tfidf"
     hits = []
     for score, record in results:
@@ -987,6 +1060,11 @@ def command_feishu_clean(args) -> int:
 
 def command_feishu_distill(args) -> int:
     return run_script("feishu_distill.py", args.feishu_distill_args)
+
+
+def command_feishu_recovery(args) -> int:
+    """Forward only explicit recovery commands to the write-capable subsystem."""
+    return run_script("feishu_recovery.py", args.feishu_recovery_args)
 
 
 def command_feishu_mirror(args) -> int:
@@ -1206,8 +1284,13 @@ def command_train(args) -> int:
         daily_dir = vault / "daily"
         daily_dir.mkdir(parents=True, exist_ok=True)
         date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        for target in [vault / "index.jsonl", daily_dir / f"{date_key}.jsonl"]:
-            with target.open("a", encoding="utf-8") as handle:
+        with writer_access(vault):
+            append_jsonl_records(
+                vault / "index.jsonl",
+                [smoke_record],
+                maintenance_held=True,
+            )
+            with (daily_dir / f"{date_key}.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(smoke_record, ensure_ascii=False) + "\n")
         mark_state("smoke")
         refresh_total_records()
@@ -1327,6 +1410,22 @@ def command_notes_status(args) -> int:
     return run_script("obsidian_notes_sync.py", ["status", *args.notes_status_args])
 
 
+def command_notes_migrate(args) -> int:
+    vault = configured_vault_dir(load_config())
+    return run_script(
+        "notes_migration.py",
+        ["--vault-dir", str(vault), *args.notes_migrate_args],
+    )
+
+
+def command_notes_migrate_reset(args) -> int:
+    vault = configured_vault_dir(load_config())
+    forwarded = ["--vault-dir", str(vault), "--reset-scratch", "--run-id", args.run_id]
+    if args.json:
+        forwarded.append("--json")
+    return run_script("notes_migration.py", forwarded)
+
+
 def command_obsidian_sync(args) -> int:
     code = run_script("obsidian_sync.py", ["sync", *args.obsidian_args])
     if code == 0 and "--dry-run" not in args.obsidian_args:
@@ -1367,6 +1466,10 @@ def command_profile_auto_review(args) -> int:
     return run_script("profile_auto_review.py", args.profile_auto_review_args)
 
 
+def command_profile_attribution_audit(args) -> int:
+    return run_script("profile_attribution_audit.py", args.profile_attribution_audit_args)
+
+
 def command_profile_nuwa(args) -> int:
     code = run_script("profile_nuwa.py", args.profile_nuwa_args)
     if code in {0, 2}:
@@ -1394,6 +1497,8 @@ def command_profile_review(args) -> int:
 
 def command_agent_factory(args) -> int:
     server_args = ["--host", args.host, "--port", str(args.port)]
+    if args.vault_dir:
+        server_args.extend(["--vault-dir", args.vault_dir])
     if args.open:
         server_args.append("--open")
     print(f"Task context compiler: http://{args.host}:{args.port}/agent-factory")
@@ -1592,6 +1697,8 @@ def command_export(args) -> int:
         vault_dir=args.vault_dir,
         output_dir=args.output_dir,
         include_raw=bool(args.include_raw),
+        fail_on_secrets=bool(getattr(args, "fail_on_secrets", False)),
+        redact_secrets=bool(getattr(args, "redact_secrets", False)),
     )
     totals = manifest.get("totals") or {}
     write_state_key("last_portable_export", manifest.get("generated_at"))
@@ -1643,7 +1750,7 @@ def command_backup(args) -> int:
 
     class _RestoreArgs:
         export_path = export_dir
-        strict = False
+        strict = True
         json = False
 
     return command_restore_check(_RestoreArgs())
@@ -1673,6 +1780,93 @@ def command_backup_status(args) -> int:
     if warnings:
         print(f"Warnings: {', '.join(map(str, warnings[:8]))}")
     return 0 if ok else 1
+
+
+def command_migration_preflight(args) -> int:
+    """Prove backup, runtime health, and read-model parity before migration."""
+    import index_db
+    import preflight
+
+    backup_source = str(getattr(args, "backup_source", "portable") or "portable")
+    if backup_source == "feishu-cloud":
+        status = get_feishu_recovery_backup_status(IMMORTAL_DIR)
+    else:
+        status = get_migration_backup_status(IMMORTAL_DIR)
+    health_report = preflight.gather_preflight(
+        max_age_hours=float(args.max_age_hours),
+        vault_dir=IMMORTAL_DIR,
+    )
+    state = read_json(STATE_FILE, {})
+    current_errors = state.get("errors") if isinstance(state, dict) else []
+    health_ok = (
+        health_report.get("context_status") == preflight.STATUS_READY
+        and health_report.get("vault_status") == "healthy"
+        and not current_errors
+    )
+    parity_ok = bool(index_db.is_ready())
+    status["health"] = {"ok": health_ok}
+    status["index_parity"] = {"ok": parity_ok}
+    secret_scan = status.get("secret_scan")
+    raw_secret_candidates = (
+        secret_scan.get("unique_candidates")
+        if isinstance(secret_scan, dict)
+        else None
+    )
+    if type(raw_secret_candidates) is int and raw_secret_candidates >= 0:
+        secret_candidates = raw_secret_candidates
+    else:
+        secret_candidates = 1
+
+    result = migration_backup_gate(
+        status,
+        require_external=bool(args.require_external_backup),
+        max_age_hours=float(args.max_age_hours),
+    )
+    verification = status.get("verification")
+    if not isinstance(verification, dict):
+        verification = status.get("check") if isinstance(status.get("check"), dict) else {}
+    restore_evidence = status.get("restore_check")
+    if not isinstance(restore_evidence, dict):
+        restore_evidence = status.get("check") if isinstance(status.get("check"), dict) else {}
+    recovery_drill = status.get("recovery_drill")
+    source_binding = status.get("source_binding")
+    result["evidence"] = {
+        "backup_source": backup_source,
+        "generated_at": status.get("generated_at"),
+        "storage_location": status.get("storage_location"),
+        "provider": str(status.get("provider") or ""),
+        "verification_mode": str(verification.get("mode") or ""),
+        "restore_check": {
+            "ok": bool(restore_evidence.get("ok")),
+            "strict": bool(restore_evidence.get("strict")),
+        },
+        "recovery_drill": {
+            "ok": bool(recovery_drill.get("ok")) if isinstance(recovery_drill, dict) else False,
+            "mode": str(recovery_drill.get("mode") or "") if isinstance(recovery_drill, dict) else "",
+        },
+        "source_binding": {
+            "ok": bool(source_binding.get("ok")) if isinstance(source_binding, dict) else False,
+        },
+        "secret_scan": {
+            "unique_candidates": secret_candidates
+        },
+        "health": {"ok": health_ok},
+        "index_parity": {"ok": parity_ok},
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print("Immortal Migration Preflight")
+        print()
+        print(f"Status: {'OK' if result['ok'] else 'FAIL'}")
+        print(f"Storage: {result['storage_location']}")
+        print(f"Verification: {result['verification_mode'] or 'missing'}")
+        print(f"Backup age: {result['backup_age_hours']}")
+        print(f"Health: {'OK' if health_ok else 'FAIL'}")
+        print(f"Index parity: {'OK' if parity_ok else 'FAIL'}")
+        if result["blockers"]:
+            print("Blockers: " + ", ".join(result["blockers"]))
+    return 0 if result["ok"] else 1
 
 
 def command_restore_guide(args) -> int:
@@ -1733,6 +1927,46 @@ def command_restore_check(args) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_claims_migrate(args) -> int:
+    vault = Path(args.vault_dir).expanduser() if args.vault_dir else IMMORTAL_DIR
+    try:
+        report = migrate_legacy_profile(
+            vault,
+            dry_run=bool(args.dry_run),
+            checkpoint_every=args.checkpoint_every,
+        )
+    except MigrationError as exc:
+        report = {
+            "ok": False,
+            "error_code": exc.code,
+            "message": str(exc),
+            "vault_dir": str(vault),
+            "dry_run": bool(args.dry_run),
+        }
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+        else:
+            print("Immortal Claims Migration")
+            print()
+            print("Status: FAIL")
+            print("Error: " + exc.code)
+            print("Detail: " + str(exc))
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    else:
+        print("Immortal Claims Migration")
+        print()
+        print("Status: OK")
+        print("Mode: " + ("dry-run" if report["dry_run"] else "write"))
+        print("Created: " + str(report["created"]))
+        print("Skipped: " + str(report["skipped"]))
+        print("Excluded: " + str(report["excluded"]))
+        print("Source broken: " + str(report["source_broken"]))
+        print("Confirmed: 0")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="immortal", description="Codex entry for the Immortal Skill")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -1776,13 +2010,24 @@ def build_parser() -> argparse.ArgumentParser:
     health = sub.add_parser("health", help="Check whether the daily automated memory loop is current")
     health.add_argument("--max-age-hours", type=float, default=30)
     health.set_defaults(func=command_health)
-    sub.add_parser("run", help="Run capture, summary, dashboard, distill, and cleanup orchestration").set_defaults(
-        func=lambda args: run_script("orchestrator.py")
-    )
+    sub.add_parser(
+        "run",
+        help="Run capture, summary, dashboard, distill, and cleanup orchestration",
+    ).set_defaults(func=command_run)
     backup = sub.add_parser("backup", help="Create a portable export and verify it immediately (real backup; no longer an alias for run)")
     backup.add_argument("--vault-dir", default=None)
     backup.add_argument("--output-dir", default=None, help="Export target; use an external disk or synced folder for real loss protection")
     backup.add_argument("--include-raw", action="store_true")
+    backup.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact credential shapes only in the backup copy and require strict verification",
+    )
+    backup.add_argument(
+        "--fail-on-secrets",
+        action="store_true",
+        help="Abort if credential shapes remain after optional backup-copy redaction",
+    )
     backup.set_defaults(func=command_backup)
     sub.add_parser("distill", help="Regenerate digital soul").set_defaults(func=lambda args: run_script("distill.py"))
     sub.add_parser("profile", help="Build structured owner profile from distilled memories and raw evidence").set_defaults(
@@ -1800,6 +2045,16 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--vault-dir", default=None)
     export.add_argument("--output-dir", default=None)
     export.add_argument("--include-raw", action="store_true", help="Also include explicitly supported raw source folders")
+    export.add_argument(
+        "--redact-secrets",
+        action="store_true",
+        help="Redact credential shapes only in the exported index copy and write a hash-only receipt",
+    )
+    export.add_argument(
+        "--fail-on-secrets",
+        action="store_true",
+        help="Abort if credential shapes remain after optional export-copy redaction",
+    )
     export.set_defaults(func=command_export)
 
     backup_status = sub.add_parser("backup-status", help="Show latest portable export status")
@@ -1808,6 +2063,35 @@ def build_parser() -> argparse.ArgumentParser:
     backup_status.add_argument("--max-age-hours", type=float, default=168)
     backup_status.add_argument("--json", action="store_true")
     backup_status.set_defaults(func=command_backup_status)
+
+    migration_preflight = sub.add_parser(
+        "migration-preflight",
+        help="Fail-closed backup, health, and index parity gate before migration",
+    )
+    migration_preflight.add_argument("--require-external-backup", action="store_true")
+    migration_preflight.add_argument(
+        "--backup-source",
+        choices=("portable", "feishu-cloud"),
+        default="portable",
+        help="Choose a state-selected portable export or a verified Feishu recovery drill",
+    )
+    migration_preflight.add_argument("--max-age-hours", type=float, default=168)
+    migration_preflight.add_argument("--json", action="store_true")
+    migration_preflight.set_defaults(func=command_migration_preflight)
+
+    claims_migrate = sub.add_parser(
+        "claims-migrate",
+        help="Migrate legacy reviewed profile candidates into v1.1 Claims",
+    )
+    claims_migrate.add_argument("--vault-dir", default=None)
+    claims_migrate.add_argument("--dry-run", action="store_true")
+    claims_migrate.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=100,
+    )
+    claims_migrate.add_argument("--json", action="store_true")
+    claims_migrate.set_defaults(func=command_claims_migrate)
 
     restore = sub.add_parser("restore-check", help="Verify an exported backup before restore")
     restore.add_argument("export_path")
@@ -1830,6 +2114,13 @@ def build_parser() -> argparse.ArgumentParser:
     feishu_distill = sub.add_parser("feishu-distill", help="Build structured memory candidates from Feishu clean layer")
     feishu_distill.add_argument("feishu_distill_args", nargs=argparse.REMAINDER)
     feishu_distill.set_defaults(func=command_feishu_distill)
+
+    feishu_recovery = sub.add_parser(
+        "feishu-recovery",
+        help="Build, upload, verify, and restore explicitly confirmed encrypted Feishu recovery packages",
+    )
+    feishu_recovery.add_argument("feishu_recovery_args", nargs=argparse.REMAINDER)
+    feishu_recovery.set_defaults(func=command_feishu_recovery)
 
     feishu_mirror = sub.add_parser("feishu-mirror", help="Mirror visible Feishu Drive/Wiki/Docs resources read-only")
     feishu_mirror.add_argument("feishu_mirror_args", nargs=argparse.REMAINDER)
@@ -1868,6 +2159,20 @@ def build_parser() -> argparse.ArgumentParser:
     notes_status.add_argument("notes_status_args", nargs=argparse.REMAINDER)
     notes_status.set_defaults(func=command_notes_status)
 
+    notes_migrate = sub.add_parser(
+        "notes-migrate",
+        help="Explicitly migrate and reconcile legacy Obsidian note facts",
+    )
+    notes_migrate.add_argument("notes_migrate_args", nargs=argparse.REMAINDER)
+    notes_migrate.set_defaults(func=command_notes_migrate)
+    notes_migrate_reset = sub.add_parser(
+        "notes-migrate-reset",
+        help="Discard only unpublished migration scratch after an explicit run-id check",
+    )
+    notes_migrate_reset.add_argument("--run-id", required=True)
+    notes_migrate_reset.add_argument("--json", action="store_true")
+    notes_migrate_reset.set_defaults(func=command_notes_migrate_reset)
+
     obsidian_sync = sub.add_parser("obsidian-sync", help="Generate Obsidian reading-layer indexes and link health")
     obsidian_sync.add_argument("obsidian_args", nargs=argparse.REMAINDER)
     obsidian_sync.set_defaults(func=command_obsidian_sync)
@@ -1886,6 +2191,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     profile_auto_review.add_argument("profile_auto_review_args", nargs=argparse.REMAINDER)
     profile_auto_review.set_defaults(func=command_profile_auto_review)
+
+    profile_attribution_audit = sub.add_parser(
+        "profile-attribution-audit",
+        help="Audit owner attribution and optionally quarantine polluted profile memories",
+    )
+    profile_attribution_audit.add_argument(
+        "profile_attribution_audit_args",
+        nargs=argparse.REMAINDER,
+    )
+    profile_attribution_audit.set_defaults(func=command_profile_attribution_audit)
 
     profile_nuwa = sub.add_parser(
         "profile-nuwa",
@@ -1936,6 +2251,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_factory = sub.add_parser("agent-factory", help="Start the local task context compiler server")
     agent_factory.add_argument("--host", default="127.0.0.1")
     agent_factory.add_argument("--port", type=int, default=8765)
+    agent_factory.add_argument("--vault-dir", default="", help="Override the dashboard vault for isolated verification")
     agent_factory.add_argument("--open", action="store_true")
     agent_factory.set_defaults(func=command_agent_factory)
 
@@ -2013,13 +2329,7 @@ def build_parser() -> argparse.ArgumentParser:
     cards_p = sub.add_parser("cards", help="判断力卡片盒（纠正即记忆）：build / list [n] / stats")
     cards_p.add_argument("action", nargs="?", default="build", choices=["build", "list", "stats"])
     cards_p.add_argument("extra", nargs="?", default=None)
-    cards_p.set_defaults(func=lambda args: run_script(
-        "cards.py", [args.action] + ([args.extra] if args.extra else [])))
-
-    project_p = sub.add_parser("project", help="项目立项与 Obsidian 可视化项目管理：new / build / list / build-all")
-    project_p.add_argument("project_args", nargs=argparse.REMAINDER,
-                           help="转发给 project.py，如：new \"项目名\" --terms a,b --people p1 --client 名")
-    project_p.set_defaults(func=lambda args: run_script("project.py", args.project_args))
+    cards_p.set_defaults(func=command_cards)
 
     brief = sub.add_parser("brief", help="Generate a local daily brief from recent records")
     brief.add_argument("--days", type=int, default=2)
@@ -2063,10 +2373,48 @@ def main(argv: list[str] | None = None) -> int:
         parser = build_parser()
         args = parser.parse_args(argv)
         return int(args.func(args) or 0)
+    if argv and argv[0] == "cards" and "--help" not in argv[1:]:
+        if len(argv) > 3:
+            print(
+                json.dumps(
+                    {
+                        "error": "invalid_argument",
+                        "message": "cards accepts an action and optional list limit",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        action = argv[1] if len(argv) >= 2 else "build"
+        if action not in {"build", "list", "stats"}:
+            print(
+                json.dumps(
+                    {
+                        "error": "invalid_argument",
+                        "message": "cards action must be build, list, or stats",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return 2
+        return command_cards(
+            argparse.Namespace(
+                action=action,
+                extra=argv[2] if len(argv) == 3 else None,
+            )
+        )
     if argv and argv[0] == "feishu-clean":
         return run_script("feishu_clean.py", argv[1:])
     if argv and argv[0] == "feishu-distill":
         return run_script("feishu_distill.py", argv[1:])
+    if argv and argv[0] == "feishu-recovery":
+        return command_feishu_recovery(
+            argparse.Namespace(feishu_recovery_args=argv[1:])
+        )
     if argv and argv[0] == "feishu-mirror":
         return command_feishu_mirror(argparse.Namespace(feishu_mirror_args=argv[1:]))
     if argv and argv[0] == "feishu-mirror-status":
@@ -2085,6 +2433,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("obsidian_notes_sync.py", ["sync", *argv[1:]])
     if argv and argv[0] == "notes-status":
         return run_script("obsidian_notes_sync.py", ["status", *argv[1:]])
+    if argv and argv[0] == "notes-migrate":
+        return command_notes_migrate(
+            argparse.Namespace(notes_migrate_args=argv[1:])
+        )
     if argv and argv[0] == "obsidian-sync":
         return command_obsidian_sync(argparse.Namespace(obsidian_args=argv[1:]))
     if argv and argv[0] == "obsidian-status":
@@ -2093,6 +2445,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_script("profile_merge.py", argv[1:])
     if argv and argv[0] == "profile-auto-review":
         return run_script("profile_auto_review.py", argv[1:])
+    if argv and argv[0] == "profile-attribution-audit":
+        return run_script("profile_attribution_audit.py", argv[1:])
     if argv and argv[0] in {"profile-nuwa", "distill-profile"}:
         return command_profile_nuwa(argparse.Namespace(profile_nuwa_args=argv[1:]))
     if argv and argv[0] in {"role-distill", "agent-build"}:

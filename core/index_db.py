@@ -5,9 +5,9 @@
 
 - docs 表存正文与元数据；docs_fts(fts5 trigram) 给 >=3 字查询做 bm25 召回，
   <3 字中文查询(trigram 无法 MATCH)用 LIKE 兜底。
-- 按字节 offset 增量同步，append-only 友好；源文件缩小则自动全量重建。
+- 用前缀指纹验证 append-only，发现中段重写、缩小或 ID 漂移时安全重建。
 - channels() 返回多通道排序结果，交给 search.py 做 RRF 融合。
-- 设计为"可失败"：任何异常由调用方(search.py)回退到内存引擎，绝不影响 recall 可用性。
+- SQLite 是可重建读模型，index.jsonl 是事实源。
 
 CLI:
   python3 index_db.py reindex   # 全量重建
@@ -16,19 +16,66 @@ CLI:
   python3 index_db.py search <关键词>
 """
 
-import os
 import sys
 import json
 import math
 import sqlite3
-import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from index_integrity import INDEX_SCHEMA_VERSION, locator_schema_is_current
+from index_locks import database_lock, index_lock_pair
+
 IMMORTAL_DIR = Path.home() / ".immortal"
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DB_FILE = IMMORTAL_DIR / "search_index.db"
+
+
+class IndexQueryError(RuntimeError):
+    """The trusted SQLite generation could not execute a search query."""
+
+
+def _notes_migration_requires_rebuild() -> bool:
+    manifest = INDEX_FILE.parent / "notes" / "manifest.json"
+    if not manifest.is_file():
+        return False
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return True
+    return not isinstance(payload, dict) or bool(
+        payload.get("index_rebuild_required")
+    )
+
+
+def _clear_notes_migration_rebuild_marker() -> None:
+    manifest = INDEX_FILE.parent / "notes" / "manifest.json"
+    if not manifest.is_file():
+        return
+    with index_lock_pair(
+        INDEX_FILE,
+        DB_FILE,
+        source_exclusive=True,
+        database_exclusive=False,
+    ):
+        if not _is_ready_unlocked(ignore_notes_rebuild_marker=True):
+            return
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("notes migration manifest is unreadable") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("notes migration manifest is invalid")
+        if not payload.get("index_rebuild_required"):
+            return
+        payload["index_rebuild_required"] = False
+        payload["index_rebuilt_at"] = datetime.now(timezone.utc).isoformat()
+        from notes_transactions import durable_atomic_json
+
+        durable_atomic_json(manifest, payload)
+
 
 # 时间衰减收敛到 ranking_common（单一真源），与 search.py 共用，避免两通道打分口径漂移。
 import sys as _sys
@@ -37,34 +84,38 @@ from ranking_common import RECENCY_TAU_DAYS, RECENCY_BOOST, local_date, recency_
 
 
 def _connect() -> sqlite3.Connection:
-    # SQLite does not always honor busy_timeout while two first-use
-    # connections both try to switch journal_mode. Retry that narrow startup
-    # race; normal writer serialization is handled by BEGIN IMMEDIATE.
-    for attempt in range(5):
-        con = sqlite3.connect(str(DB_FILE), timeout=10)
-        con.execute("PRAGMA busy_timeout=10000")
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA synchronous=NORMAL")
-            con.create_function("immortal_local_date", 1, local_date, deterministic=True)
-            return con
-        except sqlite3.OperationalError as exc:
-            con.close()
-            if "locked" not in str(exc).lower() or attempt == 4:
-                raise
-            time.sleep(0.05 * (attempt + 1))
-    raise RuntimeError("unreachable")
+    # Query paths are strictly read-only. In particular, they must not create
+    # WAL sidecars that could race an atomic staging database replacement.
+    uri = DB_FILE.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=10)
+    con.execute("PRAGMA query_only=ON")
+    con.create_function("immortal_local_date", 1, local_date, deterministic=True)
+    return con
 
 
 def _ensure_schema(con: sqlite3.Connection) -> None:
     con.execute(
         "CREATE TABLE IF NOT EXISTS docs("
-        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, source TEXT, "
-        "role TEXT, project TEXT, content TEXT)"
+        "rowid INTEGER PRIMARY KEY, rec_id TEXT, ts TEXT, ts_utc TEXT NOT NULL, source TEXT, "
+        "role TEXT, project TEXT, content TEXT, "
+        "source_offset INTEGER NOT NULL, source_length INTEGER NOT NULL, "
+        "line_number INTEGER NOT NULL, content_sha256 TEXT NOT NULL)"
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_rec_id ON docs(rec_id)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_source ON docs(source)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_docs_ts ON docs(ts)")
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_docs_ts_utc_rowid "
+        "ON docs(ts_utc DESC,rowid DESC)"
+    )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_source_offset "
+        "ON docs(source_offset)"
+    )
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_line_number "
+        "ON docs(line_number)"
+    )
     con.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5("
         "content, tokenize='trigram')"
@@ -92,84 +143,169 @@ def _reset(con) -> None:
     _ensure_schema(con)
 
 
-def sync(verbose: bool = False) -> int:
-    """增量同步：只处理 index.jsonl 中上次 offset 之后的新行。
+def sync(verbose: bool = False, force_rebuild: bool = False) -> int:
+    """Deep-reconcile the read model and return the inserted record count.
 
-    源文件比上次记录的体积还小（被 dedup/rotate 重写过）则全量重建。
-    返回本次新增条数。
+    This belongs to the scheduled collection pipeline, not the recall path.
     """
     if not INDEX_FILE.exists():
         return 0
+    from index_integrity import reconcile_index
+    from maintenance_gate import writer_access
 
-    con = _connect()
-    added = 0
+    with writer_access(INDEX_FILE.parent):
+        notes_rebuild_required = _notes_migration_requires_rebuild()
+        result = reconcile_index(
+            INDEX_FILE,
+            DB_FILE,
+            force_rebuild=force_rebuild or notes_rebuild_required,
+        )
+        _clear_notes_migration_rebuild_marker()
+    if verbose:
+        print(
+            f"索引同步模式: {result['mode']}，原因: {result['reason']}，"
+            f"写入: {result['added']}"
+        )
+    return int(result["added"])
+
+
+def is_ready() -> bool:
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or _notes_migration_requires_rebuild()
+    ):
+        return False
     try:
-        # Serialize metadata reads with writes. Reading the old offset before
-        # acquiring the writer lock lets two recall processes index the same
-        # byte range or makes one fail with "database is locked".
-        con.execute("BEGIN IMMEDIATE")
-        _ensure_schema(con)
-        last_offset = int(_meta_get(con, "last_offset", 0) or 0)
-        last_size = int(_meta_get(con, "last_size", 0) or 0)
-        fsize = INDEX_FILE.stat().st_size
+        with index_lock_pair(
+            INDEX_FILE,
+            DB_FILE,
+            source_exclusive=False,
+            database_exclusive=False,
+        ):
+            return _is_ready_unlocked()
+    except OSError:
+        return False
 
-        if fsize < last_size:
-            if verbose:
-                print("源文件变小，触发全量重建索引")
-            _reset(con)
-            last_offset = 0
 
-        if fsize == last_size and last_offset >= fsize:
-            con.commit()
-            return 0
-
-        with open(INDEX_FILE, "rb") as f:
-            f.seek(last_offset)
-            while True:
-                line_start = f.tell()
-                raw = f.readline()
-                if not raw:
-                    break
-                # A collector may still be appending the final JSONL record.
-                # Keep the offset before that fragment so the next sync can
-                # parse the completed line instead of skipping it forever.
-                if not raw.endswith(b"\n"):
-                    f.seek(line_start)
-                    break
-                try:
-                    r = json.loads(raw.decode("utf-8", "ignore"))
-                except Exception:
-                    continue
-                content = r.get("content", "") or ""
-                cur = con.execute(
-                    "INSERT INTO docs(rec_id,ts,source,role,project,content) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (
-                        r.get("id", ""),
-                        r.get("timestamp", ""),
-                        r.get("source", ""),
-                        r.get("role", ""),
-                        r.get("project", ""),
-                        content,
-                    ),
-                )
-                con.execute(
-                    "INSERT INTO docs_fts(rowid,content) VALUES(?,?)",
-                    (cur.lastrowid, content),
-                )
-                added += 1
-                if verbose and added % 50000 == 0:
-                    print(f"  已索引 {added} 条...")
-            new_offset = f.tell()
-        _meta_set(con, "last_offset", new_offset)
-        _meta_set(con, "last_size", new_offset)
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
+def _is_ready_unlocked(*, ignore_notes_rebuild_marker: bool = False) -> bool:
+    """Return trusted index readiness using only source stat and fixed metadata."""
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or (
+            not ignore_notes_rebuild_marker
+            and _notes_migration_requires_rebuild()
+        )
+    ):
+        return False
+    con = None
+    try:
+        source_before = INDEX_FILE.stat()
+        con = _connect()
+        rows = dict(
+            con.execute(
+                "SELECT key,value FROM meta WHERE key IN "
+                "('parity_status','last_size','source_dev','source_ino',"
+                "'source_mtime_ns','source_ctime_ns','indexed_id_count',"
+                "'indexed_ids_sha256','index_schema_version')"
+            ).fetchall()
+        )
+        locator_schema_current = locator_schema_is_current(con)
+        source_after = INDEX_FILE.stat()
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return False
     finally:
-        con.close()
-    return added
+        if con is not None:
+            con.close()
+    required = {
+        "parity_status",
+        "last_size",
+        "source_dev",
+        "source_ino",
+        "source_mtime_ns",
+        "source_ctime_ns",
+        "indexed_id_count",
+        "indexed_ids_sha256",
+        "index_schema_version",
+    }
+    if (
+        set(rows) != required
+        or rows["parity_status"] != "trusted"
+        or rows["index_schema_version"] != str(INDEX_SCHEMA_VERSION)
+        or not locator_schema_current
+    ):
+        return False
+    before_signature = (
+        source_before.st_dev,
+        source_before.st_ino,
+        source_before.st_size,
+        source_before.st_mtime_ns,
+        source_before.st_ctime_ns,
+    )
+    after_signature = (
+        source_after.st_dev,
+        source_after.st_ino,
+        source_after.st_size,
+        source_after.st_mtime_ns,
+        source_after.st_ctime_ns,
+    )
+    if before_signature != after_signature:
+        return False
+    try:
+        return (
+            int(rows["last_size"]) == source_after.st_size
+            and int(rows["source_dev"]) == source_after.st_dev
+            and int(rows["source_ino"]) == source_after.st_ino
+            and int(rows["source_mtime_ns"]) == source_after.st_mtime_ns
+            and int(rows["source_ctime_ns"]) == source_after.st_ctime_ns
+            and int(rows["indexed_id_count"]) >= 0
+            and bool(rows["indexed_ids_sha256"])
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def ready_channels(
+    query: str,
+    limit: int = 20,
+    source: Optional[str] = None,
+    source_prefix: Optional[str] = None,
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    pool: Optional[int] = None,
+):
+    """Check readiness and query one immutable source/DB generation snapshot."""
+    if (
+        not INDEX_FILE.exists()
+        or not DB_FILE.exists()
+        or _notes_migration_requires_rebuild()
+    ):
+        return (False, [], [])
+    try:
+        with index_lock_pair(
+            INDEX_FILE,
+            DB_FILE,
+            source_exclusive=False,
+            database_exclusive=False,
+        ):
+            if not _is_ready_unlocked():
+                return (False, [], [])
+            try:
+                labels, rankings = _channels_unlocked(
+                    query,
+                    limit=limit,
+                    source=source,
+                    source_prefix=source_prefix,
+                    since=since,
+                    until=until,
+                    pool=pool,
+                )
+            except IndexQueryError:
+                return (False, [], [])
+            return (True, labels, rankings)
+    except OSError:
+        return (False, [], [])
 
 
 def _escape_match(q: str) -> str:
@@ -210,67 +346,80 @@ def _row_to_rec(row) -> dict:
 def channels(query: str, limit: int = 20, source: Optional[str] = None,
              source_prefix: Optional[str] = None, since: Optional[str] = None,
              until: Optional[str] = None, pool: Optional[int] = None):
+    if not DB_FILE.exists():
+        return ([], [])
+    with database_lock(DB_FILE, exclusive=False):
+        return _channels_unlocked(
+            query,
+            limit=limit,
+            source=source,
+            source_prefix=source_prefix,
+            since=since,
+            until=until,
+            pool=pool,
+        )
+
+
+def _channels_unlocked(query: str, limit: int = 20, source: Optional[str] = None,
+                       source_prefix: Optional[str] = None, since: Optional[str] = None,
+                       until: Optional[str] = None, pool: Optional[int] = None):
     """返回 (labels, rankings) 供 RRF 融合。
 
     labels: ["bm25"/"like", "phrase"] 中非空的那些
     rankings: 与 labels 对应的 [(score, record), ...]
-    不可用或全空时返回 ([], [])。
+    查询成功但全空时返回 ([], [])；SQLite 查询失败时抛出 IndexQueryError。
     """
     if not DB_FILE.exists():
         return ([], [])
-    try:
-        con = _connect()
-        total = con.execute("SELECT count(*) FROM docs").fetchone()[0]
-    except Exception:
-        return ([], [])
-    if total == 0:
-        con.close()
-        return ([], [])
-
-    if pool is None:
-        pool = max(limit * 8, 80)
-    ql = query.strip()
-    if not ql:
-        con.close()
-        return ([], [])
-    clause, fparams = _build_filter(source, source_prefix, since, until)
-
     rows = []
     kw_label = None
     try:
-        if len(ql) >= 3:
-            # FTS5 trigram + bm25（>=3 字才能 MATCH）
-            sql = (
-                "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content, bm25(docs_fts) AS b "
-                "FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid "
-                "WHERE docs_fts MATCH ?" + clause + " ORDER BY b LIMIT ?"
+        with closing(_connect()) as con:
+            total = con.execute("SELECT count(*) FROM docs").fetchone()[0]
+            if total == 0:
+                return ([], [])
+            if pool is None:
+                pool = max(limit * 8, 80)
+            ql = query.strip()
+            if not ql:
+                return ([], [])
+            clause, fparams = _build_filter(
+                source,
+                source_prefix,
+                since,
+                until,
             )
-            rows = con.execute(sql, [_escape_match(ql)] + fparams + [pool]).fetchall()
-            kw_label = "bm25"
-        if not rows:
-            # 兜底：<3 字查询，或 FTS 未命中 -> LIKE 子串扫描
-            # 高频词命中可能上千条（实测：报价~1053、妙记~971、客户~6745）。
-            # 池子开到 5000 让常见 2 字词基本全覆盖，不漏相关老记录；
-            # 超高频词保留最近 5000 条（老记录本就被时间衰减压低）。
-            # 按时间倒序取，再交给 recency/phrase 通道精排。
-            like_pool = max(limit * 15, 5000)
-            sql = (
-                "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content "
-                "FROM docs d WHERE d.content LIKE ?" + clause +
-                " ORDER BY d.ts DESC LIMIT ?"
-            )
-            rows = con.execute(sql, ["%" + ql + "%"] + fparams + [like_pool]).fetchall()
-            # LIKE 行没有 bm25 列，补一个占位让下游统一处理
-            rows = [tuple(r) + (None,) for r in rows]
-            kw_label = "like"
-    except Exception:
-        con.close()
-        return ([], [])
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+            if len(ql) >= 3:
+                # FTS5 trigram + bm25（>=3 字才能 MATCH）
+                sql = (
+                    "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content, "
+                    "bm25(docs_fts) AS b FROM docs_fts JOIN docs d "
+                    "ON d.rowid = docs_fts.rowid WHERE docs_fts MATCH ?"
+                    + clause
+                    + " ORDER BY b LIMIT ?"
+                )
+                rows = con.execute(
+                    sql,
+                    [_escape_match(ql)] + fparams + [pool],
+                ).fetchall()
+                kw_label = "bm25"
+            if not rows:
+                # <3 字查询或 FTS 未命中时，用 LIKE 在完整读模型中兜底。
+                like_pool = max(limit * 15, 5000)
+                sql = (
+                    "SELECT d.rec_id,d.ts,d.source,d.role,d.project,d.content "
+                    "FROM docs d WHERE d.content LIKE ?"
+                    + clause
+                    + " ORDER BY d.ts DESC LIMIT ?"
+                )
+                rows = con.execute(
+                    sql,
+                    ["%" + ql + "%"] + fparams + [like_pool],
+                ).fetchall()
+                rows = [tuple(row) + (None,) for row in rows]
+                kw_label = "like"
+    except (sqlite3.Error, OSError) as exc:
+        raise IndexQueryError("SQLite search query failed") from exc
 
     if not rows:
         return ([], [])
@@ -314,6 +463,14 @@ def stats() -> None:
     if not DB_FILE.exists():
         print("索引未构建。运行: python3 index_db.py reindex")
         return
+    with database_lock(DB_FILE, exclusive=False):
+        _stats_unlocked()
+
+
+def _stats_unlocked() -> None:
+    if not DB_FILE.exists():
+        print("索引未构建。运行: python3 index_db.py reindex")
+        return
     con = _connect()
     total = con.execute("SELECT count(*) FROM docs").fetchone()[0]
     last_offset = _meta_get(con, "last_offset", 0)
@@ -332,14 +489,8 @@ def main():
         return
     cmd = sys.argv[1]
     if cmd == "reindex":
-        if DB_FILE.exists():
-            DB_FILE.unlink()
-        for ext in ("-wal", "-shm"):
-            p = Path(str(DB_FILE) + ext)
-            if p.exists():
-                p.unlink()
         print("开始全量构建索引（首次约 1-3 分钟）...")
-        n = sync(verbose=True)
+        n = sync(verbose=True, force_rebuild=True)
         print(f"完成，索引 {n} 条")
         stats()
     elif cmd == "sync":

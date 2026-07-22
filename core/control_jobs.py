@@ -5,10 +5,29 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 from redact_common import redact
+
+
+_QUOTED_LOCAL_PATH = re.compile(
+    r"(?P<quote>['\"])(?:/|~/|[A-Za-z]:\\)(?P<body>[^\r\n]*?)(?P=quote)"
+)
+_LOCAL_FILE_PATH = re.compile(
+    r"(?<![:/\w])(?:/|~/|[A-Za-z]:\\)(?:[^/\\\r\n]+[/\\])*"
+    r"[^/\\\r\n]*?\.[A-Za-z0-9]{1,12}"
+)
+_UNQUOTED_LOCAL_PATH = re.compile(
+    r"(?<![:/\w])(?:/|~/|[A-Za-z]:\\)[^\s'\"<>|]+"
+)
+
+
+def redact_local_paths(value: str) -> str:
+    text = _QUOTED_LOCAL_PATH.sub("[本机路径]", str(value or ""))
+    text = _LOCAL_FILE_PATH.sub("[本机路径]", text)
+    return _UNQUOTED_LOCAL_PATH.sub("[本机路径]", text)
 
 
 class JobConflict(RuntimeError):
@@ -16,7 +35,8 @@ class JobConflict(RuntimeError):
 
 
 def sanitize_job_output(value: str, limit: int = 50000) -> str:
-    return str(redact(str(value or "")) or "")[-limit:]
+    credential_safe = str(redact(str(value or "")) or "")
+    return redact_local_paths(credential_safe)[-limit:]
 
 
 def run_evidence_marker(path: Path) -> tuple[Any, ...]:

@@ -13,9 +13,21 @@ SKILL_DIR = Path(__file__).resolve().parent.parent / "core"
 sys.path.insert(0, str(SKILL_DIR))
 
 import immortal
+import agent_bridge
 
 
 class BriefRecencyTest(unittest.TestCase):
+    def test_agent_bridge_redacts_stderr_before_context_metadata(self):
+        token = "sk-" + "a" * 24
+        private_home = "/" + "Users/alice/error.log"
+        redacted = agent_bridge.redact_external_text(
+            "bridge failed token=" + token + " path=" + private_home
+        )
+
+        self.assertNotIn(token, redacted)
+        self.assertNotIn(private_home.rsplit("/", 1)[0], redacted)
+        self.assertIn("[REDACTED", redacted)
+
     def test_recent_day_survives_limit_over_old_bulky_day(self):
         with tempfile.TemporaryDirectory() as tmp:
             daily = Path(tmp) / "daily"

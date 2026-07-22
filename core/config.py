@@ -93,6 +93,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "obsidian": {
         "enabled": True,
         "vault_path": "~/Documents/Immortal Obsidian Vault",
+        "notes_sync": {
+            "max_files": 1000,
+            "max_file_bytes": 1048576,
+            "max_total_bytes": 20971520,
+        },
     },
     "extra_sources": [],
 }

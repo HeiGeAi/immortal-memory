@@ -10,6 +10,7 @@ from unittest import mock
 
 
 index_db = importlib.import_module("index_db")
+index_integrity = importlib.import_module("index_integrity")
 
 
 def record(rec_id, content):
@@ -68,53 +69,45 @@ class IndexDbReliabilityTest(unittest.TestCase):
         split = len(second) // 2
         self.index_file.write_text(first + second[:split], encoding="utf-8")
 
-        self.assertEqual(index_db.sync(), 1)
-        self.assertEqual(self.doc_ids(), ["one"])
+        with self.assertRaisesRegex(
+            index_integrity.IndexIntegrityError,
+            "malformed JSONL at line 2",
+        ):
+            index_db.sync()
+        self.assertFalse(self.db_file.exists())
 
         with self.index_file.open("a", encoding="utf-8") as handle:
             handle.write(second[split:] + "\n")
 
-        self.assertEqual(index_db.sync(), 1)
+        self.assertEqual(index_db.sync(), 2)
         self.assertEqual(self.doc_ids(), ["one", "two"])
 
     def test_concurrent_sync_indexes_each_byte_range_once(self):
-        self.write_records([record("one", "first"), record("two", "second")])
+        self.write_records([record("one", "first")])
+        self.assertEqual(index_db.sync(), 1)
+        with self.index_file.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record("two", "second"), ensure_ascii=False) + "\n")
         start_barrier = threading.Barrier(2)
-        original_connect = index_db._connect
-
-        def synchronized_connect():
-            con = original_connect()
-
-            def trace(sql):
-                if (
-                    "SELECT value FROM meta" in sql
-                    and "last_size" in sql
-                    and not con.in_transaction
-                ):
-                    start_barrier.wait(timeout=5)
-
-            con.set_trace_callback(trace)
-            return con
 
         results = []
         errors = []
 
         def worker():
             try:
+                start_barrier.wait(timeout=5)
                 results.append(index_db.sync())
             except Exception as exc:
                 errors.append(exc)
 
-        with mock.patch.object(index_db, "_connect", side_effect=synchronized_connect):
-            threads = [threading.Thread(target=worker) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
-        self.assertEqual(sum(results), 2)
+        self.assertEqual(sorted(results), [0, 1])
         self.assertEqual(self.doc_ids(), ["one", "two"])
 
     def test_date_filter_uses_local_calendar_day(self):

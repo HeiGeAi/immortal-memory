@@ -64,10 +64,11 @@ def post(url, body, *, origin=None):
         return exc.code, json.loads(exc.read())
 
 
-def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
+def test_root_serves_product_and_control_center_is_preserved(tmp_path):
     server, base = start_server(tmp_path)
     try:
         status, content_type, body = get(base + "/")
+        legacy_status, legacy_type, legacy_body = get(base + "/control-center")
         try:
             get(base + "/snapshot")
             raise AssertionError("retired snapshot unexpectedly returned success")
@@ -80,7 +81,10 @@ def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
 
     assert status == 200
     assert content_type == "text/html"
-    assert b"CONTROL" in body
+    assert b"IMMORTAL" in body
+    assert legacy_status == 200
+    assert legacy_type == "text/html"
+    assert b"CONTROL" in legacy_body
     assert snapshot_status == 410
     assert "已停用".encode() in snapshot_body
 
@@ -138,10 +142,10 @@ def test_control_action_commands_are_fixed_allowlist(tmp_path):
     backup = factory._commands_for("backup_verify", {})
     profile = factory._commands_for("profile_refresh", {})
 
-    assert health[0][0][-3:] == ["health", "--max-age-hours", "30"]
-    assert "backup-status" in backup[0][0]
-    assert "--verify" in backup[0][0]
-    assert [command[0][-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
+    assert list(health[0].argv[-3:]) == ["health", "--max-age-hours", "30"]
+    assert "backup-status" in backup[0].argv
+    assert "--verify" in backup[0].argv
+    assert [command.argv[-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
 
 
 def test_persisted_running_job_is_marked_interrupted_after_restart(tmp_path):

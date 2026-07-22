@@ -19,6 +19,23 @@ def test_start_run_and_stage_write_current_state(tmp_path):
     assert json.loads((tmp_path / "current_run.json").read_text())["pid"] == 4321
 
 
+def test_start_run_archives_unfinished_current_before_replacing_it(tmp_path):
+    telemetry = RuntimeTelemetry(tmp_path, pid_exists=lambda _pid: True)
+    previous = telemetry.start_run(trigger="schedule", pid=4321)
+    telemetry.start_stage("collect", "采集")
+
+    current = telemetry.start_run(trigger="manual", pid=9876)
+    history = telemetry.read_history()
+
+    assert current["run_id"] != previous["run_id"]
+    assert current["status"] == "running"
+    assert len(history) == 1
+    assert history[0]["run_id"] == previous["run_id"]
+    assert history[0]["status"] == "interrupted"
+    assert history[0]["finished_at"]
+    assert history[0]["error"] == "新运行启动前，上一运行未正常结束"
+
+
 def test_finish_stage_and_run_append_bounded_history(tmp_path):
     telemetry = RuntimeTelemetry(tmp_path, history_limit=2, pid_exists=lambda _pid: True)
 

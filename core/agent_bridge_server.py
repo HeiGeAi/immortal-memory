@@ -18,6 +18,7 @@ import json
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +27,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from config import configured_vault_dir, owner_display_name
+from agent_bridge import redact_external_text
+from context_compiler import ContextCompiler, ContextCompilerError
 
 
 SKILL_DIR = Path(__file__).resolve().parent
@@ -86,18 +89,28 @@ def stable_hash(value: str) -> str:
 
 
 def preview(value: Any, *, limit: int = 180) -> str:
-    text = " ".join(str(value or "").split())
+    text = " ".join(redact_external_text(value, max_chars=limit * 4).split())
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
 
 
+def _redact_tree(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_external_text(value, max_chars=24_000)
+    if isinstance(value, list):
+        return [_redact_tree(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_tree(item) for key, item in value.items()}
+    return value
+
+
 def audit_event(payload: dict[str, Any]) -> None:
-    event = {
+    event = _redact_tree({
         "ts": now_iso(),
         "server": SERVER_NAME,
         **payload,
-    }
+    })
     AGENT_DIR.mkdir(parents=True, exist_ok=True)
     line = json.dumps(event, ensure_ascii=False, sort_keys=True)
     with AUDIT_LOG.open("a", encoding="utf-8") as handle:
@@ -134,6 +147,18 @@ def run_cli(args: list[str], *, timeout: int = 240) -> subprocess.CompletedProce
     )
 
 
+def run_bridge_cli(
+    args: list[str], *, timeout: int = 240
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(AGENT_BRIDGE_PY), *args],
+        capture_output=True,
+        text=True,
+        cwd=str(SKILL_DIR),
+        timeout=timeout,
+    )
+
+
 def ensure_agent_entry() -> dict[str, Any]:
     if not ENTRY_MD.exists() or not ENTRY_JSON.exists():
         subprocess.run(
@@ -156,27 +181,160 @@ def ensure_agent_entry() -> dict[str, Any]:
     }
 
 
-def build_context(task: str, *, since: str = "2026-03-01", with_recall: bool = False, timeout: int = 240) -> dict[str, Any]:
+def load_ready_context(payload: dict[str, Any]) -> tuple[str, str, str]:
+    context_id = str(payload.get("context_id") or "")
+    compiler = ContextCompiler(VAULT_DIR)
+    loaded = compiler.load_compiled(context_id)
+    if (
+        loaded.get("content_hash") != payload.get("content_hash")
+        or loaded.get("context_markdown_hash")
+        != payload.get("context_markdown_hash")
+        or loaded.get("lifecycle_status") != "compiled"
+    ):
+        raise ContextCompilerError(
+            "context_not_ready", "Bridge metadata does not match the READY pack"
+        )
+    context_md = str(loaded["context_md"])
+    context_json = str(loaded["context_json"])
+    content = str(loaded.get("context_markdown") or "")
+    if not content:
+        raise ContextCompilerError(
+            "context_not_ready", "READY context Markdown is unavailable"
+        )
+    return content, context_md, context_json
+
+
+def build_context(
+    task: str,
+    *,
+    since: str = "2026-03-01",
+    with_recall: bool = False,
+    timeout: int = 240,
+    mode: str = "auto",
+    preview_id: str = "",
+    preview_hash: str = "",
+    excluded_item_ids: list[str] | None = None,
+) -> dict[str, Any]:
     query = (task or "当前任务").strip()
-    args = ["agent-context", query, "--since", since, "--timeout", str(timeout), "--print"]
+    safe_request = redact_external_text(query, max_chars=500)
+    request_root = AGENT_DIR / "requests" / ("req_" + uuid.uuid4().hex)
+    request_metadata = request_root / "bridge-result.json"
+    request_output = request_root / "TASK_CONTEXT.md"
+    args = [
+        "context",
+        query,
+        "--since",
+        since,
+        "--timeout",
+        str(timeout),
+        "--mode",
+        mode,
+        "--metadata-output",
+        str(request_metadata.absolute()),
+        "--output",
+        str(request_output.absolute()),
+    ]
+    if preview_id or preview_hash:
+        args.extend(["--preview-id", preview_id, "--preview-hash", preview_hash])
+    for item_id in excluded_item_ids or []:
+        args.extend(["--exclude-item-id", item_id])
     if with_recall:
         args.append("--with-recall")
-    result = run_cli(args, timeout=max(timeout + 10, 30))
-    context = read_text(LATEST_CONTEXT_MD, "")
-    payload = read_json(LATEST_CONTEXT_JSON, {})
-    return {
-        "ok": result.returncode == 0,
-        "exit_code": result.returncode,
-        "task": query,
-        "context": context or result.stdout,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "metadata": payload,
-        "paths": {
-            "context_md": str(LATEST_CONTEXT_MD),
-            "context_json": str(LATEST_CONTEXT_JSON),
-        },
-    }
+    try:
+        try:
+            result = run_bridge_cli(args, timeout=max(timeout + 10, 30))
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "exit_code": 124,
+                "error_code": "bridge_timeout",
+                "task": safe_request,
+                "request_label": safe_request,
+                "lifecycle_status": None,
+                "context": "",
+                "stdout": redact_external_text(exc.stdout, max_chars=4000),
+                "stderr": "Agent Bridge timed out before producing a verified response.",
+                "metadata": {},
+                "paths": {"context_md": None, "context_json": None},
+            }
+        except OSError as exc:
+            errno = getattr(exc, "errno", None)
+            suffix = f" (errno {errno})" if isinstance(errno, int) else ""
+            return {
+                "ok": False,
+                "exit_code": 1,
+                "error_code": "bridge_unavailable",
+                "task": safe_request,
+                "request_label": safe_request,
+                "lifecycle_status": None,
+                "context": "",
+                "stdout": "",
+                "stderr": "Agent Bridge could not be started" + suffix + ".",
+                "metadata": {},
+                "paths": {"context_md": None, "context_json": None},
+            }
+
+        payload = read_json(request_metadata, {})
+        lifecycle = str(payload.get("lifecycle_status") or "")
+        context = ""
+        context_md: str | None = None
+        context_json: str | None = None
+        verification_error = ""
+        if result.returncode == 0 and lifecycle == "compiled":
+            try:
+                context, context_md, context_json = load_ready_context(payload)
+            except (ContextCompilerError, OSError, ValueError) as exc:
+                verification_error = redact_external_text(str(exc), max_chars=1000)
+        elif result.returncode == 0 and payload.get("runtime") == "legacy_v1":
+            legacy_path = Path(str(payload.get("context_md") or ""))
+            context = (
+                read_text(legacy_path, "")
+                if str(legacy_path) not in {"", "."}
+                else ""
+            )
+            lifecycle = "legacy"
+        ok = bool(
+            result.returncode == 0
+            and (
+                lifecycle == "preview"
+                or (lifecycle == "compiled" and context and not verification_error)
+                or (lifecycle == "legacy" and context)
+            )
+        )
+        stderr = redact_external_text(result.stderr, max_chars=4000)
+        if verification_error:
+            stderr = (stderr + "\n" + verification_error).strip()
+        safe_metadata = _redact_tree(payload)
+        if lifecycle == "legacy":
+            safe_metadata["context_md"] = None
+        return {
+            "ok": ok,
+            "exit_code": result.returncode if not verification_error else 1,
+            "task": safe_metadata.get("task") or safe_request,
+            "request_label": safe_request,
+            "lifecycle_status": lifecycle or None,
+            "context": context,
+            "stdout": redact_external_text(result.stdout, max_chars=24_000),
+            "stderr": stderr,
+            "metadata": safe_metadata,
+            "paths": {
+                "context_md": context_md,
+                "context_json": context_json if lifecycle == "compiled" else None,
+            },
+        }
+    finally:
+        for transient in (request_metadata, request_output):
+            try:
+                transient.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            request_root.rmdir()
+            request_root.parent.rmdir()
+        except OSError:
+            pass
 
 
 def recall(query: str, *, source: str | None = None, since: str | None = None, timeout: int = 120) -> dict[str, Any]:
@@ -408,6 +566,14 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
                 since=str(payload.get("since") or "2026-03-01"),
                 with_recall=bool(payload.get("with_recall")),
                 timeout=int(payload.get("timeout") or 240),
+                mode=str(payload.get("mode") or "auto"),
+                preview_id=str(payload.get("preview_id") or ""),
+                preview_hash=str(payload.get("preview_hash") or ""),
+                excluded_item_ids=(
+                    [str(item) for item in payload.get("excluded_item_ids", [])]
+                    if isinstance(payload.get("excluded_item_ids", []), list)
+                    else []
+                ),
             )
             self.send_json(result, HTTPStatus.OK if result["ok"] else HTTPStatus.INTERNAL_SERVER_ERROR)
             audit_event(
@@ -528,6 +694,18 @@ def mcp_tool_definitions() -> list[dict[str, Any]]:
                     "task": {"type": "string", "description": "Current task or question."},
                     "since": {"type": "string", "description": "Optional ISO date lower bound.", "default": "2026-03-01"},
                     "with_recall": {"type": "boolean", "default": False},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "advisor", "writer", "reviewer", "business", "project", "custom"],
+                        "default": "auto",
+                    },
+                    "preview_id": {"type": "string"},
+                    "preview_hash": {"type": "string"},
+                    "excluded_item_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
                     "timeout": {"type": "integer", "default": 240, "minimum": 10, "maximum": 600},
                 },
                 "required": ["task"],
@@ -578,6 +756,14 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             since=str(arguments.get("since") or "2026-03-01"),
             with_recall=bool(arguments.get("with_recall")),
             timeout=int(arguments.get("timeout") or 240),
+            mode=str(arguments.get("mode") or "auto"),
+            preview_id=str(arguments.get("preview_id") or ""),
+            preview_hash=str(arguments.get("preview_hash") or ""),
+            excluded_item_ids=(
+                [str(item) for item in arguments.get("excluded_item_ids", [])]
+                if isinstance(arguments.get("excluded_item_ids", []), list)
+                else []
+            ),
         )
         text = result.get("context") or result.get("stdout") or result.get("stderr") or ""
         audit_event(

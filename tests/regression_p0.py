@@ -288,9 +288,16 @@ def scenario_8_source_checkout_is_not_an_install() -> None:
 def main() -> int:
     global EVIDENCE_DIR
     parser = argparse.ArgumentParser()
-    parser.add_argument("--evidence-dir", default=str(REPO / "tests" / "evidence-p0"))
+    parser.add_argument(
+        "--evidence-dir",
+        default=None,
+        help="Persist evidence to this directory; the default uses an isolated temporary directory",
+    )
     args = parser.parse_args()
-    EVIDENCE_DIR = Path(args.evidence_dir)
+    EVIDENCE_DIR = Path(
+        args.evidence_dir
+        or tempfile.mkdtemp(prefix="immortal-evidence-p0-")
+    )
     EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"repo: {REPO}")
