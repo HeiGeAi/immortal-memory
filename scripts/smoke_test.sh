@@ -90,7 +90,7 @@ HOME="$TMP_HOME" python3 "$ROOT/core/immortal.py" agent-audit --limit 10 >/tmp/i
 test -s "$TMP_HOME/.immortal/agent/ENTRY.md"
 test -s "$TMP_HOME/.immortal/agent/latest-context.json"
 test -s "$TMP_HOME/.immortal/feedback/latest.md"
-test -s "$TMP_HOME/.immortal/sessions/latest.md"
+test -s "$TMP_HOME/.immortal/product/goal.json"
 test -s "$TMP_HOME/.immortal/agent/access.log"
 test -s "$TMP_HOME/.immortal/dashboard.html"
 grep -q "immortal_agent_context" /tmp/immortal-memory-mcp.txt
