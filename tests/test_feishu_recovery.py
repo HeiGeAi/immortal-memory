@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 
 import pytest
 
 from feishu_recovery import (
+    OpenPGPCryptor,
     RecoveryError,
+    build_encrypted_package,
     build_package_manifest,
     inspect_source_export,
     require_fingerprint,
     validate_package_manifest,
+    verify_local_package,
 )
 
 
@@ -36,8 +40,12 @@ def write_redacted_export(
         json.dumps(
             {
                 "mode": "jsonl-value-redaction-v1",
+                "source_file": "index.jsonl",
+                "export_file": "index.jsonl",
                 "source_sha256": source_sha256,
                 "export_sha256": _sha256(index),
+                "source_bytes": 1024,
+                "export_bytes": index.stat().st_size,
                 "unique_candidates": secret_count,
             }
         ),
@@ -47,7 +55,7 @@ def write_redacted_export(
         "generated_at": "2026-07-22T00:00:00Z",
         "vault_dir": "/private/live/vault",
         "export_dir": str(export_dir),
-        "secret_scan": {"unique_candidates": 0},
+        "secret_scan": {"unique_candidates": 0, "scan_complete": True},
         "secret_redaction": {"receipt": "secret-redaction-receipt.json"},
         "warnings": [],
         "items": [
@@ -213,3 +221,148 @@ def test_inspect_source_export_rejects_boolean_secret_scan_count(tmp_path):
 
     with pytest.raises(RecoveryError, match="source_export_redaction_missing"):
         inspect_source_export(export_dir)
+
+
+def test_inspect_source_export_rejects_incomplete_or_misbound_redaction_metadata(tmp_path):
+    export_dir = tmp_path / "immortal-export-incomplete-scan"
+    manifest = write_redacted_export(export_dir)
+    manifest["secret_scan"]["scan_complete"] = False
+    (export_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RecoveryError, match="source_export_redaction_missing"):
+        inspect_source_export(export_dir)
+
+    manifest["secret_scan"]["scan_complete"] = True
+    (export_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    receipt_path = export_dir / "secret-redaction-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["source_file"] = "other.jsonl"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    for item in manifest["items"]:
+        if item["relpath"] == "secret-redaction-receipt.json":
+            item["sha256"] = _sha256(receipt_path)
+            item["size"] = receipt_path.stat().st_size
+    (export_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RecoveryError, match="source_export_redaction_invalid"):
+        inspect_source_export(export_dir)
+
+
+class CopyCryptor:
+    def assert_recipient(self, fingerprint):
+        assert fingerprint == "A" * 40
+
+    def encrypt(self, fingerprint, write_plaintext, write_ciphertext):
+        plaintext = BytesIO()
+        write_plaintext(plaintext)
+        write_ciphertext(plaintext.getvalue())
+
+
+def test_build_encrypted_package_splits_and_hashes_all_ciphertext(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package_dir = tmp_path / "package"
+
+    result = build_encrypted_package(
+        export_dir,
+        package_dir,
+        recipient_fingerprint="A" * 40,
+        part_bytes=17,
+        cryptor=CopyCryptor(),
+    )
+
+    assert result["ok"] is True
+    assert len(result["parts"]) > 1
+    assert verify_local_package(package_dir) == {
+        "ok": True,
+        "package_id": result["package_id"],
+        "parts": len(result["parts"]),
+        "bytes": sum(item["bytes"] for item in result["parts"]),
+        "blockers": [],
+    }
+    assert not (package_dir / "export").exists()
+    assert (package_dir / "immortal-feishu-recovery.json").stat().st_mode & 0o777 == 0o600
+    assert all(
+        (package_dir / item["name"]).stat().st_mode & 0o777 == 0o600
+        for item in result["parts"]
+    )
+    manifest_text = (package_dir / "immortal-feishu-recovery.json").read_text(
+        encoding="utf-8"
+    )
+    assert str(export_dir) not in manifest_text
+    assert "/private/live/vault" not in manifest_text
+
+
+def test_build_encrypted_package_cleans_partial_parts_after_cryptor_failure(tmp_path):
+    class FailingCryptor(CopyCryptor):
+        def encrypt(self, fingerprint, write_plaintext, write_ciphertext):
+            write_ciphertext(b"partial")
+            raise RuntimeError("injected")
+
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+
+    result = build_encrypted_package(
+        export_dir,
+        tmp_path / "package",
+        recipient_fingerprint="A" * 40,
+        cryptor=FailingCryptor(),
+    )
+
+    assert result == {"ok": False, "blockers": ["encryption_failed"]}
+    assert not (tmp_path / "package").exists()
+
+
+def test_verify_local_package_rejects_unlisted_file(tmp_path):
+    export_dir = tmp_path / "immortal-export-safe"
+    write_redacted_export(export_dir)
+    package_dir = tmp_path / "package"
+    result = build_encrypted_package(
+        export_dir,
+        package_dir,
+        recipient_fingerprint="A" * 40,
+        cryptor=CopyCryptor(),
+    )
+    assert result["ok"] is True
+    (package_dir / "unlisted.txt").write_text("unexpected", encoding="utf-8")
+
+    assert verify_local_package(package_dir) == {
+        "ok": False,
+        "package_id": "",
+        "parts": 0,
+        "bytes": 0,
+        "blockers": ["package_contents_invalid"],
+    }
+
+
+def test_openpgp_cryptor_requires_exact_primary_public_fingerprint():
+    calls = []
+
+    class Completed:
+        returncode = 0
+        stdout = "pub:u::::::\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n"
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return Completed()
+
+    cryptor = OpenPGPCryptor(runner=runner)
+    cryptor.assert_recipient("a" * 40)
+
+    assert calls == [
+        (
+            ["gpg", "--batch", "--with-colons", "--list-keys", "A" * 40],
+            {"capture_output": True, "text": True, "check": False, "timeout": 30},
+        )
+    ]
+
+
+def test_openpgp_cryptor_rejects_a_subkey_or_missing_public_key():
+    class Completed:
+        returncode = 0
+        stdout = "pub:u::::::\nfpr:::::::::BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB:\nsub:u::::::\nfpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\n"
+
+    cryptor = OpenPGPCryptor(runner=lambda *_args, **_kwargs: Completed())
+
+    with pytest.raises(RecoveryError, match="recipient_public_key_unavailable"):
+        cryptor.assert_recipient("A" * 40)

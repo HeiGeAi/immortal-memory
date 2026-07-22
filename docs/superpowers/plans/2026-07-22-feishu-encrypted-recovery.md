@@ -230,7 +230,7 @@ Expected: all Task 1 tests pass.
 - Modify: `core/feishu_recovery.py`
 - Modify: `tests/test_feishu_recovery.py`
 
-- [ ] **Step 1: Add failing package-build tests using a fake cryptor**
+- [x] **Step 1: Add failing package-build tests using a fake cryptor**
 
 ```python
 from io import BytesIO
@@ -284,7 +284,7 @@ def test_build_encrypted_package_cleans_partial_parts_after_cryptor_failure(tmp_
     assert not (tmp_path / "package").exists()
 ```
 
-- [ ] **Step 2: Run the targeted test and confirm it fails**
+- [x] **Step 2: Run the targeted test and confirm it fails**
 
 Run:
 
@@ -294,15 +294,15 @@ PYTHONPATH=core python3 -m pytest tests/test_feishu_recovery.py -q
 
 Expected: `build_encrypted_package` and `verify_local_package` are missing.
 
-- [ ] **Step 3: Implement a bounded split writer and production GPG adapter**
+- [x] **Step 3: Implement a bounded split writer and production GPG adapter**
 
 Implement the following interfaces exactly:
 
 ```python
 class SplitDigestWriter:
     def __init__(self, parts_dir: Path, part_bytes: int) -> None:
-        if part_bytes < 1024 * 1024:
-            raise RecoveryError("part_size_too_small")
+        if type(part_bytes) is not int or part_bytes <= 0:
+            raise RecoveryError("part_size_invalid")
         self.parts_dir = parts_dir
         self.part_bytes = part_bytes
         self._part_number = 0
@@ -314,8 +314,14 @@ class SplitDigestWriter:
     def _open_part(self) -> None:
         self._part_number += 1
         self.parts_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.parts_dir, 0o700)
         self._current_path = self.parts_dir / f"part-{self._part_number:05d}.gpg"
-        self._current = self._current_path.open("xb")
+        descriptor = os.open(
+            str(self._current_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        self._current = os.fdopen(descriptor, "wb")
         self._current_bytes = 0
         self._current_digest = hashlib.sha256()
 
@@ -421,7 +427,7 @@ class OpenPGPCryptor:
         self._pump_gpg(["gpg", "--batch", "--yes", "--decrypt", "--output", "-"], write_ciphertext, consume_plaintext)
 ```
 
-`OpenPGPCryptor.assert_recipient` runs `gpg --batch --with-colons --list-keys <fingerprint>` and requires an exact primary `fpr` record. `encrypt` starts `gpg --batch --yes --trust-model always --encrypt --recipient <fingerprint> --output -`, streams a tar writer through stdin on a writer thread, and writes stdout into `SplitDigestWriter`. `decrypt` concatenates parts into `gpg --batch --yes --decrypt --output -`, then passes stdout to a tar consumer. It must return a stable failure code without including GPG stderr in user-visible results.
+`OpenPGPCryptor.assert_recipient` runs `gpg --batch --with-colons --list-keys <fingerprint>` and requires an exact primary `fpr` record. `encrypt` starts `gpg --batch --yes --trust-model always --encrypt --recipient <fingerprint> --output -`, streams a tar writer through stdin on a writer thread, and writes stdout into `SplitDigestWriter`. `decrypt` concatenates parts into `gpg --batch --yes --decrypt --output -`, then passes stdout to a tar consumer. It must return a stable failure code without including GPG stderr in user-visible results. The internal writer accepts a small positive chunk only for deterministic tests; the later CLI rejects a human-supplied value below 1 MiB.
 
 Use `tarfile.open(fileobj=stream, mode="w|")` and write this exact archive order:
 
@@ -432,11 +438,11 @@ export/<each manifest item relpath in sorted order>
 
 Reject non-regular files, symlinks, duplicate archive names, missing item bodies, and an export-generation change between preflight and postflight. The package directory is created with `0o700`; manifest and local receipts use `0o600`; failure removes the entire package directory.
 
-- [ ] **Step 4: Implement local package verification**
+- [x] **Step 4: Implement local package verification**
 
 `verify_local_package(package_dir)` must reject a package whose directory contains an unlisted file, symlink, missing part, size mismatch, SHA mismatch, invalid manifest, or part count mismatch. Its return value contains only `ok`, `package_id`, `parts`, `bytes`, and blocker codes.
 
-- [ ] **Step 5: Run Task 2 tests and commit**
+- [x] **Step 5: Run Task 2 tests and commit**
 
 Run:
 
