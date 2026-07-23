@@ -45,6 +45,7 @@ from export_restore import (
     migration_backup_gate,
     restore_check,
 )
+from external_sources import collect_registered_sources, register_source, unregister_source
 from index_writer import append_jsonl_records
 from judgment_store import InvalidJudgmentOperation, JudgmentStore
 from maintenance_gate import writer_access
@@ -222,6 +223,62 @@ def run_script(script: str, args: list[str] | None = None) -> int:
 
 def command_run(_args=None) -> int:
     return run_script("orchestrator.py")
+
+
+def _external_source_payload(config: dict, kind: str) -> dict:
+    external = config.get("external_sources") if isinstance(config.get("external_sources"), dict) else {}
+    source = external.get(kind) if isinstance(external.get(kind), dict) else {}
+    return {
+        "kind": kind,
+        "enabled": bool(source.get("enabled")),
+        "paths": [str(item) for item in source.get("paths") or []],
+    }
+
+
+def command_external_source_register(args: argparse.Namespace) -> int:
+    config = load_config()
+    try:
+        register_source(config, args.kind, args.path)
+    except ValueError as exc:
+        print(f"Source registration failed: {exc}", file=sys.stderr)
+        return 2
+    save_config(config)
+    payload = _external_source_payload(config, args.kind)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else f"Registered {args.kind}: {args.path}")
+    return 0
+
+
+def command_external_source_unregister(args: argparse.Namespace) -> int:
+    config = load_config()
+    unregister_source(config, args.kind, args.path)
+    save_config(config)
+    payload = _external_source_payload(config, args.kind)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else f"Unregistered {args.kind}: {args.path}")
+    return 0
+
+
+def command_external_source_list(args: argparse.Namespace) -> int:
+    config = load_config()
+    payload = {kind: _external_source_payload(config, kind) for kind in (
+        "git", "github", "claude-web", "chatgpt", "cursor"
+    )}
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        for kind, source in payload.items():
+            print(f"{kind}: {'enabled' if source['enabled'] else 'disabled'} ({len(source['paths'])} paths)")
+    return 0
+
+
+def command_external_source_collect(args: argparse.Namespace) -> int:
+    config = load_config()
+    payload = collect_registered_sources(config, configured_vault_dir(config))
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        for kind, result in payload.items():
+            print(f"{kind}: {int(result.get('records_written') or 0)} new records")
+    return 0
 
 
 def command_cards(args) -> int:
@@ -1976,6 +2033,24 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show current memory library state").set_defaults(func=command_status)
+    source = sub.add_parser("source", help="Register and collect explicitly scoped external sources")
+    source_sub = source.add_subparsers(dest="source_command", required=True)
+    source_list = source_sub.add_parser("list", help="List registered source paths without reading them")
+    source_list.add_argument("--json", action="store_true")
+    source_list.set_defaults(func=command_external_source_list)
+    source_register = source_sub.add_parser("register", help="Register one existing path for a source kind")
+    source_register.add_argument("kind", choices=["git", "github", "claude-web", "chatgpt", "cursor"])
+    source_register.add_argument("path")
+    source_register.add_argument("--json", action="store_true")
+    source_register.set_defaults(func=command_external_source_register)
+    source_unregister = source_sub.add_parser("unregister", help="Remove one registered source path")
+    source_unregister.add_argument("kind", choices=["git", "github", "claude-web", "chatgpt", "cursor"])
+    source_unregister.add_argument("path")
+    source_unregister.add_argument("--json", action="store_true")
+    source_unregister.set_defaults(func=command_external_source_unregister)
+    source_collect = source_sub.add_parser("collect", help="Collect all enabled registered sources")
+    source_collect.add_argument("--json", action="store_true")
+    source_collect.set_defaults(func=command_external_source_collect)
     init = sub.add_parser("init", help="Initialize this installation with the current user's identity and vault config")
     init.add_argument("--owner-name", default=None, help="Legal or internal name for the owner")
     init.add_argument("--owner-display-name", default=None, help="Display name used in generated roles")

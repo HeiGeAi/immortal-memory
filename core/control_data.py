@@ -394,6 +394,13 @@ class ControlData:
     def sources(self) -> dict[str, Any]:
         state = self._read_json(self.immortal_dir / "orchestrator_state.json")
         web = self._read_json(self.immortal_dir / "web" / "state.json")
+        config = self._read_json(self.immortal_dir / "config.json")
+        feishu = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+        daily_sources = {item.strip() for item in str(feishu.get("daily_sources") or "").split(",") if item.strip()}
+        external_config = config.get("external_sources") if isinstance(config.get("external_sources"), dict) else {}
+        external_state = self._read_json(self.immortal_dir / "external_sources" / "state.json")
+        external_results = external_state.get("sources") if isinstance(external_state.get("sources"), dict) else {}
+        external_last = str(external_state.get("generated_at") or "")
         source_specs = [
             {
                 "id": "local",
@@ -416,6 +423,37 @@ class ControlData:
                 "errors": sum("feishu" in str(item) for item in (state.get("errors") or [])),
                 "evidence": "feishu/state.json",
             },
+            {
+                "id": "feishu-mail",
+                "label": "飞书邮件（显式授权）",
+                "last": str(state.get("last_feishu_collect") or "") if "mail" in daily_sources else "",
+                "status": self._source_status(state.get("last_feishu_status"), has_success=bool(state.get("last_feishu_collect")))
+                if "mail" in daily_sources else "skipped",
+                "increment": 0,
+                "errors": 0,
+                "evidence": "config.json + feishu/state.json",
+            },
+            *[
+                {
+                    "id": source_id,
+                    "label": label,
+                    "last": external_last if enabled else "",
+                    "status": self._source_status(result.get("status"), has_success=bool(external_last)) if enabled else "skipped",
+                    "increment": int(result.get("records_written") or 0),
+                    "errors": int(result.get("error_count") or 0),
+                    "evidence": "config.json + external_sources/state.json",
+                }
+                for kind, source_id, label in (
+                    ("git", "git-history", "Git 本地历史"),
+                    ("github", "github-history", "GitHub PR / Issue"),
+                    ("claude-web", "claude-web", "Claude Web 导出"),
+                    ("chatgpt", "chatgpt", "ChatGPT 导出"),
+                    ("cursor", "cursor", "Cursor 导出"),
+                )
+                for configured in [external_config.get(kind) if isinstance(external_config.get(kind), dict) else {}]
+                for enabled in [bool(configured.get("enabled") and configured.get("paths"))]
+                for result in [external_results.get(kind) if isinstance(external_results.get(kind), dict) else {}]
+            ],
             {
                 "id": "web",
                 "label": "网页访问",

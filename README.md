@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.1.1-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.3.0-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -27,7 +27,7 @@
 
 要让它说出像你会说的话、按你会做的判断去做事，只有一个办法：用**足够高密度的个人上下文**，把它从共识里硬拽出来。
 
-Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。v1.1 用五个可追溯层完成这件事：
+Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也不只是一个 Codex 技能。v1.3 在 v1.1 Living Self 架构上，用五个可追溯层完成这件事：
 
 1. **Claim**：把原始痕迹变成带出处、作用域、归因和隐私标签的可纠正主张。
 2. **Living Self**：只用已确认 Claim 生成有版本的「当前自我」，旧版本永不原地覆盖。
@@ -109,6 +109,36 @@ immortal-memory agent-entry
 # 针对一个具体任务，生成贴身的上下文包
 immortal-memory agent-context "help me review this product idea" --print
 ```
+
+### 自动接入你的高质量语料
+
+v1.3 支持五类显式登记的外部来源。全部默认关闭，只有你登记的文件或目录才会被读取：
+
+```bash
+# 本地 Git 提交历史，只读取提交元数据和提交说明，不读取代码正文
+immortal-memory source register git "/absolute/path/to/projects"
+
+# GitHub PR 和 Issue，只读调用本机已登录的 gh CLI
+immortal-memory source register github "/absolute/path/to/projects"
+
+# 官方导出的对话文件或 Cursor transcript 目录
+immortal-memory source register claude-web "/absolute/path/to/conversations.json"
+immortal-memory source register chatgpt "/absolute/path/to/conversations.json"
+immortal-memory source register cursor "/absolute/path/to/cursor/agent-transcripts"
+
+# 检查登记范围并立即执行一次增量采集
+immortal-memory source list --json
+immortal-memory source collect --json
+```
+
+每条记录在写入前都会做凭证形态脱敏，并用本地 SQLite 状态去重。每日编排会自动调用已启用来源。控制台只展示来源健康、更新时间、新增数和错误数，不展示本机私有路径。飞书邮件继续保持显式授权，不会因为安装产品而自动采集。
+
+### 支持环境与 Agent
+
+- macOS：完整支持，包括 LaunchAgent 每日自动化、Codex 和 Claude Code 适配器。
+- Linux：核心 CLI、HTTP Agent Bridge、MCP、采集和测试受支持；需要自行配置 systemd 或 cron 调度。
+- Windows：当前不支持生产运行，因为索引锁依赖 `fcntl.flock`。建议使用 WSL2，并自行配置调度。
+- Agent：Codex、Claude Code、终端 Agent，以及任何能调用 CLI、HTTP 或 MCP 的本地 Agent。适配器只负责发现入口，真实记忆仍由同一套核心权限和上下文合同控制。
 
 打开本地控制台：
 
@@ -212,7 +242,7 @@ immortal-memory agent-context "release acceptance" --print
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.1.1-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.0-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke
@@ -314,7 +344,7 @@ There is a sharper problem underneath. A large model is wired to produce **confi
 
 To make it say what you would say and decide the way you would decide, there is only one move: push **high-density personal context** at it until it gets dragged out of the consensus prior.
 
-Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. v1.1 implements five traceable layers:
+Immortal Memory is the local system that does exactly that. It is not a prompt, and not only a Codex skill. v1.3 builds on the v1.1 Living Self architecture and implements five traceable layers:
 
 1. **Claim** turns source traces into correctable assertions with evidence, scope, attribution, and privacy labels.
 2. **Living Self** builds a versioned current model from confirmed Claims without overwriting history.

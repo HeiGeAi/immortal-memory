@@ -54,6 +54,7 @@ REQUIRED_PATHS = [
     "people",
     "quality",
     "relationships",
+    "external_sources",
     # timeline.html / dashboard.html / brief 已于 2026-06-14 停用并删除；
     # 留在白名单里会让每个新导出都带 missing 警告，strict 校验对完好数据永久 FAIL
     "digests",

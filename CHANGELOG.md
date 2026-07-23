@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+
+- Add explicit, disabled-by-default imports for Git commit history, GitHub pull requests and issues, Claude Web exports, ChatGPT exports, and Cursor transcripts.
+- Keep external collection local, read-only, incremental, secret-redacted, and limited to user-registered paths.
+- Surface each external source and Feishu Mail separately in the control center without exposing local paths.
+- Include external-source deduplication state in portable recovery exports.
+- Run enabled external sources through the normal orchestrator and report partial or failed collection honestly.
+- Preserve every v1.1 Living Self, transaction, migration, recovery, and dashboard capability by releasing from the current `main` architecture.
+
 ## 1.1.1
 
 - Mark a loaded daily LaunchAgent as requiring attention when its most recent exit code is nonzero, and expose the code as bounded scheduler evidence instead of showing a false healthy state.
