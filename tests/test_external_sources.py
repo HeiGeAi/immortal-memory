@@ -167,6 +167,7 @@ def test_orchestrator_collects_declared_external_sources(monkeypatch):
         "run_script",
         lambda script, *args, **kwargs: calls.append((script, args, kwargs)) or (True, json.dumps(payload)),
     )
+    monkeypatch.setattr(orchestrator, "log", lambda _message: None)
 
     ok, result = orchestrator.external_source_collect()
 
@@ -186,6 +187,7 @@ def test_orchestrator_does_not_flatten_partial_external_source_to_success(monkey
         "run_script",
         lambda *_args, **_kwargs: (True, json.dumps(payload)),
     )
+    monkeypatch.setattr(orchestrator, "log", lambda _message: None)
 
     ok, result = orchestrator.external_source_collect()
 
