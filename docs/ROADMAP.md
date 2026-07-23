@@ -24,6 +24,13 @@
 - Storage budgeting, retention previews, and safer evidence deletion workflows.
 - Stable local API and MCP transport over the same authorization and context contracts.
 
+## v1.3 Controlled source automation
+
+- Explicit, disabled-by-default Git, GitHub, Claude Web, ChatGPT, and Cursor sources.
+- Incremental local deduplication, secret redaction, bounded collection, and source-level health evidence.
+- Feishu Mail remains a separate opt-in source instead of being folded into a generic success state.
+- External source state is part of portable recovery and the normal orchestration loop.
+
 ## Later, only after local trust is proven
 
 - Additional connector SDKs and audited adapters.

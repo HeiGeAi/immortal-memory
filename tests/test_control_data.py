@@ -331,7 +331,7 @@ def test_memory_and_source_routes_are_live(tmp_path):
         server.server_close()
 
     assert source_status == 200
-    assert len(sources["items"]) == 5
+    assert len(sources["items"]) == 11
     assert list_status == 200
     assert len(page["items"]) == 2
     assert detail_status == 200
