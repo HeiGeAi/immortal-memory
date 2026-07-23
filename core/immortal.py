@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import importlib.metadata
 import gzip
 import json
 import os
@@ -31,6 +32,7 @@ from config import (
     configured_vault_dir,
     daily_launch_agent_label,
     daily_schedule,
+    feishu_daily_sources,
     feishu_guard_args,
     load_config,
     owner_aliases,
@@ -39,11 +41,34 @@ from config import (
     slug_prefix,
 )
 from export_restore import create_export, get_backup_status, restore_check
+from external_sources import collect_registered_sources, register_source, unregister_source
+from automation_tasks import AutomationTasks
+from control_jobs import sanitize_job_output
+from process_utils import run_process
 from state_store import mutate_state_atomic, update_state_atomic
 
 
 SKILL_DIR = Path(__file__).resolve().parent
-VERSION = (SKILL_DIR / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def load_runtime_version(
+    skill_dir: Path,
+    *,
+    distribution_version=importlib.metadata.version,
+) -> str:
+    try:
+        value = (skill_dir / "VERSION").read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    except OSError:
+        pass
+    try:
+        return str(distribution_version("immortal-memory"))
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+VERSION = load_runtime_version(SKILL_DIR)
 IMMORTAL_DIR = configured_vault_dir()
 INDEX_FILE = IMMORTAL_DIR / "index.jsonl"
 DAILY_DIR = IMMORTAL_DIR / "daily"
@@ -211,6 +236,150 @@ def run_script(script: str, args: list[str] | None = None) -> int:
     if args:
         cmd.extend(args)
     return subprocess.call(cmd)
+
+
+def _lark_cli_readiness() -> dict[str, bool]:
+    """Check only whether the local Feishu CLI can be used, never expose identity data."""
+    try:
+        result = subprocess.run(
+            ["lark-cli", "auth", "status", "--json", "--verify"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"available": False, "authenticated": False}
+    if result.returncode != 0:
+        return {"available": True, "authenticated": False}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"available": True, "authenticated": False}
+    return {
+        "available": True,
+        "authenticated": bool(payload.get("verified")),
+    }
+
+
+def command_setup_status(args: argparse.Namespace) -> int:
+    """Report first-run readiness without reading a vault record or Feishu content."""
+    config = load_config()
+    feishu = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+    sources = [item.strip() for item in str(feishu.get("daily_sources") or "").split(",") if item.strip()]
+    high_signal = [item for item in ("messages", "vc", "minutes") if item in sources]
+    payload = {
+        "platform": {
+            "system": sys.platform,
+            "support": "supported" if sys.platform == "darwin" else "experimental" if os.name == "posix" else "unsupported",
+        },
+        "agents": {
+            "codex_adapter": (Path.home() / ".codex" / "skills" / "immortal").is_dir(),
+            "claude_code_adapter": (Path.home() / ".claude" / "skills" / "immortal-memory").is_dir(),
+            "generic_cli": True,
+        },
+        "feishu": {
+            **_lark_cli_readiness(),
+            "account_guard_configured": bool(feishu.get("expected_user_name") or feishu.get("expected_user_open_id")),
+            "high_signal_sources": high_signal,
+            "mail_source": {"enabled": "mail" in sources, "mode": "opt_in"},
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        return 0
+    print("Immortal setup readiness")
+    print(f"Platform: {payload['platform']['system']} ({payload['platform']['support']})")
+    print(f"Agent adapters: Codex={'ready' if payload['agents']['codex_adapter'] else 'not installed'}; Claude Code={'ready' if payload['agents']['claude_code_adapter'] else 'not installed'}")
+    print(f"Feishu CLI: {'ready' if payload['feishu']['available'] and payload['feishu']['authenticated'] else 'needs authorization'}")
+    print(f"Feishu account guard: {'configured' if payload['feishu']['account_guard_configured'] else 'required before collection'}")
+    print(f"High-signal sources: {', '.join(high_signal) if high_signal else 'not selected'}")
+    print(f"Feishu mail: {'enabled' if payload['feishu']['mail_source']['enabled'] else 'disabled by default'}")
+    print("Next: review this status, then run `immortal.py train --with-feishu` for a bounded first collection.")
+    return 0
+
+
+def command_source_policy(args: argparse.Namespace) -> int:
+    """Show or update the single opt-in source policy without exposing account data."""
+    config = load_config()
+    feishu = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+    sources = [item.strip() for item in str(feishu.get("daily_sources") or "").split(",") if item.strip()]
+    action = str(args.action)
+    if action == "enable-feishu-mail" and "mail" not in sources:
+        sources.append("mail")
+    elif action == "disable-feishu-mail":
+        sources = [item for item in sources if item != "mail"]
+
+    if action != "show":
+        config["feishu"] = {**feishu, "daily_sources": ",".join(sources)}
+        save_config(config)
+
+    payload = {
+        "feishu_mail_enabled": "mail" in sources,
+        "feishu_sources": sources,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        print(f"Feishu mail: {'enabled' if payload['feishu_mail_enabled'] else 'disabled'}")
+        print(f"Configured sources: {', '.join(sources) if sources else 'none'}")
+    return 0
+
+
+def _external_source_payload(config: dict, kind: str) -> dict:
+    external = config.get("external_sources") if isinstance(config.get("external_sources"), dict) else {}
+    source = external.get(kind) if isinstance(external.get(kind), dict) else {}
+    return {
+        "kind": kind,
+        "enabled": bool(source.get("enabled")),
+        "paths": [str(item) for item in (source.get("paths") or [])],
+    }
+
+
+def command_external_source_register(args: argparse.Namespace) -> int:
+    config = load_config()
+    try:
+        register_source(config, args.kind, args.path)
+    except ValueError as exc:
+        print(f"Source registration failed: {exc}", file=sys.stderr)
+        return 2
+    save_config(config)
+    payload = _external_source_payload(config, args.kind)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else f"Registered {args.kind}: {args.path}")
+    return 0
+
+
+def command_external_source_unregister(args: argparse.Namespace) -> int:
+    config = load_config()
+    unregister_source(config, args.kind, args.path)
+    save_config(config)
+    payload = _external_source_payload(config, args.kind)
+    print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if args.json else f"Unregistered {args.kind}: {args.path}")
+    return 0
+
+
+def command_external_source_list(args: argparse.Namespace) -> int:
+    config = load_config()
+    payload = {
+        kind: _external_source_payload(config, kind)
+        for kind in ("git", "github", "claude-web", "chatgpt", "cursor")
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        for kind, source in payload.items():
+            print(f"{kind}: {'enabled' if source['enabled'] else 'disabled'} ({len(source['paths'])} paths)")
+    return 0
+
+
+def command_external_source_collect(args: argparse.Namespace) -> int:
+    config = load_config()
+    payload = collect_registered_sources(config, configured_vault_dir(config))
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        for kind, result in payload.items():
+            print(f"{kind}: {int(result.get('records_written') or 0)} new records")
+    return 0
 
 
 def iter_daily_files(days: int = 2) -> Iterable[Path]:
@@ -930,23 +1099,13 @@ def command_dashboard_export(_args) -> int:
 def write_daily_backup_script(config: dict) -> Path:
     vault = configured_vault_dir(config)
     script = vault / "daily-backup.sh"
-    log_path = vault / "backup.log"
     script.write_text(
         "\n".join(
             [
-                "#!/bin/bash",
-                "# Immortal daily automation entrypoint.",
-                f"LOG={json.dumps(str(log_path))}",
+                "#!/bin/sh",
+                "# Fixed local dispatcher. It never evaluates supplied shell input.",
                 f"CODEX_IMMORTAL={json.dumps(str(SKILL_DIR / 'immortal.py'))}",
-                'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"',
-                'echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] === immortal daily run ===" >> "$LOG"',
-                'python3 "$CODEX_IMMORTAL" run >> "$LOG" 2>&1',
-                "STATUS=$?",
-                'python3 "$CODEX_IMMORTAL" feedback --run-status "$STATUS" --notify >> "$LOG" 2>&1',
-                "FEEDBACK_STATUS=$?",
-                'echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] === finished status=$STATUS feedback_status=$FEEDBACK_STATUS ===" >> "$LOG"',
-                'echo "" >> "$LOG"',
-                'exit "$STATUS"',
+                'exec /usr/bin/python3 "$CODEX_IMMORTAL" automation daily-dispatch',
                 "",
             ]
         ),
@@ -1269,7 +1428,18 @@ def command_train(args) -> int:
             print("Feishu collection skipped: configure expected user in `immortal.py init` or pass --allow-current-feishu-account.")
         else:
             feishu_args = guard or ["--allow-current-account"]
-            feishu_args.extend(["--days", str(args.feishu_days), "--max-chats", str(args.feishu_max_chats), "--max-messages", str(args.feishu_max_messages)])
+            feishu_args.extend(
+                [
+                    "--sources",
+                    feishu_daily_sources(config),
+                    "--days",
+                    str(args.feishu_days),
+                    "--max-chats",
+                    str(args.feishu_max_chats),
+                    "--max-messages",
+                    str(args.feishu_max_messages),
+                ]
+            )
             steps.append(("feishu", [sys.executable, str(SKILL_DIR / "feishu_collect.py"), *feishu_args], False))
             steps.extend(
                 [
@@ -1494,6 +1664,98 @@ def command_agent_audit(args) -> int:
     if args.json:
         audit_args.append("--json")
     return run_script("agent_bridge_server.py", audit_args)
+
+
+def _automation_runtime() -> AutomationTasks:
+    return AutomationTasks(IMMORTAL_DIR, skill_dir=SKILL_DIR)
+
+
+def _print_automation(value: dict) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+
+
+def command_automation_status(_args) -> int:
+    _print_automation(_automation_runtime().status())
+    return 0
+
+
+def command_automation_pause(args) -> int:
+    _print_automation(_automation_runtime().pause(args.reason))
+    return 0
+
+
+def command_automation_resume(_args) -> int:
+    _print_automation(_automation_runtime().resume())
+    return 0
+
+
+def command_automation_enqueue(args) -> int:
+    params = {}
+    if args.kind == "task_context":
+        params = {"goal": args.goal, "mode": args.mode}
+    task = _automation_runtime().enqueue(
+        args.kind,
+        trigger=args.trigger,
+        params=params,
+        dedupe_key=args.dedupe_key,
+    )
+    _print_automation(task)
+    return 0
+
+
+def command_automation_daily_dispatch(_args) -> int:
+    """Queue today's fixed daily work only when local dispatch is active."""
+    runtime = _automation_runtime()
+    status = runtime.status()
+    if status["paused"]:
+        _print_automation({"status": "paused", "pause_reason": status["pause_reason"]})
+        return 0
+    date_key = datetime.now().astimezone().date().isoformat()
+    task = runtime.enqueue(
+        "daily_pipeline",
+        trigger="schedule",
+        dedupe_key=f"daily:{date_key}",
+    )
+    _print_automation({"id": task["id"], "status": task["status"], "dedupe_key": task["dedupe_key"]})
+    return command_automation_run_once(None)
+
+
+def command_automation_run_once(_args) -> int:
+    runtime = _automation_runtime()
+    task = runtime.claim_next()
+    if task is None:
+        _print_automation({"status": "idle"})
+        return 0
+    commands = runtime.commands_for(task)
+    output = ""
+    try:
+        for command in commands:
+            result = run_process(command, capture_output=True, text=True, timeout=900, cwd=str(SKILL_DIR))
+            output = sanitize_job_output(output + "\n" + (result.stdout or "") + "\n" + (result.stderr or ""))
+            if result.returncode not in {0, 2}:
+                finished = runtime.finish(
+                    task["id"],
+                    status="failed",
+                    error=f"fixed handler exited with code {result.returncode}",
+                )
+                _print_automation({"id": finished["id"], "status": finished["status"]})
+                return 1
+            if result.returncode == 2:
+                finished = runtime.finish(
+                    task["id"],
+                    status="attention",
+                    summary=f"completed {len(commands)} fixed handler(s) with attention",
+                )
+                _print_automation({"id": finished["id"], "status": finished["status"]})
+                return 2
+    except Exception as exc:
+        sanitize_job_output(str(exc))
+        finished = runtime.finish(task["id"], status="failed", error="fixed handler execution failed")
+        _print_automation({"id": finished["id"], "status": finished["status"]})
+        return 1
+    finished = runtime.finish(task["id"], status="success", summary=f"completed {len(commands)} fixed handler(s)")
+    _print_automation({"id": finished["id"], "status": finished["status"]})
+    return 0
 
 
 def command_people(args) -> int:
@@ -1740,6 +2002,37 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("status", help="Show current memory library state").set_defaults(func=command_status)
+    setup_status = sub.add_parser(
+        "setup-status",
+        help="Show local platform, Agent adapter, and Feishu readiness without reading source content",
+    )
+    setup_status.add_argument("--json", action="store_true")
+    setup_status.set_defaults(func=command_setup_status)
+
+    source_policy = sub.add_parser("source-policy", help="Show or change the opt-in policy for controlled sources")
+    source_policy.add_argument("action", choices=["show", "enable-feishu-mail", "disable-feishu-mail"])
+    source_policy.add_argument("--json", action="store_true")
+    source_policy.set_defaults(func=command_source_policy)
+
+    source = sub.add_parser("source", help="Register and collect explicitly scoped external sources")
+    source_sub = source.add_subparsers(dest="source_command", required=True)
+    source_list = source_sub.add_parser("list", help="List registered source paths without reading them")
+    source_list.add_argument("--json", action="store_true")
+    source_list.set_defaults(func=command_external_source_list)
+    source_register = source_sub.add_parser("register", help="Register one existing path for a source kind")
+    source_register.add_argument("kind", choices=["git", "github", "claude-web", "chatgpt", "cursor"])
+    source_register.add_argument("path")
+    source_register.add_argument("--json", action="store_true")
+    source_register.set_defaults(func=command_external_source_register)
+    source_unregister = source_sub.add_parser("unregister", help="Remove one registered source path")
+    source_unregister.add_argument("kind", choices=["git", "github", "claude-web", "chatgpt", "cursor"])
+    source_unregister.add_argument("path")
+    source_unregister.add_argument("--json", action="store_true")
+    source_unregister.set_defaults(func=command_external_source_unregister)
+    source_collect = source_sub.add_parser("collect", help="Collect all enabled registered sources")
+    source_collect.add_argument("--json", action="store_true")
+    source_collect.set_defaults(func=command_external_source_collect)
+
     init = sub.add_parser("init", help="Initialize this installation with the current user's identity and vault config")
     init.add_argument("--owner-name", default=None, help="Legal or internal name for the owner")
     init.add_argument("--owner-display-name", default=None, help="Display name used in generated roles")
@@ -1803,6 +2096,30 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daily-install", help="Install or refresh the local daily LaunchAgent automation").set_defaults(func=command_daily_install)
     sub.add_parser("daily-status", help="Show local daily LaunchAgent automation status").set_defaults(func=command_daily_status)
     sub.add_parser("daily-uninstall", help="Remove the configured local daily LaunchAgent automation").set_defaults(func=command_daily_uninstall)
+
+    automation = sub.add_parser("automation", help="Inspect and run declared local automation tasks")
+    automation_sub = automation.add_subparsers(dest="automation_command", required=True)
+    automation_sub.add_parser("status", help="Show automation pause state and task counts").set_defaults(func=command_automation_status)
+    automation_pause = automation_sub.add_parser("pause", help="Pause queued task dispatch")
+    automation_pause.add_argument("reason", help="Human-readable pause reason, 1-160 characters")
+    automation_pause.set_defaults(func=command_automation_pause)
+    automation_sub.add_parser("resume", help="Resume queued task dispatch").set_defaults(func=command_automation_resume)
+    automation_enqueue = automation_sub.add_parser("enqueue", help="Queue one declared local task")
+    automation_enqueue.add_argument("kind", choices=["daily_pipeline", "profile_refresh", "task_context"])
+    automation_enqueue.add_argument("--trigger", choices=["agent", "manual", "schedule", "system"], default="manual")
+    automation_enqueue.add_argument("--dedupe-key", default="")
+    automation_enqueue.add_argument("--goal", default=None)
+    automation_enqueue.add_argument(
+        "--mode",
+        choices=["auto", "advisor", "writer", "reviewer", "business", "project", "shadow", "custom"],
+        default="auto",
+    )
+    automation_enqueue.set_defaults(func=command_automation_enqueue)
+    automation_sub.add_parser(
+        "daily-dispatch",
+        help="Queue today's fixed local daily pipeline once, unless dispatch is paused",
+    ).set_defaults(func=command_automation_daily_dispatch)
+    automation_sub.add_parser("run-once", help="Claim and run one declared local task").set_defaults(func=command_automation_run_once)
 
     export = sub.add_parser("export", help="Create a portable export of the recovery-critical memory vault")
     export.add_argument("--vault-dir", default=None)

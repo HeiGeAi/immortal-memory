@@ -43,6 +43,7 @@ REQUIRED_PATHS = [
     "feishu/state.sqlite3",
     "feishu/log.jsonl",
     "feishu/reports",
+    "external_sources",
     "people",
     "quality",
     "relationships",

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from automation_tasks import AutomationTasks
 from config import configured_vault_dir, owner_display_name
 
 
@@ -218,6 +219,13 @@ def command_context(args: argparse.Namespace) -> int:
         },
     }
     write_json(LATEST_CONTEXT_JSON, payload)
+    if result.returncode == 0:
+        AutomationTasks(IMMORTAL_DIR, skill_dir=SKILL_DIR).record_context_event(
+            kind="task_context",
+            query_length=len(query),
+            exit_code=result.returncode,
+            artifact=file_info(output),
+        )
     print(f"context_md={output}")
     print(f"context_json={LATEST_CONTEXT_JSON}")
     if args.print:

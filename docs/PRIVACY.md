@@ -16,6 +16,19 @@ Never commit:
 - API keys;
 - exported backups.
 
+## Automation Boundary
+
+Local automation is opt-in and limited to declared fixed handlers. It never
+executes arbitrary shell commands, performs cloud upload, or triggers external
+actions or notifications on its own. Configure and initiate any connector or
+other outward-facing behavior separately on the local machine.
+
+## Controlled Source Boundary
+
+External source adapters read only explicitly registered paths. GitHub PR and
+Issue collection is read-only. Registration never grants permission to upload,
+modify, merge, comment, or publish through the source account.
+
 ## Sensitive Output Policy
 
 Agents may use memory to reason, but should only output what the task requires.
@@ -50,3 +63,10 @@ git status --short
 ```
 
 Review every generated file manually if the scan reports a hit.
+
+## Portable Recovery Export
+
+A portable recovery export preserves the private fact layer for recovery and
+is not a sanitized sharing artifact. If its manifest reports secret shapes,
+do not upload or share it. Offsite copies require separate encryption,
+versioning, manifest verification, and a real restore drill.

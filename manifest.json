@@ -12,6 +12,7 @@
     "core/agent_bridge.py",
     "core/agent_bridge_server.py",
     "core/agents/openai.yaml",
+    "core/automation_tasks.py",
     "core/cc_worker.py",
     "core/cleanup.py",
     "core/collect.py",
@@ -27,6 +28,7 @@
     "core/dashboard.py",
     "core/distill.py",
     "core/export_restore.py",
+    "core/external_sources.py",
     "core/feedback_report.py",
     "core/feishu_clean.py",
     "core/feishu_collect.py",
@@ -81,7 +83,7 @@
     "scripts/private_scan.py",
     "scripts/smoke_test.sh"
   ],
-  "generated_at": "2026-07-22T21:29:00",
+  "generated_at": "2026-07-24T00:07:38",
   "name": "immortal-memory",
   "private_data_included": false,
   "type": "open-source-empty-shell"

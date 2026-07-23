@@ -693,6 +693,7 @@ async function renderOverview() {
 
 async function renderRuns() {
   const [jobs, overview] = await Promise.all([api('/api/v1/jobs'), api('/api/v1/overview')]);
+  const automation = await api('/api/v1/automation');
   setSystem(overview.status, `${overview.status_label} · 任务 ${jobs.items.length}`, overview.version);
   const current = overview.current_run || {};
   const rows = jobs.items.map(item => `
@@ -704,11 +705,26 @@ async function renderRuns() {
     </button>`).join('');
   const currentStages = (current.stages || []).map((item, index) => `
     <div class="stage ${esc(item.status)}"><div class="stage-index">${String(index + 1).padStart(2,'0')}</div><div><h4>${esc(item.label || item.id)}</h4><p>${esc(item.summary || item.error || '')}</p></div><time>${esc(statusLabel(item.status))}</time></div>`).join('');
+  const taskRow = item => `<div class="row"><strong>${esc(item.kind)}<br><span class="mono">${esc(item.id)}</span></strong><p>${esc(item.trigger || 'system')} · ${esc(when(item.started_at || item.created_at))}</p>${tag(item.status)}<span class="mono">${esc(when(item.finished_at || item.created_at))}</span></div>`;
+  const currentTask = automation.current ? taskRow(automation.current) : '<div class="empty">当前没有自动化任务</div>';
+  const recentTasks = (automation.recent || []).map(taskRow).join('') || '<div class="empty">还没有近期运行</div>';
+  const queuedTasks = (automation.queued || []).map(taskRow).join('') || '<div class="empty">队列为空</div>';
   $('viewRoot').innerHTML = `${viewHead('runs', `${jobs.items.length} JOBS · ${esc(statusLabel(current.status))}`)}
     <div class="section-title"><div><h3>当前编排器运行</h3><p>心跳、阶段和 run_id 来自结构化遥测。</p></div></div>
     <section class="stage-rail">${currentStages || '<div class="empty">当前没有运行中的阶段</div>'}</section>
     <div class="section-title"><div><h3>控制任务</h3><p>点击任务查看分页日志、取消或重试。</p></div></div>
-    <section class="row-list">${rows || '<div class="empty">还没有控制任务</div>'}</section>`;
+    <section class="row-list">${rows || '<div class="empty">还没有控制任务</div>'}</section>
+    <div class="section-title"><div><h3>自动化控制</h3><p>${automation.paused ? '自动化已暂停。恢复后仅由受控调度器领取任务。' : '自动化运行中。网页只写入受控任务状态，不执行 shell。'}</p></div><span class="micro">${automation.paused ? 'PAUSED' : 'ACTIVE'} · QUEUED ${num(automation.queued_count)}</span></div>
+    <section class="grid grid-3">
+      <div class="card"><div class="card-top"><span class="mono">CURRENT</span>${tag(automation.paused ? 'attention' : 'ready')}</div><h4>当前自动化</h4><div class="row-list">${currentTask}</div></div>
+      <div class="card"><div class="card-top"><span class="mono">RECENT</span>${tag('ready')}</div><h4>近期运行</h4><div class="row-list">${recentTasks}</div></div>
+      <div class="card"><div class="card-top"><span class="mono">QUEUE</span>${tag('ready')}</div><h4>排队任务</h4><div class="row-list">${queuedTasks}</div></div>
+    </section>
+    <section class="grid grid-3" style="margin-top:12px">
+      <button class="control${automation.paused ? ' primary' : ' danger'}" data-automation-action="${automation.paused ? 'resume' : 'pause'}"><span><strong>${automation.paused ? '恢复自动化' : '暂停自动化'}</strong><small>${automation.paused ? 'RESUME QUEUE' : 'HOLD QUEUE'}</small></span></button>
+      <button class="control" data-automation-enqueue="profile_refresh"><span><strong>加入画像刷新</strong><small>QUEUE ONLY</small></span></button>
+      <button class="control primary" data-automation-run-once="daily_pipeline"><span><strong>立即执行一次</strong><small>CONTROLLED TASK</small></span></button>
+    </section>`;
 }
 
 async function renderSources() {
@@ -987,6 +1003,29 @@ function requestJobAction(kind, control) {
   });
 }
 
+function requestAutomationAction(action, control) {
+  const isPause = action === 'pause';
+  confirmAction({
+    title:isPause ? '暂停自动化' : '恢复自动化',
+    copy:isPause ? '暂停后，已排队任务会保留，但不会被调度器领取。' : '恢复后，受控调度器可继续领取已排队任务。',
+    impact:'网页只更新 AutomationTasks 状态，不会直接调用 shell。',
+    control,
+    feedback:{loading:'正在更新', loadingMeta:'LOCAL STATE', success:'状态已更新', successMeta:'AUTOMATION', error:'更新失败', errorMeta:'RETRY'},
+    execute:async () => { const endpoint = action === 'pause' ? '/api/v1/automation/pause' : '/api/v1/automation/resume'; await api(endpoint, {method:'POST', body:'{}'}); await renderActive(); }
+  });
+}
+
+function requestAutomationTask(path, kind, control) {
+  confirmAction({
+    title:path === 'run-once' ? '立即执行一次' : '加入自动化队列',
+    copy:'只接受声明过的任务类型，不接受命令或自由文本。',
+    impact:'任务先写入 AutomationTasks；实际执行仍由受控 CLI 调度器负责。',
+    control,
+    feedback:{loading:'正在入队', loadingMeta:'CONTROLLED TASK', success:'已入队', successMeta:'AUTOMATION', error:'入队失败', errorMeta:'RETRY'},
+    execute:async () => { const endpoint = path === 'run-once' ? '/api/v1/automation/run-once' : '/api/v1/automation/enqueue'; await api(endpoint, {method:'POST', body:JSON.stringify({kind})}); await renderActive(); }
+  });
+}
+
 function bindDrawerEvents() {
   document.querySelectorAll('[data-job-cancel]').forEach(button => button.onclick = () => confirmAction({
     title:'请求安全取消',
@@ -1024,6 +1063,9 @@ function bindViewEvents() {
     try { showDrawer(button.dataset.detailTitle || '详情', detailBlocks(JSON.parse(decodeURIComponent(button.dataset.detail)))); } catch (_) {}
   });
   document.querySelectorAll('[data-job-action]').forEach(button => button.onclick = () => requestJobAction(button.dataset.jobAction, button));
+  document.querySelectorAll('[data-automation-action]').forEach(button => button.onclick = () => requestAutomationAction(button.dataset.automationAction, button));
+  document.querySelectorAll('[data-automation-enqueue]').forEach(button => button.onclick = () => requestAutomationTask('enqueue', button.dataset.automationEnqueue, button));
+  document.querySelectorAll('[data-automation-run-once]').forEach(button => button.onclick = () => requestAutomationTask('run-once', button.dataset.automationRunOnce, button));
   document.querySelectorAll('[data-job-id]').forEach(button => button.onclick = () => openJob(button.dataset.jobId).catch(error => toast(error.message, true)));
   document.querySelectorAll('[data-memory-id]').forEach(button => button.onclick = () => openMemory(button.dataset.memoryId).catch(error => toast(error.message, true)));
   document.querySelectorAll('[data-profile-id]').forEach(button => button.onclick = () => openProfile(button.dataset.profileId).catch(error => toast(error.message, true)));

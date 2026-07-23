@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.2.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.3.0-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -249,6 +249,16 @@ It can recall evidence with sources, mirror your writing preferences, pre-judge 
 It holds a few hard lines: no irreversible decisions without your approval, no raw private messages by default (summaries and evidence IDs instead), no silent collection of the wrong account, and no treating a single hallucinated profile as permanent truth.
 
 Data stays local by default. Collection scope, identity aliases, account guards, exports, and deletion are all explicit.
+
+## Local automation is opt-in and fixed
+
+Daily automation is installed only when you explicitly opt in locally. Its dispatcher deduplicates the declared daily pipeline by local calendar date, exits without dispatching while paused, and runs only fixed local handlers.
+
+It never executes arbitrary shell commands, performs cloud upload, or triggers external actions or notifications on its own. Any connector or outward-facing action remains separately configured and explicitly initiated on the local machine.
+
+## Controlled external sources
+
+Git, GitHub PR and Issue, Claude Web, ChatGPT, and Cursor adapters read only explicitly registered paths. They never scan the whole disk. GitHub access is read-only through the user's existing `gh` CLI session and does not fetch, push, merge, comment, or publish. Imported records are redacted before entering the local append-only vault and use local deduplication state for incremental runs.
 
 ## What this repo is
 

@@ -86,6 +86,51 @@ class ControlData:
         )
 
     @staticmethod
+    def _automation_task_metadata(task: dict[str, Any]) -> dict[str, Any]:
+        """Expose scheduling evidence without returning task input or execution output."""
+        return {
+            key: task.get(key)
+            for key in (
+                "id",
+                "kind",
+                "trigger",
+                "status",
+                "created_at",
+                "started_at",
+                "finished_at",
+            )
+        }
+
+    def automation_status(self, runtime: Any) -> dict[str, Any]:
+        """Return the bounded AutomationTasks dashboard model.
+
+        Automation task params may contain a user's goal.  Command lines, task
+        params, summaries and errors are intentionally omitted from this API.
+        """
+        state = runtime.status()
+        tasks = [
+            self._automation_task_metadata(task)
+            for task in runtime.list_tasks()
+            if isinstance(task, dict)
+        ]
+        current = next((task for task in tasks if task.get("status") == "running"), None)
+        return {
+            "paused": bool(state.get("paused")),
+            "paused_at": state.get("paused_at"),
+            "queued_count": int(state.get("queued_count") or 0),
+            "running_count": int(state.get("running_count") or 0),
+            "current": current,
+            "recent": [
+                task for task in tasks
+                if task.get("status") in {"success", "attention", "failed", "canceled"}
+            ][:8],
+            "queued": [task for task in tasks if task.get("status") == "queued"][:8],
+        }
+
+    def automation_task_metadata(self, task: dict[str, Any]) -> dict[str, Any]:
+        return self._automation_task_metadata(task)
+
+    @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -401,9 +446,47 @@ class ControlData:
             return "success"
         return "unknown"
 
+    def _newest_feishu_source_backup(self, source_prefix: str = "feishu-") -> str:
+        """Return the newest Feishu source metadata timestamp, without reading content."""
+        sources = self._read_json(self.immortal_dir / "sources.json")
+        newest_value = ""
+        newest_time: datetime | None = None
+        for source in sources.get("sources") or []:
+            if not isinstance(source, dict) or not str(source.get("type") or "").startswith(source_prefix):
+                continue
+            value = str(source.get("last_backup") or "").strip()
+            if not value:
+                continue
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed = parsed.astimezone(timezone.utc)
+            except ValueError:
+                continue
+            if newest_time is None or parsed > newest_time:
+                newest_value = value
+                newest_time = parsed
+        return newest_value
+
     def sources(self) -> dict[str, Any]:
         state = self._read_json(self.immortal_dir / "orchestrator_state.json")
         web = self._read_json(self.immortal_dir / "web" / "state.json")
+        config = self._read_json(self.immortal_dir / "config.json")
+        feishu_config = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+        external_config = config.get("external_sources") if isinstance(config.get("external_sources"), dict) else {}
+        external_state = self._read_json(self.immortal_dir / "external_sources" / "state.json")
+        external_results = (
+            external_state.get("sources") if isinstance(external_state.get("sources"), dict) else {}
+        )
+        external_last = str(external_state.get("generated_at") or "")
+        feishu_daily_sources = {
+            item.strip()
+            for item in str(feishu_config.get("daily_sources") or "").split(",")
+            if item.strip()
+        }
+        feishu_last = self._newest_feishu_source_backup() or str(state.get("last_feishu_collect") or "")
+        feishu_mail_last = self._newest_feishu_source_backup("feishu-mail")
         source_specs = [
             {
                 "id": "local",
@@ -417,15 +500,56 @@ class ControlData:
             {
                 "id": "feishu",
                 "label": "飞书",
-                "last": str(state.get("last_feishu_collect") or ""),
+                "last": feishu_last,
                 "status": self._source_status(
                     state.get("last_feishu_status"),
-                    has_success=bool(state.get("last_feishu_collect")),
+                    has_success=bool(feishu_last),
                 ),
                 "increment": int(state.get("last_run_feishu_new_records") or 0),
                 "errors": sum("feishu" in str(item) for item in (state.get("errors") or [])),
-                "evidence": "feishu/state.json",
+                "evidence": "sources.json + orchestrator_state.json",
             },
+            {
+                "id": "feishu-mail",
+                "label": "飞书邮件（可选）",
+                "last": feishu_mail_last,
+                "status": self._source_status("", has_success=bool(feishu_mail_last))
+                if "mail" in feishu_daily_sources
+                else "skipped",
+                "increment": 0,
+                "errors": 0,
+                "evidence": "config.json + sources.json",
+            },
+            *[
+                {
+                    "id": source_id,
+                    "label": label,
+                    "last": external_last if enabled else "",
+                    "status": self._source_status(
+                        result.get("status"),
+                        has_success=bool(external_last),
+                    )
+                    if enabled
+                    else "skipped",
+                    "increment": int(result.get("records_written") or 0),
+                    "errors": int(result.get("error_count") or 0),
+                    "evidence": "config.json + external_sources/state.json",
+                }
+                for kind, source_id, label in (
+                    ("git", "git-history", "Git 本地历史"),
+                    ("github", "github-history", "GitHub PR / Issue"),
+                    ("claude-web", "claude-web", "Claude Web 导出"),
+                    ("chatgpt", "chatgpt", "ChatGPT 导出"),
+                    ("cursor", "cursor", "Cursor 导出"),
+                )
+                for configured in [
+                    external_config.get(kind) if isinstance(external_config.get(kind), dict) else {}
+                ]
+                for enabled in [bool(configured.get("enabled") and configured.get("paths"))]
+                for result in [
+                    external_results.get(kind) if isinstance(external_results.get(kind), dict) else {}
+                ]
+            ],
             {
                 "id": "web",
                 "label": "网页访问",

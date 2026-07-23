@@ -1,10 +1,21 @@
 [project]
 name = "immortal-memory"
-version = "1.2.0"
+version = "1.3.0"
 description = "Local-first personal memory layer for AI agents"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Immortal Memory Contributors"}]
+
+[project.scripts]
+immortal-memory = "immortal:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "core"}
+py-modules = ["agent_bridge", "agent_bridge_server", "automation_tasks", "cc_worker", "cleanup", "collect", "config", "control_center", "control_center_ui", "control_data", "control_http", "control_jobs", "cron_check", "daily_digest", "dashboard", "distill", "export_restore", "external_sources", "feedback_report", "feishu_clean", "feishu_collect", "feishu_distill", "feishu_drive_mirror", "feishu_mirror_worker", "file_utils", "getnote_sync", "immortal", "index_db", "integrity_audit", "obsidian_sync", "orchestrator", "people_index", "personal_model", "process_utils", "product_brief", "profile", "profile_attribution_audit", "profile_auto_review", "profile_merge", "profile_nuwa", "profile_review", "quality_report", "ranking_common", "redact_common", "relationship_index", "role_distill", "runtime_telemetry", "search", "secret_scan", "soul", "state_store", "summary", "task_compile", "timeline", "web_capture"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

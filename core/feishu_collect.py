@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import redact_common
+from config import feishu_daily_sources
 
 
 IMMORTAL_DIR = Path.home() / ".immortal"
@@ -1750,7 +1751,7 @@ class Collector:
                     record_type="mail",
                     timestamp=normalize_timestamp(mail.get("date") or mail.get("created_at")),
                     content=f"Feishu mail: {mail.get('subject') or ''}\nfrom: {mail.get('from') or ''}\nto: {mail.get('to') or ''}",
-                    metadata={"mail": mail},
+                    metadata={"mail_id": str(message_id)},
                     session_id=str(message_id),
                 )
             )
@@ -1794,8 +1795,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Collect Feishu/Lark data into ~/.immortal")
     parser.add_argument(
         "--sources",
-        default="contacts,chats,members,messages,tasks,calendar,vc,minutes,docs,mail",
-        help="Comma-separated sources: contacts,chats,members,messages,message-search,tasks,calendar,vc,minutes,docs,doc-contents,mail",
+        default=feishu_daily_sources(),
+        help="Comma-separated sources. Uses configured safe defaults; mail is opt-in via config or an explicit --sources value.",
     )
     parser.add_argument("--days", type=int, default=7, help="Lookback window in days unless --since or --all is provided")
     parser.add_argument("--since", default=None, help="Start date/time, e.g. 2026-05-01 or 2026-05-01T00:00:00+08:00")

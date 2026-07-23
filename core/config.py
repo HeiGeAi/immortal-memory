@@ -94,6 +94,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "vault_path": "~/Documents/Immortal Obsidian Vault",
     },
+    "external_sources": {
+        "git": {"enabled": False, "paths": [], "max_commits": 200},
+        "github": {"enabled": False, "paths": [], "max_items": 50},
+        "claude-web": {"enabled": False, "paths": []},
+        "chatgpt": {"enabled": False, "paths": []},
+        "cursor": {"enabled": False, "paths": []},
+    },
     "extra_sources": [],
 }
 

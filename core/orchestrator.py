@@ -293,6 +293,28 @@ def collect():
         return False, {"total_new": 0, "by_source": {}}
 
 
+def external_source_collect():
+    log("=== 阶段 1E: 受控外部来源同步 ===")
+    ok, out = run_script("immortal.py", "source", "collect", "--json", timeout=900)
+    if not ok:
+        log(f"受控外部来源同步失败: {out.strip()[:300]}")
+        return False, {"records_written": 0, "sources": {}}
+    try:
+        sources = json.loads(out)
+    except json.JSONDecodeError:
+        log("受控外部来源同步返回无效 JSON")
+        return False, {"records_written": 0, "sources": {}}
+    if not isinstance(sources, dict):
+        return False, {"records_written": 0, "sources": {}}
+    total = sum(
+        int(value.get("records_written") or 0)
+        for value in sources.values()
+        if isinstance(value, dict)
+    )
+    log(f"受控外部来源同步成功: 新增 {total} 条")
+    return True, {"records_written": total, "sources": sources}
+
+
 def web_collect():
     log("=== 阶段 1W: 网页访问元信息扫描 ===")
     ok, out = run_script("web_capture.py", "collect", "--json", timeout=300)
@@ -916,6 +938,13 @@ def run_main():
         errors.append("collect failed")
 
     telemetry_stage("external", "外部来源同步", errors)
+    external_ok, external_info = external_source_collect()
+    external_new = int(external_info.get("records_written") or 0)
+    if external_ok:
+        state["last_external_source_collect"] = now_iso
+    else:
+        errors.append("external source collect failed")
+
     web_new = 0
     web_due_hours = hours_since(state.get("last_web_collect"))
     if web_due_hours >= WEB_CAPTURE_INTERVAL_HOURS:
@@ -1092,6 +1121,7 @@ def run_main():
     state["last_run_new_records"] = collect_info.get("total_new", 0)
     state["last_run_feishu_new_records"] = feishu_new
     state["last_run_web_new_records"] = web_new
+    state["last_run_external_new_records"] = external_new
     state["errors"] = errors[-10:]  # 保留最近 10 个错误
 
     save_state(state)
@@ -1170,6 +1200,7 @@ def run_main():
 
     log(f"========= 编排器完成 =========")
     log(f"  本次新增: {collect_info.get('total_new', 0)} 条")
+    log(f"  受控外部来源新增: {external_new} 条")
     log(f"  网页新增: {web_new} 条")
     log(f"  飞书新增: {feishu_new} 条")
     log(f"  总记录数: {state['total_records']:,}")
@@ -1182,6 +1213,7 @@ def run_main():
         "errors": errors,
         "results": {
             "new_records": collect_info.get("total_new", 0),
+            "external_new_records": external_new,
             "web_new_records": web_new,
             "feishu_new_records": feishu_new,
             "total_records": state["total_records"],

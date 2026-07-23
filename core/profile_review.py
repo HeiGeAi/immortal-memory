@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from control_center import ControlCenter
 from control_center_ui import control_center_page_html
 from control_data import ControlData
+from automation_tasks import AutomationTasks
 import personal_model
 from control_http import SECURITY_HEADERS, error_page, error_payload, is_allowed_host
 from control_jobs import JobConflict, live_pid_lock, run_evidence_marker, sanitize_job_output
@@ -653,6 +654,7 @@ class FactoryStore:
             "run",
             "backup_verify",
             "profile_refresh",
+            "automation_run_once",
         }:
             raise ValueError("unknown factory job kind")
         if kind in {"run", "collect", "full"} and self._orchestrator_is_active():
@@ -836,6 +838,8 @@ class FactoryStore:
                 ([python, immortal, "personal-model", "build"], COMMAND_TIMEOUTS["personal_model"]),
                 ([python, immortal, "quality"], COMMAND_TIMEOUTS["quality"]),
             ]
+        if kind == "automation_run_once":
+            return [([python, immortal, "automation", "run-once"], COMMAND_TIMEOUTS["profile_auto_review"])]
         raise ValueError("unknown factory job kind")
 
     def _orchestrator_is_active(self) -> bool:
@@ -899,6 +903,8 @@ class FactoryStore:
             return "最新便携备份校验已完成。"
         if kind == "profile_refresh":
             return "长期画像、Personal Model 和质量报告已刷新。"
+        if kind == "automation_run_once":
+            return "已触发一次受控自动化任务领取。"
         return "任务完成。"
 
     @staticmethod
@@ -1782,6 +1788,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.server.control_data = value  # type: ignore[attr-defined]
         return value
 
+    @property
+    def automation(self) -> AutomationTasks:
+        value = getattr(self.server, "automation", None)
+        if value is None:
+            value = AutomationTasks(
+                self.control_center.immortal_dir,
+                skill_dir=self.control_center.skill_dir,
+            )
+            self.server.automation = value  # type: ignore[attr-defined]
+        return value
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
@@ -1961,6 +1978,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v1/diagnostics":
             self.send_json(self.control_data.diagnostics())
+            return
+        if parsed.path == "/api/v1/automation":
+            self.send_json(self.control_data.automation_status(self.automation))
             return
         if parsed.path == "/api/v1/jobs":
             self.send_json({"items": self.factory.list_jobs()})
@@ -2165,6 +2185,47 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     self.factory.start_job("backup_verify", {}),
                     status=202,
                 )
+                return
+            if parsed.path == "/api/v1/automation/pause":
+                if body:
+                    raise ValueError("automation pause does not accept parameters")
+                self.automation.pause("control_center")
+                self.send_json(self.control_data.automation_status(self.automation))
+                return
+            if parsed.path == "/api/v1/automation/resume":
+                if body:
+                    raise ValueError("automation resume does not accept parameters")
+                self.automation.resume()
+                self.send_json(self.control_data.automation_status(self.automation))
+                return
+            if parsed.path in {"/api/v1/automation/enqueue", "/api/v1/automation/run-once"}:
+                unknown = set(body) - {"kind", "params", "dedupe_key"}
+                if unknown:
+                    raise ValueError(f"unsupported field: {sorted(unknown)[0]}")
+                kind = body.get("kind")
+                if not isinstance(kind, str):
+                    raise ValueError("kind is required")
+                params = body.get("params")
+                dedupe_key = body.get("dedupe_key", "")
+                if not isinstance(dedupe_key, str):
+                    raise ValueError("dedupe_key must be a string")
+                task = self.automation.enqueue(
+                    kind,
+                    trigger="manual",
+                    params=params,
+                    dedupe_key=dedupe_key if parsed.path.endswith("/enqueue") else "",
+                )
+                if parsed.path.endswith("/run-once"):
+                    job = self.factory.start_job("automation_run_once", {})
+                    self.send_json(
+                        {
+                            key: job.get(key)
+                            for key in ("id", "kind", "status", "created_at", "started_at", "finished_at")
+                        },
+                        status=202,
+                    )
+                    return
+                self.send_json(self.control_data.automation_task_metadata(task), status=202)
                 return
             if parsed.path == "/api/review":
                 memory_id = str(body.get("id") or "")
