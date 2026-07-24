@@ -311,42 +311,53 @@ def update_sources_backup(stats: dict[str, Any], failed_sources: set[str] | None
     write_json(SOURCES_FILE, config)
 
 
+def _retryable_lark_failure(body: dict[str, Any], error: str) -> bool:
+    text = (str(error or "") + "\n" + compact_json(body, 2000)).lower()
+    return any(marker in text for marker in ("network", "timeout", "timed out", "connection reset"))
+
+
 def run_lark(args: list[str], *, timeout: int = 60, cwd: Path | None = None) -> tuple[bool, dict[str, Any], str]:
     executable = next((str(path) for path in LARK_CLI_CANDIDATES if path.exists()), "lark-cli")
     cmd = [executable, *args]
     env_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env={**os.environ, "NO_COLOR": "1", "PATH": f"{env_path}:{os.environ.get('PATH', '')}"},
-            cwd=str(cwd) if cwd else None,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return False, {}, f"timeout after {timeout}s: {' '.join(cmd)}"
-    except Exception as exc:
-        return False, {}, f"{type(exc).__name__}: {exc}"
-
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-    body: dict[str, Any] = {}
-    if stdout:
+    last: tuple[bool, dict[str, Any], str] = (False, {}, "lark-cli did not run")
+    for attempt in range(2):
         try:
-            body = json.loads(stdout)
-        except json.JSONDecodeError:
-            body = {"raw_stdout": stdout}
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "NO_COLOR": "1", "PATH": f"{env_path}:{os.environ.get('PATH', '')}"},
+                cwd=str(cwd) if cwd else None,
+            )
+        except subprocess.TimeoutExpired:
+            last = (False, {}, f"timeout after {timeout}s: {' '.join(cmd)}")
+            if attempt == 0:
+                continue
+            return last
+        except Exception as exc:
+            return False, {}, f"{type(exc).__name__}: {exc}"
 
-    ok = proc.returncode == 0
-    if body.get("ok") is False:
-        ok = False
-    if body.get("code") not in (None, 0):
-        ok = False
-    err = stderr
-    if not ok and body:
-        err = compact_json(body, 2000)
-    return ok, body, err
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        body: dict[str, Any] = {}
+        if stdout:
+            try:
+                body = json.loads(stdout)
+            except json.JSONDecodeError:
+                body = {"raw_stdout": stdout}
+
+        ok = proc.returncode == 0
+        if body.get("ok") is False or body.get("code") not in (None, 0):
+            ok = False
+        err = stderr
+        if not ok and body:
+            err = compact_json(body, 2000)
+        last = (ok, body, err)
+        if ok or attempt == 1 or not _retryable_lark_failure(body, err):
+            return last
+    return last
 
 
 def current_auth_status() -> tuple[bool, dict[str, Any], str]:
@@ -480,6 +491,23 @@ def write_records(records: list[dict[str, Any]]) -> None:
         _write_records_locked(records)
 
 
+EXPECTED_ACCESS_BOUNDARY_MARKERS = (
+    "chat open restricted mode",
+    "don't allow copying or forwarding messages",
+    "no notes available for this meeting",
+    "no permission to access this meeting's minute",
+    "user lacks permission for the requested resource",
+    "resource deleted",
+)
+
+
+def is_expected_access_boundary(source: str, message: str) -> bool:
+    if source not in {"feishu-im", "feishu-vc-note", "feishu-vc-recording", "feishu-minutes-note"}:
+        return False
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in EXPECTED_ACCESS_BOUNDARY_MARKERS)
+
+
 class Collector:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -487,12 +515,18 @@ class Collector:
         self.run_id = str(uuid.uuid4())
         self.stats: dict[str, int] = defaultdict(int)
         self.errors: list[dict[str, str]] = []
+        self.skips: list[dict[str, str]] = []
         prev_state = read_json(STATE_FILE, {})
         self.start, self.end = window_from_args(args, prev_state.get("last_window_end"))
         self.chats: list[dict[str, Any]] = []
         self.self_user: dict[str, Any] | None = None
 
     def error(self, source: str, message: str) -> None:
+        if is_expected_access_boundary(source, message):
+            item = {"source": source, "reason": "access_boundary", "message": message[:1000]}
+            self.skips.append(item)
+            log_event("info", "collector_skipped", **item)
+            return
         self.errors.append({"source": source, "message": message[:1000]})
         log_event("error", "collector_error", source=source, message=message[:1000])
 
@@ -565,11 +599,12 @@ class Collector:
                 "last_window_end": iso_local(self.end),
                 "last_stats": stats,
                 "last_errors": self.errors[-20:],
+                "last_skips": self.skips[-50:],
             }
         )
         write_json(STATE_FILE, state)
         update_sources_backup(stats, failed_sources={e.get("source") for e in self.errors})
-        log_event("info", "run_finished", run_id=self.run_id, stats=stats, errors=len(self.errors))
+        log_event("info", "run_finished", run_id=self.run_id, stats=stats, errors=len(self.errors), skips=len(self.skips))
 
     def collect_contact_self(self) -> None:
         ok, body, err = run_lark(["contact", "+get-user", "--as", "user", "--format", "json"])

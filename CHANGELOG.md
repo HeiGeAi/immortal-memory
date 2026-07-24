@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.1
+
+- Move private identity aliases and categories out of public source code into local configuration, and make owner-only defaults work for every installation.
+- Restore correct person extraction, relationship indexing, and quality scoring after sanitized public-code installation.
+- Snapshot registered Claude Web and ChatGPT exports into the private vault so macOS background jobs can read them reliably.
+- Support explicit GitHub `owner/repository` registration without scanning protected local directories.
+- Show explicitly registered GitHub repositories as enabled and healthy in the control center even when no local checkout path is configured.
+- Retry transient GitHub and Feishu network failures and persist bounded, secret-redacted error details.
+- Treat restricted chats, missing meeting notes, deleted minute resources, and unavailable recordings as visible access-boundary skips instead of system failures.
+- Prefer fresh Feishu collector state over stale orchestrator status in automatic feedback.
+
 ## 1.3.0
 
 - Add explicit, disabled-by-default imports for Git commit history, GitHub pull requests and issues, Claude Web exports, ChatGPT exports, and Cursor transcripts.

@@ -133,7 +133,9 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
                 ),
             )
             latest_json = Path(tmp) / "latest-context.json"
-            with mock.patch.object(agent_bridge.subprocess, "run", side_effect=timeout), \
+            with mock.patch.object(
+                agent_bridge, "_authoritative_runtime_available", return_value=False
+            ), mock.patch.object(agent_bridge.subprocess, "run", side_effect=timeout), \
                  mock.patch.object(agent_bridge, "LATEST_CONTEXT_JSON", latest_json):
                 code = agent_bridge.command_context(args)
 

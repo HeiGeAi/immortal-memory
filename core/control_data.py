@@ -451,7 +451,13 @@ class ControlData:
                     ("cursor", "cursor", "Cursor 导出"),
                 )
                 for configured in [external_config.get(kind) if isinstance(external_config.get(kind), dict) else {}]
-                for enabled in [bool(configured.get("enabled") and configured.get("paths"))]
+                for enabled in [bool(
+                    configured.get("enabled")
+                    and (
+                        configured.get("paths")
+                        or (kind == "github" and configured.get("repositories"))
+                    )
+                )]
                 for result in [external_results.get(kind) if isinstance(external_results.get(kind), dict) else {}]
             ],
             {
