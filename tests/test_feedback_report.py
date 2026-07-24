@@ -82,6 +82,19 @@ class BuildReportTest(unittest.TestCase):
             report = feedback_report.build_report(vault, run_status=0)
             self.assertEqual(report["status"], "partial")
 
+    def test_fresh_feishu_success_overrides_stale_orchestrator_partial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = make_vault(tmp)
+            state_path = vault / "orchestrator_state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["last_feishu_status"] = "partial"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            report = feedback_report.build_report(vault, run_status=0)
+
+            self.assertEqual(report["status"], "ok")
+            self.assertEqual(report["feishu"]["last_status"], "ok")
+
 
 class MainExitCodeTest(unittest.TestCase):
     def _main(self, vault: Path, argv_extra: list[str]) -> int:

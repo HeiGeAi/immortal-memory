@@ -80,6 +80,34 @@ CONFIRMED_IDENTITY_RULES = [
     },
 ]
 
+if people_layer.IDENTITY_RULES:
+    CONFIRMED_IDENTITY_RULES = []
+    for configured_rule in people_layer.IDENTITY_RULES:
+        rule = {
+            "id": str(configured_rule.get("id") or configured_rule["canonical"]),
+            "canonical": str(configured_rule["canonical"]),
+            "aliases": list(configured_rule.get("aliases") or []),
+            "must_exist": bool(configured_rule.get("must_exist", True)),
+        }
+        category = str(configured_rule.get("category") or "")
+        if category == "self":
+            rule["expected_category"] = "self"
+        elif category:
+            rule["expected_not_category"] = "self"
+        CONFIRMED_IDENTITY_RULES.append(rule)
+    SHUSHU_CANONICAL = next(
+        (str(rule["canonical"]) for rule in people_layer.IDENTITY_RULES if rule.get("id") == "shushu"),
+        SHUSHU_CANONICAL,
+    )
+else:
+    CONFIRMED_IDENTITY_RULES = [{
+        "id": "user",
+        "canonical": USER_CANONICAL,
+        "aliases": sorted(people_layer.USER_ALIASES),
+        "expected_category": "self",
+        "must_exist": True,
+    }]
+
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 STATUS_LABELS = {
     "ok": "可用",
@@ -398,11 +426,13 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
     mama_misses = []
     bibi_brand_hits = []
     contamination_hits = []
+    owner_rule = next((rule for rule in people_layer.IDENTITY_RULES if rule.get("id") == "user"), {})
+    owner_text_aliases = owner_rule.get("quality_text_aliases") or people_layer.USER_ALIASES
     for row in rows:
         text = row_text(row)
         canonical_people = people_layer.row_people(row)
         raw_people = [str(person).strip().lstrip("@") for person in row.get("people") or []]
-        if "用户本人" in text and USER_CANONICAL not in canonical_people:
+        if any(str(alias) in text for alias in owner_text_aliases) and USER_CANONICAL not in canonical_people:
             user_alias_misses.append(row_sample(row))
         if people_layer.MAMA_ROLE_RE.search(text) and MAMA_CANONICAL not in canonical_people:
             mama_misses.append(row_sample(row))
@@ -427,11 +457,11 @@ def check_identity_rules(people: list[dict[str, Any]], rows: list[dict[str, Any]
     if user_alias_misses:
         make_issue(
             issues,
-            issue_id="user_alias_extraction_miss:xujiang",
+            issue_id="user_alias_extraction_miss:owner",
             area="identity",
             severity="medium",
             title="用户本人别名可能漏抽取",
-            detail=f"发现 {len(user_alias_misses)} 条文本包含“用户本人”，但人物字段没有归到用户本人。",
+            detail=f"发现 {len(user_alias_misses)} 条文本包含用户别名，但人物字段没有归到用户本人。",
             suggested_action="补强 Feishu 蒸馏层人物抽取词表，或在 people_index row_people 中兜底识别。",
             evidence=user_alias_misses[:6],
         )

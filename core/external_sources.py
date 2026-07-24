@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 from datetime import datetime, timezone
@@ -32,9 +33,24 @@ def iso_utc(value: Any = None) -> str:
 def register_source(settings: dict[str, Any], kind: str, path: str | Path) -> dict[str, Any]:
     if kind not in SUPPORTED_KINDS:
         raise ValueError(f"unsupported source kind: {kind}")
+    raw = str(path).strip()
+    if kind == "github" and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", raw):
+        source = settings.setdefault("external_sources", {}).setdefault(kind, {})
+        repositories = [str(item).strip() for item in source.get("repositories") or [] if str(item).strip()]
+        if raw not in repositories:
+            repositories.append(raw)
+        source.update({"enabled": True, "repositories": repositories})
+        return settings
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
         raise ValueError(f"source path does not exist: {resolved}")
+    if kind in {"claude-web", "chatgpt"} and resolved.is_file():
+        vault = Path(str(settings.get("vault_dir") or Path.home() / ".immortal")).expanduser()
+        import_dir = vault / "imports" / kind
+        import_dir.mkdir(parents=True, exist_ok=True)
+        imported = import_dir / resolved.name
+        shutil.copy2(resolved, imported)
+        resolved = imported.resolve()
     source = settings.setdefault("external_sources", {}).setdefault(kind, {})
     paths = [str(Path(item).expanduser().resolve()) for item in source.get("paths") or []]
     if str(resolved) not in paths:
@@ -44,6 +60,13 @@ def register_source(settings: dict[str, Any], kind: str, path: str | Path) -> di
 
 
 def unregister_source(settings: dict[str, Any], kind: str, path: str | Path) -> dict[str, Any]:
+    raw = str(path).strip()
+    if kind == "github" and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", raw):
+        external = settings.get("external_sources") if isinstance(settings.get("external_sources"), dict) else {}
+        source = external.get(kind) if isinstance(external.get(kind), dict) else {}
+        source["repositories"] = [item for item in source.get("repositories") or [] if str(item) != raw]
+        source["enabled"] = bool(source.get("paths") or source.get("repositories"))
+        return settings
     resolved = str(Path(path).expanduser().resolve())
     external = settings.get("external_sources") if isinstance(settings.get("external_sources"), dict) else {}
     source = external.get(kind) if isinstance(external.get(kind), dict) else {}
@@ -51,7 +74,7 @@ def unregister_source(settings: dict[str, Any], kind: str, path: str | Path) -> 
         item for item in source.get("paths") or []
         if str(Path(item).expanduser().resolve()) != resolved
     ]
-    source["enabled"] = bool(source["paths"])
+    source["enabled"] = bool(source["paths"] or source.get("repositories"))
     return settings
 
 
@@ -189,25 +212,39 @@ def _github_remote(repo: Path) -> str:
     return github_slug_from_remote(result.stdout) if result.returncode == 0 else ""
 
 
-def _gh_list(repository: str, kind: str, limit: int) -> tuple[list[dict[str, Any]], bool]:
+def _gh_list_with_error(repository: str, kind: str, limit: int) -> tuple[list[dict[str, Any]], bool, dict[str, str] | None]:
     command = "pr" if kind == "pull-request" else "issue"
     fields = "number,title,body,state,createdAt,updatedAt,url"
-    try:
-        result = subprocess.run(
-            ["gh", command, "list", "--repo", repository, "--state", "all", "--limit", str(limit), "--json", fields],
-            text=True, capture_output=True, timeout=90,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return [], False
-    if result.returncode:
-        if kind == "issue" and "disabled issues" in result.stderr.lower():
-            return [], True
-        return [], False
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return [], False
-    return (data if isinstance(data, list) else []), True
+    last_error: dict[str, str] | None = None
+    for _attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["gh", command, "list", "--repo", repository, "--state", "all", "--limit", str(limit), "--json", fields],
+                text=True, capture_output=True, timeout=90,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = {"error_type": type(exc).__name__, "message": str(redact_tree(str(exc)))[:240]}
+            continue
+        if result.returncode:
+            if kind == "issue" and "disabled issues" in result.stderr.lower():
+                return [], True, None
+            last_error = {
+                "error_type": "gh_command_failed",
+                "message": str(redact_tree(result.stderr.strip() or f"exit {result.returncode}"))[:240],
+            }
+            continue
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            last_error = {"error_type": "JSONDecodeError", "message": str(exc)[:240]}
+            continue
+        return (data if isinstance(data, list) else []), True, None
+    return [], False, last_error
+
+
+def _gh_list(repository: str, kind: str, limit: int) -> tuple[list[dict[str, Any]], bool]:
+    items, ok, _error = _gh_list_with_error(repository, kind, limit)
+    return items, ok
 
 
 def github_items_to_records(repository: str, kind: str, items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -228,24 +265,33 @@ def github_items_to_records(repository: str, kind: str, items: Iterable[dict[str
     return records
 
 
-def collect_github_history(vault: str | Path, roots: Iterable[str | Path], *, max_items: int = 50) -> dict[str, Any]:
-    repositories: set[Path] = set()
+def collect_github_history(
+    vault: str | Path,
+    roots: Iterable[str | Path],
+    *,
+    repositories: Iterable[str] = (),
+    max_items: int = 50,
+) -> dict[str, Any]:
+    local_repositories: set[Path] = set()
     for root in roots:
-        repositories.update(discover_git_repositories(root))
-    records, errors, count = [], 0, 0
-    for repo in sorted(repositories):
+        local_repositories.update(discover_git_repositories(root))
+    slugs = {str(value).strip() for value in repositories if str(value).strip()}
+    for repo in sorted(local_repositories):
         slug = _github_remote(repo)
-        if not slug:
-            continue
-        count += 1
+        if slug:
+            slugs.add(slug)
+    records, errors, error_details = [], 0, []
+    for slug in sorted(slugs):
         for kind in ("pull-request", "issue"):
-            items, ok = _gh_list(slug, kind, max(1, int(max_items)))
+            items, ok, error = _gh_list_with_error(slug, kind, max(1, int(max_items)))
             if ok:
                 records.extend(github_items_to_records(slug, kind, items))
             else:
                 errors += 1
-    return {"repositories": count, "records_written": _collect_records(Path(vault).expanduser(), records),
-            "status": "partial" if errors else "success", "error_count": errors}
+                error_details.append({"repository": slug, "kind": kind, **(error or {})})
+    return {"repositories": len(slugs), "records_written": _collect_records(Path(vault).expanduser(), records),
+            "status": "partial" if errors else "success", "error_count": errors,
+            "errors": error_details}
 
 
 def parse_chatgpt_export(path: str | Path) -> list[dict[str, Any]]:
@@ -355,21 +401,35 @@ def collect_registered_sources(settings: dict[str, Any], vault: str | Path) -> d
         ("github", collect_github_history, "max_items", 50),
     ):
         source = external.get(kind) if isinstance(external.get(kind), dict) else {}
-        result[kind] = collector(vault_path, source.get("paths") or [], **{limit_key: int(source.get(limit_key) or default)}) \
-            if source.get("enabled") and source.get("paths") else {"repositories": 0, "records_written": 0, "status": "disabled"}
+        enabled = bool(source.get("enabled"))
+        paths = source.get("paths") or []
+        registered_repositories = (source.get("repositories") or []) if kind == "github" else []
+        if not enabled or (not paths and not registered_repositories):
+            result[kind] = {"repositories": 0, "records_written": 0, "status": "disabled"}
+            continue
+        kwargs = {limit_key: int(source.get(limit_key) or default)}
+        if kind == "github":
+            kwargs["repositories"] = registered_repositories
+        result[kind] = collector(vault_path, paths, **kwargs)
     for kind, parser in (("claude-web", parse_claude_web_export), ("chatgpt", parse_chatgpt_export), ("cursor", parse_cursor_export)):
         source = external.get(kind) if isinstance(external.get(kind), dict) else {}
         if not source.get("enabled") or not source.get("paths"):
             result[kind] = {"files": 0, "records_written": 0, "status": "disabled"}
             continue
-        files, records, errors = _registered_files(source, kind), [], 0
+        files, records, errors, error_details = _registered_files(source, kind), [], 0, []
         for path in files:
             try:
                 records.extend(parser(path))
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
                 errors += 1
+                error_details.append({
+                    "file": path.name,
+                    "error_type": type(exc).__name__,
+                    "message": str(redact_tree(str(exc)))[:240],
+                })
         result[kind] = {"files": len(files), "records_written": _collect_records(vault_path, records),
-                        "status": "partial" if errors else "success", "error_count": errors}
+                        "status": "partial" if errors else "success", "error_count": errors,
+                        "errors": error_details}
     state_dir = vault_path / "external_sources"
     state_dir.mkdir(parents=True, exist_ok=True)
     temporary = state_dir / "state.json.tmp"

@@ -109,8 +109,8 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
         "collect_count": state.get("collect_count"),
     }
     feishu = {
-        "last_collect": state.get("last_feishu_collect"),
-        "last_status": state.get("last_feishu_status"),
+        "last_collect": feishu_state.get("last_run_at") or state.get("last_feishu_collect"),
+        "last_status": ("partial" if feishu_errors else "ok") if feishu_fresh else state.get("last_feishu_status"),
         "last_clean": state.get("last_feishu_clean"),
         "last_distill": state.get("last_feishu_distill"),
         "source_errors": len(feishu_errors),
@@ -130,7 +130,7 @@ def build_report(vault: Path, run_status: int | None = None) -> dict[str, Any]:
     elif current_errors:
         status = "failed"
         status_label = "存在错误"
-    elif run_status == 2 or feishu_errors or str(state.get("last_feishu_status") or "") == "partial":
+    elif run_status == 2 or feishu_errors or str(feishu.get("last_status") or "") == "partial":
         status = "partial"
         status_label = "部分成功"
     elif quality_status == "attention" or issue_count > 0 or stale_inputs:

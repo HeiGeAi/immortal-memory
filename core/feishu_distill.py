@@ -158,6 +158,38 @@ PEOPLE_TERMS = [
 ]
 MAMA_ROLE_RE = re.compile(r"@?协作者庚\s*协作者庚|@?协作者庚")
 
+
+def load_configured_people_terms() -> tuple[list[str], dict[str, dict[str, Any]]]:
+    if load_config is None:
+        return PEOPLE_TERMS, {}
+    try:
+        config = load_config()
+    except Exception:
+        return PEOPLE_TERMS, {}
+    section = config.get("people_index") if isinstance(config.get("people_index"), dict) else {}
+    identity_rows = section.get("identities") if isinstance(section.get("identities"), list) else []
+    identities = {
+        str(row.get("id") or ""): row
+        for row in identity_rows
+        if isinstance(row, dict) and row.get("canonical")
+    }
+    configured: list[str] = []
+    for row in identity_rows:
+        if not isinstance(row, dict):
+            continue
+        configured.extend(str(value).strip() for value in row.get("aliases") or [] if str(value).strip())
+    configured.extend(str(value).strip() for value in (section.get("categories") or {}) if str(value).strip())
+    distill = config.get("distill") if isinstance(config.get("distill"), dict) else {}
+    configured.extend(str(value).strip() for value in distill.get("people") or [] if str(value).strip())
+    return list(dict.fromkeys([*configured, *PEOPLE_TERMS])), identities
+
+
+PEOPLE_TERMS, CONFIGURED_IDENTITIES = load_configured_people_terms()
+_configured_mama = CONFIGURED_IDENTITIES.get("mama") or {}
+_configured_mama_aliases = _configured_mama.get("role_aliases") or _configured_mama.get("aliases") or []
+if _configured_mama_aliases:
+    MAMA_ROLE_RE = re.compile("|".join(re.escape(str(value)) for value in _configured_mama_aliases if str(value)))
+
 DECISION_TERMS = ["决定", "明确", "拍板", "采用", "选用", "不再", "转向", "统一", "收口", "替代"]
 PREFERENCE_TERMS = ["原则", "最高原则", "要求", "必须", "不要", "不能", "优先", "规范", "标准", "偏好"]
 COMMITMENT_TERMS = ["待办", "跟进", "完成", "推进", "下周", "本周", "明天", "后续", "尽快", "负责", "配合"]
@@ -165,7 +197,7 @@ LESSON_TERMS = ["复盘", "教训", "经验", "根因", "问题", "卡点", "解
 RELATION_TERMS = ["客户", "对接", "主导", "承接", "配合", "负责人", "服务群", "售前", "交付方"]
 
 JUNK_TASK_RE = re.compile(r"^(123123|测试|写明具体任务，，|填写下一步任务，，|填写具体的执行计划，，|剪辑|来自会话：)")
-USER_ALIAS_RE = re.compile(r"(用户本人|用户本人|Owner|用户本人)")
+USER_ALIAS_RE = re.compile("|".join(re.escape(value) for value in OWNER_ALIASES if value))
 BIBI_ACCOUNT_TITLE_RE = re.compile(r"(内容创作者A的正确使用方式|内容账号A ·|三篇Claude Code对标文章审稿报告|内容账号A.*审稿|内容账号A.*文风)")
 BIBI_ACCOUNT_STATEMENT_RE = re.compile(
     r"(内容账号A.*(内容特色|文风|选题|标题技巧|粉丝IP)|"

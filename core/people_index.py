@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from config import load_config, owner_aliases, owner_display_name
+
 
 HOME = Path.home()
 IMMORTAL_DIR = HOME / ".immortal"
@@ -181,6 +183,73 @@ CATEGORY_BY_NAME = {
     BIBI_CANONICAL: "business",
     "协作者寅": "other",
 }
+
+
+def _configured_identity_rules() -> list[dict[str, Any]]:
+    """Load private identity bindings without placing them in public code."""
+    config = load_config()
+    section = config.get("people_index") if isinstance(config.get("people_index"), dict) else {}
+    rows = section.get("identities") if isinstance(section.get("identities"), list) else []
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        canonical = str(row.get("canonical") or "").strip()
+        aliases = [str(value).strip() for value in row.get("aliases") or [] if str(value).strip()]
+        if canonical:
+            result.append({**row, "canonical": canonical, "aliases": list(dict.fromkeys(aliases))})
+    return result
+
+
+IDENTITY_RULES = _configured_identity_rules()
+_IDENTITY_BY_ID = {str(row.get("id") or ""): row for row in IDENTITY_RULES}
+_RUNTIME_CONFIG = load_config()
+_OWNER_RULE = _IDENTITY_BY_ID.get("user") or {}
+_configured_owner = str(_OWNER_RULE.get("canonical") or owner_display_name(_RUNTIME_CONFIG)).strip()
+if _configured_owner and _configured_owner != "the configured user":
+    USER_CANONICAL = _configured_owner
+    USER_ALIASES = set(_OWNER_RULE.get("aliases") or owner_aliases(_RUNTIME_CONFIG))
+    CANONICAL_ALIASES[USER_CANONICAL] = list(dict.fromkeys([USER_CANONICAL, *sorted(USER_ALIASES)]))
+    for _owner_alias in CANONICAL_ALIASES[USER_CANONICAL]:
+        ALIASES[_owner_alias] = USER_CANONICAL
+    CATEGORY_BY_NAME[USER_CANONICAL] = "self"
+
+for _identity_id, _constant_name in (("bibi", "BIBI_CANONICAL"), ("taozi", "TAOZI_CANONICAL"), ("mama", "MAMA_CANONICAL")):
+    _rule = _IDENTITY_BY_ID.get(_identity_id) or {}
+    if _rule.get("canonical"):
+        globals()[_constant_name] = str(_rule["canonical"])
+
+for _rule in IDENTITY_RULES:
+    _canonical = str(_rule["canonical"])
+    _aliases = list(dict.fromkeys([_canonical, *(_rule.get("aliases") or [])]))
+    CANONICAL_ALIASES[_canonical] = _aliases
+    for _alias in _aliases:
+        ALIASES[_alias] = _canonical
+    if _rule.get("category"):
+        CATEGORY_BY_NAME[_canonical] = str(_rule["category"])
+
+_people_section = _RUNTIME_CONFIG.get("people_index") if isinstance(_RUNTIME_CONFIG.get("people_index"), dict) else {}
+for _name, _category in (_people_section.get("categories") or {}).items():
+    if str(_category) in {"self", "team", "business", "customer", "other"}:
+        CATEGORY_BY_NAME[canonical_name(str(_name)) if "canonical_name" in globals() else ALIASES.get(str(_name), str(_name))] = str(_category)
+
+_mama_rule = _IDENTITY_BY_ID.get("mama") or {}
+_mama_text_aliases = _mama_rule.get("role_aliases") or _mama_rule.get("aliases") or []
+if _mama_text_aliases:
+    MAMA_ROLE_RE = re.compile("|".join(re.escape(str(value)) for value in _mama_text_aliases if str(value)))
+
+_bibi_rule = _IDENTITY_BY_ID.get("bibi") or {}
+_brand_aliases = [str(value) for value in _bibi_rule.get("brand_aliases") or [] if str(value)]
+_person_aliases = [str(value) for value in _bibi_rule.get("person_aliases") or [] if str(value)]
+if _brand_aliases:
+    _brand = "(?:" + "|".join(re.escape(value) for value in _brand_aliases) + ")"
+    BIBI_BRAND_CONTEXT_RE = re.compile(
+        rf"({_brand}[-—_ ]?(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP)|"
+        rf"(账号|品牌|公众号|栏目|文章|视频|内容|矩阵|社群|方案|案例|业务|客户|平台|IP).{{0,8}}{_brand})"
+    )
+if _person_aliases:
+    _person = "(?:" + "|".join(re.escape(value) for value in _person_aliases) + ")"
+    BIBI_PERSON_CONTEXT_RE = re.compile(rf"({_person}(说|认为|负责|提醒|组织|审稿|反馈|要求|提到|提出|明确|提供|赋能|协助|主导|@)|@{_person})")
 
 CATEGORY_LABELS = {
     "self": "用户本人",
@@ -368,6 +437,11 @@ def row_people(row: dict[str, Any]) -> list[str]:
             output.append(MAMA_CANONICAL)
     if "用户本人" in row_text and USER_CANONICAL not in output:
         output.append(USER_CANONICAL)
+    for identity in IDENTITY_RULES:
+        canonical = str(identity.get("canonical") or "")
+        text_aliases = [str(value) for value in identity.get("text_aliases") or [] if str(value)]
+        if canonical and text_aliases and any(alias in row_text for alias in text_aliases) and canonical not in output:
+            output.append(canonical)
     return output
 
 
