@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.3.0-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.3.1-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -118,8 +118,8 @@ v1.3 支持五类显式登记的外部来源。全部默认关闭，只有你登
 # 本地 Git 提交历史，只读取提交元数据和提交说明，不读取代码正文
 immortal-memory source register git "/absolute/path/to/projects"
 
-# GitHub PR 和 Issue，只读调用本机已登录的 gh CLI
-immortal-memory source register github "/absolute/path/to/projects"
+# GitHub PR 和 Issue，直接登记 owner/repository，不依赖后台扫描 Documents
+immortal-memory source register github "owner/repository"
 
 # 官方导出的对话文件或 Cursor transcript 目录
 immortal-memory source register claude-web "/absolute/path/to/conversations.json"
@@ -130,6 +130,8 @@ immortal-memory source register cursor "/absolute/path/to/cursor/agent-transcrip
 immortal-memory source list --json
 immortal-memory source collect --json
 ```
+
+单文件的 Claude Web 和 ChatGPT 导出在登记时会复制到 `~/.immortal/imports/`，避免 macOS LaunchAgent 无法读取 Downloads 的权限差异。GitHub 建议直接登记仓库名；只有确实需要本地未推送 commit 时，才登记本地 Git 目录。
 
 每条记录在写入前都会做凭证形态脱敏，并用本地 SQLite 状态去重。每日编排会自动调用已启用来源。控制台只展示来源健康、更新时间、新增数和错误数，不展示本机私有路径。飞书邮件继续保持显式授权，不会因为安装产品而自动采集。
 
@@ -242,7 +244,7 @@ immortal-memory agent-context "release acceptance" --print
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.0-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.1-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke
