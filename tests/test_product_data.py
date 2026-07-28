@@ -467,6 +467,12 @@ def test_home_leads_with_memory_value_not_machine_metrics(tmp_path):
         "latest_outcome",
     ]
     assert home["system_health"]["status"] == "healthy"
+    assert home["confirmation_summary"] == {
+        "total": 2,
+        "claims": 1,
+        "judgments": 1,
+        "visible": 2,
+    }
     assert center.calls == 1
     assert "private-token" not in json.dumps(home)
 
@@ -727,6 +733,8 @@ def test_trust_surfaces_bounded_evidence_gaps_privacy_and_candidates(tmp_path):
     data, _control, _center = seeded_product_data(tmp_path)
     trust = data.trust()
     assert trust["summary"]["needs_confirmation"] >= 2
+    assert trust["summary"]["candidate_claims"] == 1
+    assert trust["summary"]["candidate_judgments"] == 1
     kinds = {item["kind"] for item in trust["items"]}
     assert {"missing_evidence", "low_confidence", "privacy_exclusion"} <= kinds
     assert len(trust["items"]) <= 50

@@ -63,6 +63,8 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     const newest = remembered[0] || {};
     const counts = data.understanding_changes?.counts || {};
     const confirmations = Array.isArray(data.needs_confirmation) ? data.needs_confirmation : [];
+    const confirmationTotal = Number(data.confirmation_summary?.total);
+    const safeConfirmationTotal = Number.isFinite(confirmationTotal) ? Math.max(0, confirmationTotal) : confirmations.length;
     const context = data.latest_context_use || {};
     const outcome = data.latest_outcome || {};
     const health = data.system_health || {};
@@ -75,7 +77,13 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     };
     fact("今日记忆", String(remembered.length), newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录");
     fact("理解变化", String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)), `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`);
-    fact("待确认", String(confirmations.length), confirmations[0]?.summary || "没有待确认项目");
+    fact(
+      "待确认",
+      String(safeConfirmationTotal),
+      safeConfirmationTotal > confirmations.length
+        ? `当前展示 ${confirmations.length} 条，逐条处理后继续加载`
+        : confirmations[0]?.summary || "没有待确认项目",
+    );
     fact("最近 Context", context.context_id ? "已使用" : "无", context.task || context.goal || context.context_id || "暂无已使用 Context");
     fact("最近 Outcome", outcome.outcome_id ? "已记录" : "无", outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果");
     fact("系统连续性", health.status_label || health.status || "未知", `版本 ${health.version || "未知"} · 关注项 ${health.attention_count ?? "未知"}`);

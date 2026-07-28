@@ -13,9 +13,10 @@ An adapter should only answer three questions:
 ## Universal Handoff
 
 ```text
-Read ~/.immortal/agent/ENTRY.md first. Then run:
-immortal-memory agent-context "<current task>" --print
-Use the returned context as task-local memory. Do not read the raw vault by default.
+Read ~/.immortal/agent/ENTRY.md first. Run agent-context with an explicit mode
+to create a preview. Review context_json, then compile the same task with
+--preview-id and --preview-hash. Continue only when lifecycle_status=compiled.
+Do not read the raw vault by default.
 ```
 
 ## Codex
@@ -53,9 +54,9 @@ Optional global instruction snippet:
 
 ```text
 When a task depends on my personal preferences, history, writing style, project
-judgment, relationships, or long-term memory, run:
-immortal-memory agent-context "<current task>" --print
-Then continue using the returned context. Do not read the raw vault by default.
+judgment, relationships, or long-term memory, preview with an explicit mode.
+Review context_json, then compile with --preview-id and --preview-hash.
+Continue only when lifecycle_status=compiled. Do not read the raw vault.
 ```
 
 ## Generic Local Agent
@@ -64,11 +65,11 @@ Any local agent with shell access can call:
 
 ```bash
 immortal-memory agent-entry
-immortal-memory agent-context "current task" --print
+immortal-memory agent-context "current task" --mode reviewer
 immortal-memory recall "topic"
 ```
 
-## Future HTTP / MCP Mode
+## HTTP / MCP Mode
 
 The same bridge can be exposed as a local server:
 

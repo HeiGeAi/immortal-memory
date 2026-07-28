@@ -301,6 +301,10 @@ def test_agent_backup_and_diagnostic_routes_use_controlled_actions(tmp_path):
         diagnostic_status, diagnostics = get_json(base + "/api/v1/diagnostics")
         context_status, context_job = post(
             base + "/api/v1/agent/contexts",
+            {"goal": "prepare customer plan", "mode": "reviewer"},
+        )
+        invalid_mode_status, invalid_mode = post(
+            base + "/api/v1/agent/contexts",
             {"goal": "prepare customer plan", "mode": "plan"},
         )
         injection_status, injection = post(
@@ -321,9 +325,45 @@ def test_agent_backup_and_diagnostic_routes_use_controlled_actions(tmp_path):
     assert diagnostics["listen_address"] == "127.0.0.1"
     assert context_status == 202
     assert context_job["kind"] == "session"
+    assert invalid_mode_status == 400
+    assert invalid_mode["error"]["code"] == "invalid_request"
     assert injection_status == 400
     assert injection["error"]["code"] == "invalid_request"
     assert verify_status == 202
     assert verify_job["kind"] == "backup_verify"
     assert restore_status == 404
     assert restore["error"]["code"] == "not_found"
+
+
+def test_agent_capability_modes_match_executable_factory_modes(tmp_path):
+    server, base = start_server(tmp_path)
+    try:
+        status, agent = get_json(base + "/api/v1/agent")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert agent["supported_actions"][0]["modes"] == [
+        "auto",
+        "advisor",
+        "writer",
+        "reviewer",
+        "business",
+        "project",
+        "custom",
+    ]
+
+
+def test_control_center_context_options_use_executable_modes(tmp_path):
+    server, base = start_server(tmp_path)
+    try:
+        status, _, body = get(base + "/control-center")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    page = body.decode("utf-8")
+    assert 'option value="reviewer"' in page
+    assert 'option value="plan"' not in page

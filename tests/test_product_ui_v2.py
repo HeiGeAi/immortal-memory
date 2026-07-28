@@ -207,6 +207,8 @@ def test_home_ui_can_confirm_or_reject_candidate_claims():
     assert 'reviewClaim(item, "reject"' in home
     assert "expected_version: item.revision" in home
     assert "createMutationAttempt" in home
+    assert "confirmation_summary?.total" in home
+    assert "当前展示" in home
 
 
 def test_judgment_and_trust_are_real_and_coverage_honest():
@@ -218,6 +220,11 @@ def test_judgment_and_trust_are_real_and_coverage_honest():
     assert "/api/v2/trust" in trust
     for state in ("complete", "partial", "unknown", "truncated"):
         assert state in trust
+    assert 'document.createElement("details")' in trust
+    assert "审核候选理解" in trust
+    assert 'navigate("home")' in trust
+    assert "审核候选判断" in trust
+    assert 'navigate("judgments")' in trust
     assert "window.confirm" not in judgments
     assert "innerHTML" not in judgments
     assert "innerHTML" not in trust

@@ -1526,6 +1526,7 @@ class ProductData:
             for row in claims
             if row.get("status") == "candidate"
         ]
+        candidate_claim_count = len(confirmations)
         confirmations.extend(
             {
                 "kind": "judgment",
@@ -1537,6 +1538,7 @@ class ProductData:
             for row in judgments
             if row.get("status") == "candidate"
         )
+        candidate_judgment_count = len(confirmations) - candidate_claim_count
         used_contexts = [
             row
             for row in self._context_rows()
@@ -1581,6 +1583,12 @@ class ProductData:
                 "status_label": _compact_text(snapshot.get("status_label"), 80),
                 "version": _compact_text(snapshot.get("version"), 40),
                 "attention_count": len(snapshot.get("attention") or []),
+            },
+            "confirmation_summary": {
+                "total": len(confirmations),
+                "claims": candidate_claim_count,
+                "judgments": candidate_judgment_count,
+                "visible": min(len(confirmations), 8),
             },
         }
 
@@ -1736,6 +1744,8 @@ class ProductData:
         return {
             "summary": {
                 "needs_confirmation": candidate_claims + candidate_judgments,
+                "candidate_claims": candidate_claims,
+                "candidate_judgments": candidate_judgments,
                 "low_confidence": categories["low_confidence"]["count"],
                 "privacy_exclusions": categories["privacy_exclusion"]["count"],
             },
