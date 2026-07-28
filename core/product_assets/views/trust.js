@@ -11,6 +11,7 @@ const CATEGORY_LABELS = {
   privacy_exclusion: "隐私策略排除",
   recent_correction: "最近纠正或替换",
   model_evaluation: "自我模型评估",
+  failed_outcome: "任务结果提出复核",
 };
 
 const COVERAGE_LABELS = {
@@ -98,6 +99,7 @@ export async function renderTrust(root, { signal, isCurrent, navigate }) {
     fact("等待确认", data.summary?.needs_confirmation, "候选理解与候选判断的合计");
     fact("低置信度", data.summary?.low_confidence, "证据强度不足，需要谨慎使用");
     fact("隐私排除", data.summary?.privacy_exclusions, "按隐私规则未进入上下文的项目");
+    fact("结果复核", data.summary?.challenged_memories, "实际任务结果挑战过的记忆，等待人工核对");
     fragment.append(summary);
     const reviewActions = document.createElement("div");
     reviewActions.className = "honest-actions";

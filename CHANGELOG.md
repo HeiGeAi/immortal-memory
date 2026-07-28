@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.3
+
+- Let users bind confirmed and challenged memory references when recording a real Context outcome.
+- Surface challenged memory references in the Trust ledger as review signals without automatically mutating Claim or Judgment authority.
+- Show the confirmed and challenged reference counts on recorded Context outcomes.
+
 ## 1.3.2
 
 - Make the top-level `agent-context` command support the complete preview and compile lifecycle instead of returning preview-only output.

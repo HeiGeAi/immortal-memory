@@ -198,6 +198,11 @@ def test_use_ui_has_preview_compile_consume_and_outcome_states():
     assert "navigator.clipboard.writeText" in page
     assert "已复制，尚未标记为已交给 Agent" in page
     assert "标记为已交给 Agent" in page
+    assert "这条记忆实际表现如何" in page
+    assert "confirmed_refs" in page
+    assert "challenged_refs" in page
+    assert "标记为需复核" in page
+    assert "支持 ${confirmed} 条，需复核 ${challenged} 条" in page
 
 
 def test_home_ui_can_confirm_or_reject_candidate_claims():
@@ -218,6 +223,8 @@ def test_judgment_and_trust_are_real_and_coverage_honest():
     assert "/actions" in judgments
     assert "revision" in judgments
     assert "/api/v2/trust" in trust
+    assert "任务结果提出复核" in trust
+    assert "challenged_memories" in trust
     for state in ("complete", "partial", "unknown", "truncated"):
         assert state in trust
     assert 'document.createElement("details")' in trust

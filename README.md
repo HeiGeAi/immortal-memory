@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.3.2-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.3.3-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -268,7 +268,7 @@ immortal-memory agent-context "release acceptance" --mode reviewer
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.2-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.3-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke

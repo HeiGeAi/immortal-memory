@@ -1596,6 +1596,7 @@ class ProductData:
         claims = self._claims()
         judgments = self._judgment_rows()
         contexts = self._context_rows()
+        outcomes = self._outcomes()
         category_coverage = {
             "unknown_speaker": "complete",
             "other_view_candidate": "complete",
@@ -1607,6 +1608,7 @@ class ProductData:
             "privacy_exclusion": "complete",
             "recent_correction": "partial",
             "model_evaluation": "partial",
+            "failed_outcome": "complete",
         }
         category_items = {key: {} for key in category_coverage}
 
@@ -1684,6 +1686,23 @@ class ProductData:
                     "上下文包含按隐私策略排除的项目",
                     "info",
                 )
+        for outcome in outcomes:
+            summary = _compact_text(outcome.get("summary"), 180) or "任务结果对这条记忆提出了挑战"
+            for ref in outcome.get("challenged_refs") or []:
+                if not isinstance(ref, Mapping):
+                    continue
+                add(
+                    "failed_outcome",
+                    str(ref.get("id") or ""),
+                    "%s；%s %s（版本 %s）"
+                    % (
+                        summary,
+                        str(ref.get("kind") or "memory"),
+                        str(ref.get("id") or ""),
+                        str(ref.get("revision") or "未知"),
+                    ),
+                    "attention",
+                )
         try:
             current_self = self.self_model()
         except ProductDataError:
@@ -1748,6 +1767,7 @@ class ProductData:
                 "candidate_judgments": candidate_judgments,
                 "low_confidence": categories["low_confidence"]["count"],
                 "privacy_exclusions": categories["privacy_exclusion"]["count"],
+                "challenged_memories": categories["failed_outcome"]["count"],
             },
             "categories": categories,
             "items": flat_items,
