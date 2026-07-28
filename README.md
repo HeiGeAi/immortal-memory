@@ -1,6 +1,6 @@
 # Immortal Memory · 赛博永生记忆库
 
-> 给本地 AI 一个能长期记住你、并且按你的方式思考的记忆底座。
+> 让 AI 基于证据长期理解你，按任务调用记忆，并把真实结果写回来。
 
 <div align="center">
 
@@ -9,11 +9,24 @@
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
 
-[我为什么做这个](#我为什么做这个) · [快速开始](#快速开始) · [让任何-agent-用上它](#让任何-agent-用上它) · [架构](./docs/ARCHITECTURE.md) · [隐私边界](./docs/PRIVACY.md) · [English](#immortal-memory-english)
+[它能做什么](#它能做什么) · [我为什么做这个](#我为什么做这个) · [快速开始](#快速开始) · [让任何-agent-用上它](#让任何-agent-用上它) · [架构](./docs/ARCHITECTURE.md) · [隐私边界](./docs/PRIVACY.md) · [English](#immortal-memory-english)
 
 </div>
 
 ---
+
+## 它能做什么
+
+Immortal Memory 是运行在你自己电脑上的个人 AI 记忆系统。它把你明确授权的会议、对话、笔记和代码协作痕迹，变成有出处、可纠正、可审核的长期记忆。
+
+对使用者来说，它完成四件事：
+
+1. **自动沉淀**：持续采集已登记来源，自动清洗、去重、脱敏和蒸馏。
+2. **由你确认**：系统只能提出候选理解，未经本人确认的内容不会升级成稳定的「你」。
+3. **按任务调用**：Codex、Claude Code 或其他本地 Agent 先生成 Context 预览，你可以排除内容，再编译实际交付的记忆包。
+4. **结果可追踪**：任务结束后，可以标记哪些记忆有用、哪些需要复核；Trust 账本会展示问题，但不会擅自改写记忆。
+
+对 Agent 来说，它提供同一套 CLI、HTTP 和 MCP 接口，并强制执行「预览、确认、编译、使用、结果」生命周期。Agent 得到的是当前任务需要的有限上下文，不是整座私人记忆库。
 
 ## 我为什么做这个
 
@@ -33,7 +46,7 @@ Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也
 2. **Living Self**：只用已确认 Claim 生成有版本的「当前自我」，旧版本永不原地覆盖。
 3. **Judgment**：保存情境、选择、结果和教训，不把一次选择夸大成永久原则。
 4. **Context**：按当前任务预览并编译有界上下文，用户能看到、排除和确认实际交给 Agent 的内容。
-5. **Outcome**：记录使用结果，让后续判断有真实反馈，而不是只有画像没有闭环。
+5. **Outcome**：记录使用结果和被支持或被挑战的记忆，让 Trust 账本有真实反馈，而不是只有画像没有闭环。
 
 采集、检索和角色编译仍然存在，但它们围绕这五层工作。每次纠正都会保留旧 Claim，写入新的纠正事件，并生成新的 Living Self 版本，因此「系统现在怎么理解你」和「它为什么改变」都能追溯。
 
@@ -87,7 +100,7 @@ Immortal Memory 就是干这件事的本地系统。它不是一句 prompt，也
 
 ## 这个仓库是什么
 
-这是 Immortal Memory 的**公开空壳版**，只有代码、适配器和模板。
+这是 Immortal Memory 的**完整公开核心**，包含可安装的运行代码、Agent 适配器、控制台、测试和模板，但不附带任何人的数据。
 
 它不包含任何人的私人记忆库、聊天记录、文档、生成的画像、角色证据、日志或密钥。这些东西属于你本地的 `~/.immortal/`，永远不进仓库。
 
@@ -151,7 +164,7 @@ immortal-memory agent-factory
 
 然后访问 http://127.0.0.1:8765/
 
-看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack；「信任」解释归因、隐私排除和纠正；「系统」展示采集、索引、备份、服务与版本健康。
+看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack、记录真实结果；「信任」解释归因、隐私排除、纠正和被任务结果挑战的记忆；「系统」展示采集、索引、备份、服务与版本健康。
 
 ### 飞书学习审核提醒
 
@@ -356,7 +369,9 @@ MIT。如果你的项目需要别的协议，发布前自己改掉。
 
 # Immortal Memory (English)
 
-> A local-first memory layer that lets any AI agent remember you over the long run, and reason the way you actually reason.
+> A local-first memory system that gives AI evidence-backed context, user-governed review, and a real outcome feedback loop.
+
+Immortal Memory runs on your own computer. It turns explicitly authorized meetings, conversations, notes, and coding traces into source-linked, correctable, reviewable memory. Agents access a bounded Context through CLI, HTTP, or MCP only after preview and compilation. After a task, users can mark which memories helped and which need review, without allowing the system to rewrite identity or judgment on its own.
 
 ## Why I built this
 
@@ -376,7 +391,7 @@ Immortal Memory is the local system that does exactly that. It is not a prompt, 
 2. **Living Self** builds a versioned current model from confirmed Claims without overwriting history.
 3. **Judgment** preserves situation, choice, result, and lesson without turning one decision into a universal rule.
 4. **Context** previews and compiles a bounded task pack so the user can inspect and exclude what an Agent will receive.
-5. **Outcome** records what happened after use, closing the loop with real feedback.
+5. **Outcome** records what happened after use and which memories were confirmed or challenged, closing the loop with real feedback in the Trust ledger.
 
 Collection, retrieval, and role compilation remain, but now operate around these five layers. A correction preserves the old Claim, appends a correction event, and produces a new Living Self version, so every change remains explainable.
 
@@ -419,7 +434,7 @@ Data stays local by default. Collection scope, identity aliases, account guards,
 
 ## What this repo is
 
-This is the **public empty-shell** distribution: code, adapters, and templates only.
+This is the **complete public core**: installable runtime code, Agent adapters, dashboard, tests, and templates, without anyone's private data.
 
 It contains no private vault, chat records, documents, generated profiles, role evidence, logs, or secrets. Those live in your local `~/.immortal/` and never enter the repository.
 
