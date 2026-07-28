@@ -2,7 +2,7 @@
 
 更新时间：2026-07-28 15:24 CST
 当前本地版本：1.3.3
-本轮层级：本地源码已验证，本机真实安装已验证，GitHub 尚未发布
+本轮层级：本地源码已验证，本机真实安装已验证，GitHub 发布以远端 `v1.3.3` Release 为准
 
 ## 已完成
 
@@ -47,7 +47,7 @@
 - Trust 层有 57 条候选需要本人确认，Living Self 当前已确认条目为 0，Judgment Store 当前为 0。系统不能自行把推断升级为用户身份事实。
 - Claude Desktop 配置已修正，但已运行的 Claude MCP 子进程仍是旧路径。退出并重新打开 Claude Desktop 后才会切换到正式核心；本轮未强杀应用，避免打断正在进行的任务。
 - `MAINTENANCE_FREEZE_DESTRUCTIVE` 仍保留。没有经过恢复演练和外部备份前，不解除破坏性维护冻结。
-- GitHub 公共仓库尚未更新。本轮授权了本地开发，但没有新的公开发布确认，因此不推送、不打标签。
+- GitHub 公开发布已获得明确授权，目标版本为 `v1.3.3`；远端是否完成以 GitHub tag、Release 和 CI 结果为最终证据。
 
 ## 下一步门槛
 
@@ -55,4 +55,4 @@
 2. 在 Trust 看板中人工确认或拒绝候选记忆，生成第一版有依据的 Living Self。
    可先运行 `immortal-memory learning-review` 本地预览；需要本人飞书提醒时，再显式运行 `immortal-memory learning-review --send-feishu --confirm-remote-write`。
 3. 重启 Claude Desktop，验证实际 Claude 会话调用的是正式 MCP 核心。
-4. 用户明确确认公开发布后，再推送 `1.3.3` 并更新 GitHub Release。
+4. 发布后核对 GitHub `v1.3.3` tag、Release、wheel 附件和远端 CI，不把本地推送成功单独当作公开发布完成。
