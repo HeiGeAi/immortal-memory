@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -224,6 +225,202 @@ def test_agent_factory_forwards_explicit_vault_to_dashboard(tmp_path, monkeypatc
         "script": "profile_review.py",
         "args": ["--host", "127.0.0.1", "--port", "0", "--vault-dir", str(vault)],
     }
+
+
+def test_agent_context_forwards_review_lifecycle_arguments(monkeypatch):
+    captured = {}
+
+    def fake_run_script(script, args=None):
+        captured["script"] = script
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(immortal, "run_script", fake_run_script)
+    args = immortal.build_parser().parse_args(
+        [
+            "agent-context",
+            "review task",
+            "--mode",
+            "reviewer",
+            "--preview-id",
+            "prv_one",
+            "--preview-hash",
+            "sha256:" + "1" * 64,
+            "--exclude-item-id",
+            "clm_private",
+            "--ttl-seconds",
+            "600",
+            "--metadata-output",
+            "/tmp/immortal-context.json",
+            "--print",
+        ]
+    )
+
+    assert immortal.command_agent_context(args) == 0
+    assert captured == {
+        "script": "agent_bridge.py",
+        "args": [
+            "context",
+            "review task",
+            "--since",
+            "2026-03-01",
+            "--timeout",
+            "240",
+            "--mode",
+            "reviewer",
+            "--preview-id",
+            "prv_one",
+            "--preview-hash",
+            "sha256:" + "1" * 64,
+            "--exclude-item-id",
+            "clm_private",
+            "--ttl-seconds",
+            "600",
+            "--metadata-output",
+            "/tmp/immortal-context.json",
+            "--print",
+        ],
+    }
+
+
+def test_health_uses_judgment_build_state_not_retired_cards_file(
+    tmp_path, monkeypatch, capsys
+):
+    now = datetime.now(timezone.utc).isoformat()
+    state = {
+        "total_records": 1,
+        "errors": [],
+        "last_obsidian_sync_status": "ok",
+        "last_portable_restore_check_status": "ok",
+        "last_portable_restore_check_files": 1,
+        "last_portable_restore_check_dir": str(tmp_path / "export"),
+    }
+    for key in (
+        "last_collect",
+        "last_feishu_collect",
+        "last_feishu_clean",
+        "last_feishu_distill",
+        "last_profile",
+        "last_profile_nuwa",
+        "last_people_index",
+        "last_relationship_index",
+        "last_quality",
+        "last_profile_attribution_audit",
+        "last_feishu_mirror_inventory",
+        "last_feishu_mirror_download",
+        "last_agent_entry",
+        "last_web_collect",
+        "last_obsidian_sync",
+        "last_cards_build",
+        "last_portable_restore_check",
+    ):
+        state[key] = now
+
+    files = {
+        "STATE_FILE": ("state.json", state),
+        "QUALITY_JSON": (
+            "quality.json",
+            {"status": "ok", "score": 100, "issue_count": 0},
+        ),
+        "WEB_STATE_JSON": (
+            "web.json",
+            {"status": "ok", "totals": {"errors": 0}},
+        ),
+        "OBSIDIAN_STATUS_JSON": (
+            "obsidian.json",
+            {"status": "ok", "broken_links_count": 0},
+        ),
+        "RELATIONSHIP_JSON": (
+            "relationships.json",
+            {"summary": {"person_edges": 1, "project_edges": 1}},
+        ),
+    }
+    for name, (filename, payload) in files.items():
+        path = tmp_path / filename
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        monkeypatch.setattr(immortal, name, path)
+
+    fresh = tmp_path / "fresh.txt"
+    fresh.write_text("x" * 2048, encoding="utf-8")
+    for name in (
+        "QUALITY_MD",
+        "PROFILE_ATTRIBUTION_AUDIT_JSON",
+        "PROFILE_NUWA_JSON",
+        "PROFILE_NUWA_MD",
+        "AGENT_ENTRY_MD",
+        "AGENT_ENTRY_JSON",
+        "FEISHU_CLEAN_COVERAGE",
+        "FEISHU_DISTILLED_COVERAGE",
+        "FEISHU_DRIVE_MIRROR_COVERAGE",
+    ):
+        monkeypatch.setattr(immortal, name, fresh)
+    retired = tmp_path / "cards_compact.md"
+    retired.write_text("legacy" * 100, encoding="utf-8")
+    os.utime(retired, (1, 1))
+    monkeypatch.setattr(immortal, "CARDS_COMPACT_MD", retired, raising=False)
+    monkeypatch.setattr(immortal, "check_crontab", lambda: (True, ["scheduler"]))
+    monkeypatch.setattr(
+        immortal,
+        "get_backup_status",
+        lambda _vault: {
+            "ok": True,
+            "mode": "manifest-only",
+            "latest_export": {
+                "generated_at": now,
+                "export_dir": str(tmp_path / "export"),
+                "totals": {"files": 1, "bytes": 1},
+            },
+        },
+    )
+
+    code = immortal.command_health(type("Args", (), {"max_age_hours": 30})())
+    output = capsys.readouterr().out
+
+    assert code == 0
+    assert "OK   判断力卡片盒" in output
+    assert "FAIL 判断力卡片盒" not in output
+
+
+def test_raw_context_does_not_inject_retired_cards_cache(
+    tmp_path, monkeypatch, capsys
+):
+    missing = tmp_path / "missing"
+    state = tmp_path / "state.json"
+    state.write_text(
+        json.dumps({"last_collect": "2026-07-28T00:00:00Z", "total_records": 1}),
+        encoding="utf-8",
+    )
+    retired = tmp_path / "cards_compact.md"
+    retired.write_text("RETIRED_UNREVIEWED_JUDGMENT", encoding="utf-8")
+    monkeypatch.setattr(immortal, "STATE_FILE", state)
+    monkeypatch.setattr(immortal, "CARDS_COMPACT_MD", retired, raising=False)
+    for name in (
+        "PROFILE_COMPACT_MD",
+        "PROFILE_MD",
+        "SOUL_FILE",
+        "PROFILE_NUWA_MD",
+        "PEOPLE_MD",
+    ):
+        monkeypatch.setattr(immortal, name, missing)
+
+    code = immortal.command_context(
+        type(
+            "Args",
+            (),
+            {
+                "query": "task",
+                "since": "2026-03-01",
+                "with_recall": False,
+                "profile_lines": 10,
+                "nuwa_lines": 10,
+                "digest_lines": 10,
+                "people_lines": 10,
+            },
+        )()
+    )
+
+    assert code == 0
+    assert "RETIRED_UNREVIEWED_JUDGMENT" not in capsys.readouterr().out
 
 
 def test_v1_overview_reuses_truth_snapshot(tmp_path):

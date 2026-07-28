@@ -570,7 +570,15 @@ class ControlData:
                 {
                     "id": "create_context",
                     "fields": ["goal", "mode"],
-                    "modes": ["auto", "answer", "code", "research", "plan"],
+                    "modes": [
+                        "auto",
+                        "advisor",
+                        "writer",
+                        "reviewer",
+                        "business",
+                        "project",
+                        "custom",
+                    ],
                 }
             ],
         }

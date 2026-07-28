@@ -4,7 +4,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-v1.3.1-111827.svg)
+![Version](https://img.shields.io/badge/version-v1.3.3-111827.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/platform-Codex%20%7C%20Claude%20Code%20%7C%20Local%20Agent-0F766E.svg)
 ![License](https://img.shields.io/badge/license-MIT-059669.svg)
@@ -106,8 +106,9 @@ immortal-memory train --smoke --build-role --goal "writing review" --mode writer
 # 看看给 agent 的入口长什么样
 immortal-memory agent-entry
 
-# 针对一个具体任务，生成贴身的上下文包
-immortal-memory agent-context "help me review this product idea" --print
+# 先生成可审阅预览，再用返回的 ID 和 hash 编译
+immortal-memory agent-context "help me review this product idea" --mode reviewer
+immortal-memory agent-context "help me review this product idea" --mode reviewer --preview-id "<preview_id>" --preview-hash "<preview_hash>" --print
 ```
 
 ### 自动接入你的高质量语料
@@ -151,6 +152,29 @@ immortal-memory agent-factory
 然后访问 http://127.0.0.1:8765/
 
 看板有七个真实模块：**首页、记忆、我、判断、使用、信任、系统**。首页回答今天新增了什么价值；「记忆」追溯原始证据；「我」展示 Living Self 的八个认知分区；「判断」管理判断卡；「使用」预览并编译 Context Pack；「信任」解释归因、隐私排除和纠正；「系统」展示采集、索引、备份、服务与版本健康。
+
+### 飞书学习审核提醒
+
+先在本机预览待确认内容，不会发送消息：
+
+```bash
+immortal-memory learning-review
+immortal-memory learning-review --json
+```
+
+发送前可以让飞书 CLI 只预演请求。收件人固定读取本机私有配置中的 `feishu.expected_user_open_id`，不能临时改成群或其他人：
+
+```bash
+immortal-memory learning-review --send-feishu --dry-run --json
+```
+
+只有明确确认远端写入才会以机器人身份发送本人私聊提醒：
+
+```bash
+immortal-memory learning-review --send-feishu --confirm-remote-write
+```
+
+提醒只包含经过凭证和本机路径脱敏的有限候选摘要，以及本机审核面板入口。它不会自动确认、拒绝或升级任何 Claim 和 Judgment，也不会自动加入每日调度。真实审核仍在 Home 和 Trust 中完成，所有状态变化继续使用原有事件账本。
 
 ### 从 v1.0 做隔离迁移演练
 
@@ -234,7 +258,7 @@ immortal-memory backup-status --verify --max-age-hours 168 --json
 immortal-memory health --max-age-hours 72
 immortal-memory doctor
 immortal-memory preflight
-immortal-memory agent-context "release acceptance" --print
+immortal-memory agent-context "release acceptance" --mode reviewer
 ```
 
 系统看板会把主流程、自动反馈和本机通知分开显示。`run` 成功不等于整条自动化成功：飞书来源部分失败或通知未送达时，反馈卡和调度器都会明确标为需要关注。
@@ -244,13 +268,13 @@ immortal-memory agent-context "release acceptance" --print
 ```bash
 CLEAN_HOME="$(mktemp -d /tmp/immortal-clean-home.XXXXXX)"
 python3 -m venv "$CLEAN_HOME/venv"
-WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.1-*.whl' | head -n 1)"
+WHEEL="$(find "$(pwd)/dist" -maxdepth 1 -name 'immortal_memory-1.3.3-*.whl' | head -n 1)"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/python" -m pip install "$WHEEL"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" init --owner-display-name "Clean Install" --alias "clean"
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" train --smoke
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" health --max-age-hours 72
 HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" preflight
-HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" agent-context "clean install acceptance" --print
+HOME="$CLEAN_HOME" "$CLEAN_HOME/venv/bin/immortal-memory" agent-context "clean install acceptance" --mode reviewer
 ```
 
 空白 vault 尚未配置外置备份或每日调度时，`health` 和 `preflight` 应明确返回待配置项，不能假装健康；clean-install 验收关注命令可运行、状态诚实、数据只写入隔离 `HOME`。生产验收则要求前述健康命令全部通过。
@@ -272,9 +296,9 @@ Windows 原生运行。
 给本地 agent 一段这样的交接说明就行：
 
 ```text
-先读 ~/.immortal/agent/ENTRY.md。然后运行：
-immortal-memory agent-context "<当前任务>" --print
-把返回的内容当作任务级记忆来用，默认不要直接去读原始库。
+先读 ~/.immortal/agent/ENTRY.md。运行 agent-context --mode reviewer 生成预览。
+审阅 context_json 后，用同一任务、--preview-id 和 --preview-hash 再运行一次并加 --print。
+只有 lifecycle_status=compiled 时才把输出当作任务级记忆，默认不直接读原始库。
 ```
 
 这套模式对下面这些都成立：
@@ -284,7 +308,7 @@ immortal-memory agent-context "<当前任务>" --print
 | Codex | 装 `adapters/codex/skills/immortal-memory` |
 | Claude Code | 装 `adapters/claude-code/skills/immortal-memory` |
 | 通用 CLI agent | 直接跑 `immortal-memory agent-context` |
-| MCP / HTTP | 通过 Agent Bridge 扩展（规划中） |
+| MCP / HTTP | 通过本地 Agent Bridge |
 
 ## 项目结构
 
@@ -407,7 +431,7 @@ cd immortal-memory
 python3 install.py --owner-display-name "Your Name" --alias "Your Alias" --install-codex-adapter
 immortal-memory train --smoke --build-role --goal "writing review" --mode writer
 immortal-memory agent-entry
-immortal-memory agent-context "help me review this product idea" --print
+immortal-memory agent-context "help me review this product idea" --mode reviewer
 ```
 
 Open the local dashboard:
@@ -431,9 +455,9 @@ not load Python from the private vault.
 Hand a local agent this:
 
 ```text
-Read ~/.immortal/agent/ENTRY.md first. Then run:
-immortal-memory agent-context "<current task>" --print
-Use the returned context as task-local memory. Do not read the raw vault by default.
+Read ~/.immortal/agent/ENTRY.md first. Preview with an explicit mode, review
+context_json, then compile the same task with --preview-id and --preview-hash.
+Use output only when lifecycle_status=compiled. Do not read the raw vault.
 ```
 
 This works for Codex, Claude Code, terminal agents, and any tool that can read local files and run shell commands.

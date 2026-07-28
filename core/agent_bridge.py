@@ -205,9 +205,10 @@ def bridge_metadata() -> dict[str, Any]:
             "profile_compact": str(IMMORTAL_DIR / "profile_compact.md"),
             "profile_nuwa": str(IMMORTAL_DIR / "profile_nuwa.md"),
             "people_index": str(IMMORTAL_DIR / "people" / "people_index.md"),
-            # 2026-06-14：digest/product 已停用，改注入判断力卡片盒（纠正即记忆）
-            "cards": str(IMMORTAL_DIR / "cards" / "cards.md"),
-            "cards_compact": str(IMMORTAL_DIR / "cards" / "cards_compact.md"),
+            "judgments_current": str(IMMORTAL_DIR / "judgment" / "current.jsonl"),
+            "judgment_evaluations": str(
+                IMMORTAL_DIR / "judgment" / "evaluations.jsonl"
+            ),
         },
         "commands": {
             "health": cli_command("health", "--max-age-hours", "72"),
@@ -225,17 +226,28 @@ def bridge_metadata() -> dict[str, Any]:
 
 def render_entry(meta: dict[str, Any]) -> str:
     owner = meta.get("owner") or "the owner"
-    command = meta["commands"]["agent_context"]
+    preview_command = cli_command(
+        "agent-context", "<current task>", "--mode", "reviewer"
+    )
+    compile_command = cli_command(
+        "agent-context",
+        "<current task>",
+        "--mode",
+        "reviewer",
+        "--preview-id",
+        "<preview_id>",
+        "--preview-hash",
+        "<preview_hash>",
+        "--print",
+    )
     one_sentence = (
         f"请先读取 {ENTRY_MD}，然后针对当前任务运行 "
-        f"`{command}`，"
-        f"把返回内容作为理解{owner}的长期上下文。"
+        f"`{preview_command}` 生成预览；审阅 `context_json` 后用 "
+        f"`{compile_command}` 编译，仅在 `lifecycle_status=compiled` 时消费上下文。"
     )
-    current_task_command = cli_command("agent-context", "本次任务", "--print")
     claude_prompt = (
-        f"你现在可以调用{owner}的永生知识库。开始任务前先运行："
-        f"`{current_task_command}`，"
-        "再基于返回的画像、偏好、近期状态和证据继续工作。"
+        f"你现在可以调用{owner}的永生知识库。先运行预览命令，"
+        "审阅选中内容，再带 preview ID 和 hash 运行编译命令。"
     )
     lines = [
         "# Immortal Agent Entry",
@@ -269,7 +281,8 @@ def render_entry(meta: dict[str, Any]) -> str:
         "",
         "## 稳定命令",
         f"- health: `{meta['commands']['health']}`",
-        f"- agent-context: `{command}`",
+        f"- context preview: `{preview_command}`",
+        f"- approved compile: `{compile_command}`",
         f"- recall: `{meta['commands']['recall']}`",
         f"- raw context: `{meta['commands']['context']}`",
         "",
@@ -288,10 +301,24 @@ def command_entry(_args: argparse.Namespace) -> int:
     AGENT_DIR.mkdir(parents=True, exist_ok=True)
     ENTRY_MD.write_text(render_entry(meta), encoding="utf-8")
     write_json(ENTRY_JSON, meta)
-    current_task_command = cli_command("agent-context", "本次任务", "--print")
+    preview_command = cli_command(
+        "agent-context", "本次任务", "--mode", "reviewer"
+    )
+    compile_command = cli_command(
+        "agent-context",
+        "本次任务",
+        "--mode",
+        "reviewer",
+        "--preview-id",
+        "<preview_id>",
+        "--preview-hash",
+        "<preview_hash>",
+        "--print",
+    )
     claude_prompt = (
         f"你现在可以调用{meta.get('owner')}的永生知识库。"
-        f"开始任务前运行：{current_task_command}"
+        f"先运行预览：{preview_command}。审阅 context_json 后运行："
+        f"{compile_command}。仅在 lifecycle_status=compiled 时继续。"
     )
     CLAUDE_PROMPT.write_text(claude_prompt + "\n", encoding="utf-8")
     print(f"entry_md={ENTRY_MD}")

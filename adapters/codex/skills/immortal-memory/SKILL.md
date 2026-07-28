@@ -22,21 +22,28 @@ Private data lives in:
 ## Default Flow
 
 For tasks involving the user's preferences, history, writing style, relationships,
-projects, decisions, or digital agent behavior, run:
+projects, decisions, or digital agent behavior, first create a reviewable preview:
 
 ```bash
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --print
+python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer
 ```
 
-Use the returned context as task-local context. Do not read the full raw vault by
-default.
+Read the returned `context_json`. A preview is not task context. After reviewing
+its selection, compile that exact preview:
+
+```bash
+python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer --preview-id "<preview_id>" --preview-hash "<preview_hash>" --print
+```
+
+Continue only when the command reports `lifecycle_status=compiled`. Use the
+printed pack as task-local context. Do not read the full raw vault by default.
 
 ## Commands
 
 ```bash
 python3 ~/.local/share/immortal-memory/core/immortal.py health
 python3 ~/.local/share/immortal-memory/core/immortal.py agent-entry
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<task>" --print
+python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<task>" --mode reviewer
 python3 ~/.local/share/immortal-memory/core/immortal.py recall "<topic>"
 python3 ~/.local/share/immortal-memory/core/immortal.py agent-factory
 ```

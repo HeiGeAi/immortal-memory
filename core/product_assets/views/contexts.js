@@ -112,6 +112,28 @@ function previewBody(preview, refresh) {
   return container;
 }
 
+function outcomeMemoryReview(detail) {
+  const fieldset = document.createElement("fieldset");
+  fieldset.className = "preview-section";
+  fieldset.append(node("legend", "这条记忆实际表现如何"));
+  const allowedKinds = new Set(["claim", "self_model", "judgment"]);
+  Object.values(detail.sections || {}).flat().forEach((item) => {
+    if (!allowedKinds.has(item?.kind) || !item.id || !Number.isInteger(item.revision)) return;
+    const label = document.createElement("label");
+    label.className = "field-label";
+    label.append(node("span", item.summary || item.title || item.id));
+    const select = document.createElement("select");
+    select.name = "memory_feedback";
+    select.dataset.kind = item.kind;
+    select.dataset.id = item.id;
+    select.dataset.revision = String(item.revision);
+    [["", "不评价"], ["confirmed", "确认为有用"], ["challenged", "标记为需复核"]].forEach(([value, text]) => select.append(new Option(text, value)));
+    label.append(select);
+    fieldset.append(label);
+  });
+  return fieldset.querySelector("select") ? fieldset : null;
+}
+
 function outcomeForm(detail, refresh) {
   const form = node("form", "", "action-form");
   const adopted = control("采用程度", "adopted", "select");
@@ -124,15 +146,26 @@ function outcomeForm(detail, refresh) {
   submit.type = "submit";
   const feedback = node("p", "", "form-feedback");
   const attempt = createMutationAttempt();
+  const memoryReview = outcomeMemoryReview(detail);
   form.append(adopted.wrapper, result.wrapper, summary.wrapper, reason.wrapper, submit, feedback);
+  if (memoryReview) form.insertBefore(memoryReview, submit);
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     pending(submit, true, "正在记录……", "记录结果");
     try {
+      const confirmed_refs = [];
+      const challenged_refs = [];
+      form.querySelectorAll('select[name="memory_feedback"]').forEach((select) => {
+        if (!select.value) return;
+        const ref = { kind: select.dataset.kind, id: select.dataset.id, revision: Number(select.dataset.revision) };
+        (select.value === "confirmed" ? confirmed_refs : challenged_refs).push(ref);
+      });
       const payload = {
         adopted: adopted.input.value,
         result: result.input.value,
         summary: summary.input.value,
+        confirmed_refs,
+        challenged_refs,
         expected_version: detail.revision,
         reason: reason.input.value,
       };
@@ -202,7 +235,14 @@ async function showContext(id, trigger, refresh) {
       content.append(consume, feedback);
     }
     if (detail.lifecycle_status === "consumed") content.append(node("h3", "待记录结果"), outcomeForm(detail, refresh));
-    if (detail.outcome) content.append(node("p", `${detail.outcome.result}：${detail.outcome.summary || "无摘要"}`, "outcome-summary"));
+    if (detail.outcome) {
+      const confirmed = detail.outcome.confirmed_refs?.length || 0;
+      const challenged = detail.outcome.challenged_refs?.length || 0;
+      content.append(
+        node("p", `${detail.outcome.result}：${detail.outcome.summary || "无摘要"}`, "outcome-summary"),
+        node("p", `支持 ${confirmed} 条，需复核 ${challenged} 条`, "form-feedback"),
+      );
+    }
     body.replaceChildren(content);
   } catch (error) {
     body.replaceChildren(node("p", error.message || "Context 读取失败", "error-text"));

@@ -77,7 +77,6 @@ QUALITY_JSON = IMMORTAL_DIR / "quality" / "latest.json"
 QUALITY_MD = IMMORTAL_DIR / "quality" / "latest.md"
 DIGEST_JSON = IMMORTAL_DIR / "digests" / "latest.json"
 DIGEST_MD = IMMORTAL_DIR / "digests" / "latest.md"
-CARDS_COMPACT_MD = IMMORTAL_DIR / "cards" / "cards_compact.md"
 PRODUCT_GOAL_JSON = IMMORTAL_DIR / "product" / "goal.json"
 PRODUCT_GOAL_MD = IMMORTAL_DIR / "product" / "goal.md"
 DASHBOARD_HTML = IMMORTAL_DIR / "dashboard.html"
@@ -700,8 +699,8 @@ def command_health(args) -> int:
     add_file("Profile Attribution Audit", PROFILE_ATTRIBUTION_AUDIT_JSON)
     add_file("Nuwa Profile JSON", PROFILE_NUWA_JSON)
     add_file("Nuwa Profile MD", PROFILE_NUWA_MD)
-    # 2026-06-14：Product Goal / Digest / 主看板 / 时间线 已停用，改为校验判断力卡片盒
-    add_file("判断力卡片盒", CARDS_COMPACT_MD, min_size=64)
+    # v1.1 判断库是事件源；旧 cards_compact.md 只是已退役的派生缓存。
+    add_state("判断力卡片盒", "last_cards_build")
     add_file("Agent Entry MD", AGENT_ENTRY_MD, min_size=1024)
     add_file("Agent Entry JSON", AGENT_ENTRY_JSON)
     add_file("网页收录状态", WEB_STATE_JSON)
@@ -976,13 +975,6 @@ def command_context(args) -> int:
         print("Nuwa thinking profile excerpt:")
         text = redact(PROFILE_NUWA_MD.read_text(encoding="utf-8", errors="ignore"))
         for line in text.splitlines()[: args.nuwa_lines]:
-            print(line)
-        print()
-    # 判断力卡片盒（纠正即记忆）取代旧的 digest 遥测摘要注入：高信号、低噪音
-    if CARDS_COMPACT_MD.exists():
-        print("Judgment cards excerpt (纠正即记忆，代表你纠正 AI 时表达的判断):")
-        text = redact(CARDS_COMPACT_MD.read_text(encoding="utf-8", errors="ignore"))
-        for line in text.splitlines()[: args.digest_lines]:
             print(line)
         print()
     if PEOPLE_MD.exists():
@@ -1571,6 +1563,18 @@ def command_agent_entry(_args) -> int:
 
 def command_agent_context(args) -> int:
     bridge_args = ["context", args.query, "--since", args.since, "--timeout", str(args.timeout)]
+    bridge_args.extend(["--mode", args.mode])
+    if args.preview_only:
+        bridge_args.append("--preview-only")
+    if args.preview_id:
+        bridge_args.extend(["--preview-id", args.preview_id])
+    if args.preview_hash:
+        bridge_args.extend(["--preview-hash", args.preview_hash])
+    for item_id in args.exclude_item_id:
+        bridge_args.extend(["--exclude-item-id", item_id])
+    bridge_args.extend(["--ttl-seconds", str(args.ttl_seconds)])
+    if args.metadata_output:
+        bridge_args.extend(["--metadata-output", args.metadata_output])
     if args.with_recall:
         bridge_args.append("--with-recall")
     if args.output:
@@ -1743,6 +1747,21 @@ def command_feedback(args) -> int:
     if args.print:
         feedback_args.append("--print")
     return run_script("feedback_report.py", feedback_args)
+
+
+def command_learning_review(args) -> int:
+    review_args = ["--limit", str(args.limit)]
+    if args.vault_dir:
+        review_args[0:0] = ["--vault-dir", args.vault_dir]
+    if args.json:
+        review_args.append("--json")
+    if args.send_feishu:
+        review_args.append("--send-feishu")
+    if args.dry_run:
+        review_args.append("--dry-run")
+    if args.confirm_remote_write:
+        review_args.append("--confirm-remote-write")
+    return run_script("learning_review.py", review_args)
 
 
 def command_product(_args) -> int:
@@ -2064,7 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--default-mode",
         default=None,
-        choices=["auto", "advisor", "writer", "reviewer", "business", "project", "shadow", "custom"],
+        choices=["auto", "advisor", "writer", "reviewer", "business", "project", "custom"],
     )
     init.set_defaults(func=command_init)
 
@@ -2080,7 +2099,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--mode",
         default=None,
-        choices=["auto", "advisor", "writer", "reviewer", "business", "project", "shadow", "custom"],
+        choices=["auto", "advisor", "writer", "reviewer", "business", "project", "custom"],
     )
     train.set_defaults(func=command_train)
 
@@ -2341,6 +2360,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_context.add_argument("--with-recall", action="store_true")
     agent_context.add_argument("--output", default="")
     agent_context.add_argument("--timeout", type=int, default=240)
+    agent_context.add_argument("--mode", default="auto", choices=("auto", "advisor", "writer", "reviewer", "business", "project", "custom"))
+    agent_context.add_argument("--preview-only", action="store_true")
+    agent_context.add_argument("--preview-id", default="")
+    agent_context.add_argument("--preview-hash", default="")
+    agent_context.add_argument("--exclude-item-id", action="append", default=[])
+    agent_context.add_argument("--ttl-seconds", type=int, default=900)
+    agent_context.add_argument("--metadata-output", default="")
     agent_context.add_argument("--print", action="store_true")
     agent_context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     agent_context.set_defaults(func=command_agent_context)
@@ -2401,6 +2427,17 @@ def build_parser() -> argparse.ArgumentParser:
     feedback.add_argument("--notify", action="store_true")
     feedback.add_argument("--print", action="store_true")
     feedback.set_defaults(func=command_feedback)
+    learning_review = sub.add_parser(
+        "learning-review",
+        help="Preview or send an owner-only review of pending learning candidates",
+    )
+    learning_review.add_argument("--vault-dir", default=None)
+    learning_review.add_argument("--limit", type=int, default=8)
+    learning_review.add_argument("--json", action="store_true")
+    learning_review.add_argument("--send-feishu", action="store_true")
+    learning_review.add_argument("--dry-run", action="store_true")
+    learning_review.add_argument("--confirm-remote-write", action="store_true")
+    learning_review.set_defaults(func=command_learning_review)
     sub.add_parser("product", help="Generate the product-level operating brief").set_defaults(func=command_product)
     sub.add_parser("goal", help="Alias for product; show what this system is becoming").set_defaults(func=command_product)
 

@@ -10,6 +10,16 @@ import agent_bridge_server
 
 
 class AgentBridgeCorsTest(unittest.TestCase):
+    def test_mcp_server_reports_product_version(self):
+        expected = (Path(agent_bridge_server.__file__).with_name("VERSION")).read_text(
+            encoding="utf-8"
+        ).strip()
+        response = agent_bridge_server.handle_mcp_message(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        )
+
+        self.assertEqual(response["result"]["serverInfo"]["version"], expected)
+
     def test_exact_loopback_origins_are_allowed(self):
         self.assertTrue(agent_bridge_server.is_allowed_origin("http://localhost:8799"))
         self.assertTrue(agent_bridge_server.is_allowed_origin("https://127.0.0.1:443"))

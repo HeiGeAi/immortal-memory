@@ -11,6 +11,7 @@ const CATEGORY_LABELS = {
   privacy_exclusion: "隐私策略排除",
   recent_correction: "最近纠正或替换",
   model_evaluation: "自我模型评估",
+  failed_outcome: "任务结果提出复核",
 };
 
 const COVERAGE_LABELS = {
@@ -39,14 +40,19 @@ function categoryMessage(category) {
 }
 
 function trustCategory(key, category) {
-  const section = document.createElement("section");
+  const section = document.createElement("details");
   section.className = "system-section";
   const title = CATEGORY_LABELS[key] || key.replaceAll("_", " ");
   const parsed = Number(category.count);
   const count = Number.isFinite(parsed) ? Math.max(0, parsed) : "未知";
-  section.append(
+  section.open = typeof count === "number" && count > 0 && count <= 5;
+  const summary = document.createElement("summary");
+  summary.append(
     node("p", `${COVERAGE_LABELS[category.coverage] || "覆盖状态未知"} · ${count} 项`, "kicker"),
     node("h2", title),
+  );
+  section.append(
+    summary,
     node("p", categoryMessage(category), category.coverage === "complete" ? "state-message" : "coverage-warning"),
   );
   const items = Array.isArray(category.items) ? category.items : [];
@@ -93,7 +99,23 @@ export async function renderTrust(root, { signal, isCurrent, navigate }) {
     fact("等待确认", data.summary?.needs_confirmation, "候选理解与候选判断的合计");
     fact("低置信度", data.summary?.low_confidence, "证据强度不足，需要谨慎使用");
     fact("隐私排除", data.summary?.privacy_exclusions, "按隐私规则未进入上下文的项目");
+    fact("结果复核", data.summary?.challenged_memories, "实际任务结果挑战过的记忆，等待人工核对");
     fragment.append(summary);
+    const reviewActions = document.createElement("div");
+    reviewActions.className = "honest-actions";
+    if (Number(data.summary?.candidate_claims) > 0) {
+      const claims = node("button", "审核候选理解");
+      claims.type = "button";
+      claims.addEventListener("click", () => navigate("home"));
+      reviewActions.append(claims);
+    }
+    if (Number(data.summary?.candidate_judgments) > 0) {
+      const judgments = node("button", "审核候选判断", "secondary");
+      judgments.type = "button";
+      judgments.addEventListener("click", () => navigate("judgments"));
+      reviewActions.append(judgments);
+    }
+    if (reviewActions.children.length) fragment.append(reviewActions);
     const grid = document.createElement("div");
     grid.className = "system-grid";
     Object.entries(data.categories || {}).forEach(([key, category]) => grid.append(trustCategory(key, category || {})));

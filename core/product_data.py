@@ -1526,6 +1526,7 @@ class ProductData:
             for row in claims
             if row.get("status") == "candidate"
         ]
+        candidate_claim_count = len(confirmations)
         confirmations.extend(
             {
                 "kind": "judgment",
@@ -1537,6 +1538,7 @@ class ProductData:
             for row in judgments
             if row.get("status") == "candidate"
         )
+        candidate_judgment_count = len(confirmations) - candidate_claim_count
         used_contexts = [
             row
             for row in self._context_rows()
@@ -1582,12 +1584,19 @@ class ProductData:
                 "version": _compact_text(snapshot.get("version"), 40),
                 "attention_count": len(snapshot.get("attention") or []),
             },
+            "confirmation_summary": {
+                "total": len(confirmations),
+                "claims": candidate_claim_count,
+                "judgments": candidate_judgment_count,
+                "visible": min(len(confirmations), 8),
+            },
         }
 
     def trust(self) -> Dict[str, Any]:
         claims = self._claims()
         judgments = self._judgment_rows()
         contexts = self._context_rows()
+        outcomes = self._outcomes()
         category_coverage = {
             "unknown_speaker": "complete",
             "other_view_candidate": "complete",
@@ -1599,6 +1608,7 @@ class ProductData:
             "privacy_exclusion": "complete",
             "recent_correction": "partial",
             "model_evaluation": "partial",
+            "failed_outcome": "complete",
         }
         category_items = {key: {} for key in category_coverage}
 
@@ -1676,6 +1686,23 @@ class ProductData:
                     "上下文包含按隐私策略排除的项目",
                     "info",
                 )
+        for outcome in outcomes:
+            summary = _compact_text(outcome.get("summary"), 180) or "任务结果对这条记忆提出了挑战"
+            for ref in outcome.get("challenged_refs") or []:
+                if not isinstance(ref, Mapping):
+                    continue
+                add(
+                    "failed_outcome",
+                    str(ref.get("id") or ""),
+                    "%s；%s %s（版本 %s）"
+                    % (
+                        summary,
+                        str(ref.get("kind") or "memory"),
+                        str(ref.get("id") or ""),
+                        str(ref.get("revision") or "未知"),
+                    ),
+                    "attention",
+                )
         try:
             current_self = self.self_model()
         except ProductDataError:
@@ -1736,8 +1763,11 @@ class ProductData:
         return {
             "summary": {
                 "needs_confirmation": candidate_claims + candidate_judgments,
+                "candidate_claims": candidate_claims,
+                "candidate_judgments": candidate_judgments,
                 "low_confidence": categories["low_confidence"]["count"],
                 "privacy_exclusions": categories["privacy_exclusion"]["count"],
+                "challenged_memories": categories["failed_outcome"]["count"],
             },
             "categories": categories,
             "items": flat_items,

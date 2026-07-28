@@ -43,7 +43,6 @@ MODE_LABELS = {
     "reviewer": "复核审阅",
     "business": "商业判断",
     "project": "项目推进",
-    "shadow": "影子分身",
     "custom": "自定义",
 }
 

@@ -98,7 +98,6 @@ ROLE_MODES = {
     "reviewer",
     "business",
     "project",
-    "shadow",
     "custom",
 }
 
@@ -2357,6 +2356,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if not goal:
                     raise ValueError("goal is required")
                 mode = str(body.get("mode") or "auto")
+                if mode not in ROLE_MODES:
+                    raise ValueError("invalid mode")
                 self.send_json(
                     self.factory.start_job(
                         "session",

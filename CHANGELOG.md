@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.3 - 2026-07-28
+
+- Let users bind confirmed and challenged memory references when recording a real Context outcome.
+- Surface challenged memory references in the Trust ledger as review signals without automatically mutating Claim or Judgment authority.
+- Show the confirmed and challenged reference counts on recorded Context outcomes.
+
+## 1.3.2
+
+- Make the top-level `agent-context` command support the complete preview and compile lifecycle instead of returning preview-only output.
+- Stop treating the retired Markdown card cache as the authoritative judgment health signal or injecting it into agent context.
+- Keep the advertised agent modes aligned with the modes accepted by the backend and reject unsupported modes before queueing work.
+- Point generated agent guidance and adapters at the reviewed Context Store and Judgment Store lifecycle.
+- Report the full pending-confirmation count on Home instead of presenting the eight-item display budget as the total.
+- Add real review routes to Trust and collapse long evidence categories with native disclosure controls.
+- Add an owner-only `learning-review` preview and explicitly confirmed Feishu reminder without duplicating the Claim or Judgment state machines.
+
 ## 1.3.1
 
 - Move private identity aliases and categories out of public source code into local configuration, and make owner-only defaults work for every installation.

@@ -467,6 +467,12 @@ def test_home_leads_with_memory_value_not_machine_metrics(tmp_path):
         "latest_outcome",
     ]
     assert home["system_health"]["status"] == "healthy"
+    assert home["confirmation_summary"] == {
+        "total": 2,
+        "claims": 1,
+        "judgments": 1,
+        "visible": 2,
+    }
     assert center.calls == 1
     assert "private-token" not in json.dumps(home)
 
@@ -727,10 +733,37 @@ def test_trust_surfaces_bounded_evidence_gaps_privacy_and_candidates(tmp_path):
     data, _control, _center = seeded_product_data(tmp_path)
     trust = data.trust()
     assert trust["summary"]["needs_confirmation"] >= 2
+    assert trust["summary"]["candidate_claims"] == 1
+    assert trust["summary"]["candidate_judgments"] == 1
     kinds = {item["kind"] for item in trust["items"]}
     assert {"missing_evidence", "low_confidence", "privacy_exclusion"} <= kinds
     assert len(trust["items"]) <= 50
     assert "private-token" not in json.dumps(trust)
+
+
+def test_trust_surfaces_challenged_context_refs_without_mutating_memory(tmp_path):
+    data, _control, _center = seeded_product_data(tmp_path)
+    data.outcome_store.list = lambda: [
+        {
+            "outcome_id": "out_" + "1" * 32,
+            "context_id": "ctx_" + "1" * 32,
+            "result": "negative",
+            "summary": "实际执行失败",
+            "challenged_refs": [
+                {"kind": "claim", "id": "clm_confirmed", "revision": 3}
+            ],
+            "created_at": "2026-07-22T00:40:00+00:00",
+        }
+    ]
+
+    trust = data.trust()
+
+    assert trust["summary"]["challenged_memories"] == 1
+    item = trust["categories"]["failed_outcome"]["items"][0]
+    assert item["id"] == "clm_confirmed"
+    assert item["kind"] == "failed_outcome"
+    assert "实际执行失败" in item["summary"]
+    assert data.claim_store.get("clm_confirmed")["status"] == "confirmed"
 
 
 def test_trust_does_not_mislabel_user_exclusion_as_privacy_policy(tmp_path):
@@ -1407,6 +1440,7 @@ def test_trust_has_all_spec_categories_with_counts_and_coverage(tmp_path):
         "privacy_exclusion",
         "recent_correction",
         "model_evaluation",
+        "failed_outcome",
     }
     assert set(trust["categories"]) == expected
     for category in trust["categories"].values():

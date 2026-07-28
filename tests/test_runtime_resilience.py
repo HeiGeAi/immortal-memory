@@ -28,6 +28,106 @@ class VolatileFileTest(unittest.TestCase):
         self.assertEqual(existing, set())
 
 
+class AgentEntryAuthorityTest(unittest.TestCase):
+    def test_command_entry_writes_approved_compile_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            entry_md = root / "ENTRY.md"
+            entry_json = root / "entry.json"
+            claude_prompt = root / "claude-code-prompt.txt"
+            meta = {
+                "generated_at": "2026-07-28T00:00:00+08:00",
+                "owner": "Owner",
+                "vault_status": "healthy",
+                "context_status": "ready",
+                "loss_protection": "unprotected",
+                "real_record_count": 1,
+                "total_records": 1,
+                "quality_status": "ok",
+                "quality_score": 100,
+                "quality_issues": 0,
+                "last_collect": "2026-07-28T00:00:00Z",
+                "last_feishu_collect": "2026-07-28T00:00:00Z",
+                "paths": {},
+                "commands": {
+                    "health": "immortal-memory health",
+                    "agent_context": 'immortal-memory agent-context "<current task>"',
+                    "recall": 'immortal-memory recall "<topic>"',
+                    "context": 'immortal-memory context "<task>"',
+                },
+                "local_urls": {},
+            }
+            with mock.patch.object(agent_bridge, "AGENT_DIR", root), \
+                 mock.patch.object(agent_bridge, "ENTRY_MD", entry_md), \
+                 mock.patch.object(agent_bridge, "ENTRY_JSON", entry_json), \
+                 mock.patch.object(agent_bridge, "CLAUDE_PROMPT", claude_prompt), \
+                 mock.patch.object(agent_bridge, "bridge_metadata", return_value=meta):
+                code = agent_bridge.command_entry(argparse.Namespace())
+
+            self.assertEqual(code, 0)
+            prompt = claude_prompt.read_text(encoding="utf-8")
+            self.assertIn("--preview-id", prompt)
+            self.assertIn("--preview-hash", prompt)
+            self.assertIn("lifecycle_status=compiled", prompt)
+
+    def test_entry_explains_preview_then_approved_compile(self):
+        meta = {
+            "generated_at": "2026-07-28T00:00:00+08:00",
+            "owner": "Owner",
+            "vault_status": "healthy",
+            "context_status": "ready",
+            "loss_protection": "unprotected",
+            "real_record_count": 1,
+            "total_records": 1,
+            "quality_status": "ok",
+            "quality_score": 100,
+            "quality_issues": 0,
+            "last_collect": "2026-07-28T00:00:00Z",
+            "last_feishu_collect": "2026-07-28T00:00:00Z",
+            "paths": {},
+            "commands": {
+                "health": "immortal-memory health",
+                "agent_context": 'immortal-memory agent-context "<current task>"',
+                "recall": 'immortal-memory recall "<topic>"',
+                "context": 'immortal-memory context "<task>"',
+            },
+            "local_urls": {},
+        }
+
+        text = agent_bridge.render_entry(meta)
+
+        self.assertIn("--preview-id", text)
+        self.assertIn("--preview-hash", text)
+        self.assertIn("lifecycle_status=compiled", text)
+
+    def test_entry_points_to_authoritative_judgment_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vault = Path(tmp)
+            with mock.patch.object(agent_bridge, "IMMORTAL_DIR", vault), \
+                 mock.patch.object(agent_bridge, "read_json", return_value={}), \
+                 mock.patch.object(agent_bridge, "owner_display_name", return_value="Owner"), \
+                 mock.patch.object(
+                     agent_bridge,
+                     "gather_preflight",
+                     return_value={
+                         "vault_status": "healthy",
+                         "context_status": "ready",
+                         "loss_protection": "unprotected",
+                         "real_record_count": 1,
+                     },
+                 ):
+                paths = agent_bridge.bridge_metadata()["paths"]
+
+            self.assertEqual(
+                paths["judgments_current"], str(vault / "judgment" / "current.jsonl")
+            )
+            self.assertEqual(
+                paths["judgment_evaluations"],
+                str(vault / "judgment" / "evaluations.jsonl"),
+            )
+            self.assertFalse(any("/cards/" in value for value in paths.values()))
+
+
 class ProcessGroupTimeoutTest(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX process-group behavior")
     def test_timeout_terminates_grandchild_process(self):
@@ -286,6 +386,12 @@ class AgentBridgeTimeoutTest(unittest.TestCase):
         self.assertEqual(preview.mode, "reviewer")
         self.assertEqual(compile_args.preview_id, "prv_one")
         self.assertEqual(compile_args.preview_hash, "sha256:" + "1" * 64)
+
+    def test_task_compile_rejects_removed_shadow_context_mode(self):
+        with self.assertRaises(SystemExit):
+            task_compile.build_parser().parse_args(
+                ["preview", "review plan", "--mode", "shadow"]
+            )
 
     def test_naked_task_compile_returns_preview_without_formal_session(self):
         with tempfile.TemporaryDirectory() as tmp:

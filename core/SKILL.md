@@ -74,7 +74,8 @@ immortal-memory train
 immortal-memory daily-install
 immortal-memory agent-entry
 immortal-memory task-compile "task" --mode auto
-immortal-memory agent-context "task" --print
+immortal-memory agent-context "task" --mode reviewer
+immortal-memory agent-context "task" --mode reviewer --preview-id "<preview_id>" --preview-hash "<preview_hash>" --print
 immortal-memory agent-factory
 immortal-memory goal
 immortal-memory recall "topic"

@@ -43,7 +43,7 @@ LATEST_CONTEXT_JSON = AGENT_DIR / "latest-context.json"
 AUDIT_LOG = AGENT_DIR / "access.log"
 AUDIT_LATEST = AGENT_DIR / "access_latest.json"
 SERVER_NAME = "immortal-memory"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = (SKILL_DIR / "VERSION").read_text(encoding="utf-8").strip()
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
