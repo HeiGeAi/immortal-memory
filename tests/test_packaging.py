@@ -23,6 +23,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingTest(unittest.TestCase):
+    def test_asset_directories_are_explicit_distribution_packages(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        for package in (
+            "immortal_memory.agents",
+            "immortal_memory.product_assets",
+            "immortal_memory.product_assets.views",
+        ):
+            self.assertIn(f'"{package}"', pyproject)
+
     def test_agent_adapters_document_preview_then_approved_compile(self) -> None:
         paths = [
             ROOT / "adapters" / "codex" / "skills" / "immortal-memory" / "SKILL.md",
@@ -99,6 +108,7 @@ class PackagingTest(unittest.TestCase):
                 0,
                 msg=f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}",
             )
+            self.assertNotIn("Package would be ignored", build.stdout + build.stderr)
             wheels = list(wheel_dir.glob("immortal_memory-*.whl"))
             self.assertEqual(len(wheels), 1, msg=f"built wheels: {wheels}")
 

@@ -22,6 +22,7 @@ class VersionGovernanceTest(unittest.TestCase):
         ).strip()
         pyproject = (self.ROOT / "pyproject.toml").read_text(encoding="utf-8")
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        status = (self.ROOT / "STATUS.md").read_text(encoding="utf-8")
         project_version = re.search(
             r'^version\s*=\s*"([^"]+)"\s*$', pyproject, re.MULTILINE
         )
@@ -32,11 +33,13 @@ class VersionGovernanceTest(unittest.TestCase):
                 immortal.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(version, "1.3.3")
+        self.assertEqual(version, "1.3.4")
         self.assertIsNotNone(project_version)
         self.assertEqual(project_version.group(1), version)
         self.assertIn(f"version-v{version}-", readme)
-        self.assertEqual(output.getvalue().strip(), "immortal 1.3.3")
+        self.assertIn(f"目标版本为 `v{version}`", status)
+        self.assertIn(f"核对 GitHub `v{version}` tag", status)
+        self.assertEqual(output.getvalue().strip(), "immortal 1.3.4")
 
         setup_version = subprocess.run(
             [sys.executable, "setup.py", "--version"],

@@ -1,10 +1,19 @@
 # Immortal Memory 当前状态
 
-更新时间：2026-07-28 15:24 CST
-当前本地版本：1.3.3
-本轮层级：本地源码已验证，本机真实安装已验证，GitHub 发布以远端 `v1.3.3` Release 为准
+更新时间：2026-07-31，Asia/Shanghai
+当前仓库待发布版本：1.3.4
+本机生产安装：仍为 1.3.3，本轮未部署、未重启、未读写真实 vault
+本轮层级：打包配置修复已产出，远端发布以 `v1.3.4` tag、Release 与 CI 为准
 
-## 已完成
+## 1.3.4 源码验收
+
+- 显式声明 `agents`、`product_assets` 与 `product_assets/views` 三个分发包，Setuptools 构建不再报告 package discovery warning。
+- Homebrew Python 3.11 隔离环境全量回归：`1333 passed in 73.62s`。
+- 打包与版本聚焦回归：8 项通过；源码隐私扫描为 `private_scan=ok`。
+- 构建产物：wheel 651,966 bytes，SHA256 `d4dced3da862fd6349d394771ff8a53535ed73b4d8f5cf8325f89ec3581bb152`；sdist 796,926 bytes，SHA256 `b43cc6c05b75982ec3252f594c3dff668afe0d9a0bacfa02d587415419b1543b`。
+- 本轮没有安装到本机生产目录，没有读取或写入真实 vault，没有重启控制中心或调度器。
+
+## 1.3.3 已完成能力
 
 - 修复健康检查继续读取退役 Markdown 卡片缓存而产生的假告警，判断力健康状态现在读取当前编排状态。
 - 移除 Agent 上下文对退役、未审核卡片文件的直接注入，改为使用 Judgment Store 的当前数据和评估记录。
@@ -21,7 +30,7 @@
 - 已记录的 Context 结果会展示支持与需复核的引用数量，用户能看到反馈是否真正落库。
 - 本机核心、Codex 适配器、Claude Code 适配器和控制中心已更新到同一份源码。
 
-## 验收证据
+## 1.3.3 生产验收证据快照
 
 - 全量测试：Python 3.11 下 `1332 passed in 78.75s`。
 - Python 3.13 临时环境先得到 `1331 passed`，仅隔离 venv 的 `ensurepip` 因解释器自身 `SIGABRT` 失败；同一测试及全量套件已在支持环境 Python 3.11 通过。
@@ -47,7 +56,7 @@
 - Trust 层有 57 条候选需要本人确认，Living Self 当前已确认条目为 0，Judgment Store 当前为 0。系统不能自行把推断升级为用户身份事实。
 - Claude Desktop 配置已修正，但已运行的 Claude MCP 子进程仍是旧路径。退出并重新打开 Claude Desktop 后才会切换到正式核心；本轮未强杀应用，避免打断正在进行的任务。
 - `MAINTENANCE_FREEZE_DESTRUCTIVE` 仍保留。没有经过恢复演练和外部备份前，不解除破坏性维护冻结。
-- GitHub 公开发布已获得明确授权，目标版本为 `v1.3.3`；远端是否完成以 GitHub tag、Release 和 CI 结果为最终证据。
+- GitHub 公开发布已获得明确授权，目标版本为 `v1.3.4`；远端是否完成以 GitHub tag、Release 和 CI 结果为最终证据。
 
 ## 下一步门槛
 
@@ -55,4 +64,4 @@
 2. 在 Trust 看板中人工确认或拒绝候选记忆，生成第一版有依据的 Living Self。
    可先运行 `immortal-memory learning-review` 本地预览；需要本人飞书提醒时，再显式运行 `immortal-memory learning-review --send-feishu --confirm-remote-write`。
 3. 重启 Claude Desktop，验证实际 Claude 会话调用的是正式 MCP 核心。
-4. 发布后核对 GitHub `v1.3.3` tag、Release、wheel 附件和远端 CI，不把本地推送成功单独当作公开发布完成。
+4. 发布后核对 GitHub `v1.3.4` tag、Release、wheel 附件和远端 CI，不把本地推送成功单独当作公开发布完成。

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.4 - 2026-07-31
+
+- Declare the bundled agent metadata and web assets as explicit distribution packages.
+- Remove Setuptools package-discovery warnings while preserving the wheel contents.
+- Add a regression contract for warning-free package configuration.
+
 ## 1.3.3 - 2026-07-28
 
 - Let users bind confirmed and challenged memory references when recording a real Context outcome.

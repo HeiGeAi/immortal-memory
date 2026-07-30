@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "immortal-memory"
-version = "1.3.3"
+version = "1.3.4"
 description = "Local-first personal memory layer for AI agents"
 requires-python = ">=3.9"
 license = "MIT"
@@ -18,7 +18,12 @@ Repository = "https://github.com/HeiGeAi/immortal-memory"
 immortal-memory = "immortal_memory.cli:main"
 
 [tool.setuptools]
-packages = ["immortal_memory"]
+packages = [
+  "immortal_memory",
+  "immortal_memory.agents",
+  "immortal_memory.product_assets",
+  "immortal_memory.product_assets.views",
+]
 include-package-data = true
 
 [tool.setuptools.package-dir]
