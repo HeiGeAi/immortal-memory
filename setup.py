@@ -13,7 +13,12 @@ setup(
     description="Local-first personal memory layer for AI agents",
     url="https://github.com/HeiGeAi/immortal-memory",
     python_requires=">=3.9",
-    packages=["immortal_memory"],
+    packages=[
+        "immortal_memory",
+        "immortal_memory.agents",
+        "immortal_memory.product_assets",
+        "immortal_memory.product_assets.views",
+    ],
     package_dir={"immortal_memory": "core"},
     include_package_data=True,
     package_data={

@@ -32,11 +32,11 @@ class VersionGovernanceTest(unittest.TestCase):
                 immortal.main(["--version"])
 
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(version, "1.3.3")
+        self.assertEqual(version, "1.3.4")
         self.assertIsNotNone(project_version)
         self.assertEqual(project_version.group(1), version)
         self.assertIn(f"version-v{version}-", readme)
-        self.assertEqual(output.getvalue().strip(), "immortal 1.3.3")
+        self.assertEqual(output.getvalue().strip(), "immortal 1.3.4")
 
         setup_version = subprocess.run(
             [sys.executable, "setup.py", "--version"],
