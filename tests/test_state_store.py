@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import os
 import tempfile
 import threading
 import unittest
@@ -6,6 +8,18 @@ from pathlib import Path
 from unittest import mock
 
 import state_store
+
+
+def _hold_state_lock(path, ready, release):
+    def delayed_update(current):
+        ready.set()
+        release.wait(timeout=5)
+        current["holder"] = True
+        return current
+
+    state_store.mutate_state_atomic(
+        Path(path), delayed_update, timeout=1.0, stale_after=0.0
+    )
 
 
 class StateStoreTest(unittest.TestCase):
@@ -55,6 +69,47 @@ class StateStoreTest(unittest.TestCase):
             state_store.update_state_atomic(self.path, {"new": "value"})
 
         self.assertEqual(self.path.read_text(encoding="utf-8"), "{broken")
+
+    def test_live_owner_is_not_reclaimed_only_because_lock_is_old(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_state_lock, args=(str(self.path), ready, release)
+        )
+        holder.start()
+        self.addCleanup(lambda: holder.is_alive() and holder.terminate())
+        self.assertTrue(ready.wait(timeout=3), "holder did not acquire lock")
+
+        with self.assertRaises(TimeoutError):
+            state_store.update_state_atomic(
+                self.path,
+                {"contender": True},
+                timeout=0.15,
+                stale_after=0.0,
+            )
+
+        release.set()
+        holder.join(timeout=3)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder.exitcode, 0)
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8")), {"holder": True}
+        )
+
+    def test_dead_owner_lock_is_reclaimed(self):
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        lock_path.write_text(
+            json.dumps({"pid": 99999999, "created_at": 0}), encoding="utf-8"
+        )
+        os.utime(lock_path, (0, 0))
+
+        result = state_store.update_state_atomic(
+            self.path, {"recovered": True}, timeout=0.5, stale_after=0.0
+        )
+
+        self.assertEqual(result, {"recovered": True})
+        self.assertFalse(lock_path.exists())
 
 
 if __name__ == "__main__":
