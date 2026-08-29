@@ -75,24 +75,35 @@ def _lock_is_stale(lock_path: Path, stale_after: float) -> bool:
 def _acquire_lock(lock_path: Path, timeout: float, stale_after: float) -> Tuple[int, str]:
     deadline = time.monotonic() + timeout
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            lock_id = uuid.uuid4().hex
-            payload = json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "hostname": socket.gethostname(),
-                    "process_start": _process_start_identity(os.getpid()),
-                    "lock_id": lock_id,
-                    "created_at": time.time(),
-                },
-                ensure_ascii=True,
-            ).encode("ascii")
-            os.write(fd, payload)
-            os.fsync(fd)
-            return fd, lock_id
-        except FileExistsError:
+    lock_id = uuid.uuid4().hex
+    payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "process_start": _process_start_identity(os.getpid()),
+            "lock_id": lock_id,
+            "created_at": time.time(),
+        },
+        ensure_ascii=True,
+    ).encode("ascii")
+    fd, unpublished_path = tempfile.mkstemp(
+        dir=str(lock_path.parent),
+        prefix=f".{lock_path.name}.",
+        suffix=".pending",
+    )
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+        while True:
+            try:
+                os.link(unpublished_path, lock_path)
+                try:
+                    os.unlink(unpublished_path)
+                except OSError:
+                    pass
+                return fd, lock_id
+            except FileExistsError:
+                pass
             try:
                 original_stat = lock_path.stat()
             except FileNotFoundError:
@@ -111,6 +122,13 @@ def _acquire_lock(lock_path: Path, timeout: float, stale_after: float) -> Tuple[
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for state lock: {lock_path}")
             time.sleep(0.02)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(unpublished_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
