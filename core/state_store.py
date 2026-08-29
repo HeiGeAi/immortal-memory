@@ -92,7 +92,12 @@ def _acquire_lock(lock_path: Path, timeout: float, stale_after: float) -> Tuple[
         suffix=".pending",
     )
     try:
-        os.write(fd, payload)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("failed to write complete state lock identity")
+            remaining = remaining[written:]
         os.fsync(fd)
         while True:
             try:

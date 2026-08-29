@@ -175,6 +175,31 @@ class StateStoreTest(unittest.TestCase):
         self.assertIsInstance(holder_errors[0], TimeoutError)
         self.assertEqual(entered, ["contender"])
 
+    def test_short_write_cannot_publish_a_partial_lock_identity(self):
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        original_write = state_store.os.write
+        calls = 0
+
+        def short_first_write(fd, payload):
+            nonlocal calls
+            calls += 1
+            chunk = payload[:1] if calls == 1 else payload
+            return original_write(fd, chunk)
+
+        with mock.patch.object(state_store.os, "write", side_effect=short_first_write):
+            fd, lock_id = state_store._acquire_lock(
+                lock_path,
+                timeout=0.5,
+                stale_after=0.0,
+            )
+        try:
+            published = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(published["lock_id"], lock_id)
+            self.assertGreater(calls, 1)
+        finally:
+            os.close(fd)
+            lock_path.unlink(missing_ok=True)
+
     def test_dead_owner_lock_is_reclaimed(self):
         lock_path = self.path.with_name(self.path.name + ".lock")
         lock_path.write_text(
