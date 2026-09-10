@@ -258,21 +258,20 @@ class ProductIndexIntegrity:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        uri = self.database_path.resolve().as_uri() + "?mode=ro&immutable=1"
+        uri = self.database_path.resolve().as_uri() + "?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=3)
         connection.execute("PRAGMA query_only=ON")
         return connection
 
     def _database_signature(self) -> Tuple[Any, ...]:
-        wal_path = Path(str(self.database_path) + "-wal")
-        try:
-            wal = self._regular_file(wal_path)
-        except FileNotFoundError:
-            pass
-        else:
-            if wal.st_size:
-                raise ValueError("search index has a non-empty WAL")
-        return (self._signature(self._regular_file(self.database_path)),)
+        result = [self._signature(self._regular_file(self.database_path))]
+        for suffix in ("-wal", "-shm"):
+            path = Path(str(self.database_path) + suffix)
+            try:
+                result.append(self._signature(self._regular_file(path)))
+            except FileNotFoundError:
+                result.append(None)
+        return tuple(result)
 
     def _verification_identity(
         self,
@@ -403,11 +402,10 @@ class ProductIndexIntegrity:
             identity, sort_keys=True, separators=(",", ":")
         )
         # The surrounding shared source/database locks make the identity
-        # stable against cooperative index publishers. Immutable reads reject
-        # a non-empty WAL and bind the receipt to the main database identity;
-        # mutable SHM bookkeeping is deliberately not a generation identity.
-        # This is not a claim of protection from an attacker that bypasses the
-        # repository lock contract and restores file metadata.
+        # stable against cooperative index publishers. Main, WAL, and SHM
+        # signatures invalidate the receipt after a published generation
+        # changes; this is not a claim of protection from an attacker that
+        # bypasses the repository lock contract and restores file metadata.
         # The receipt itself is re-read on every access so a long-running
         # process cannot hide later corruption behind its in-memory cache.
         receipt_path = self.vault_dir / "product" / "index-verification.json"

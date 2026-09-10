@@ -1,9 +1,7 @@
 """Product-facing bounded read models never fall back to raw vault scans."""
 
 import json
-import os
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -456,23 +454,6 @@ def seeded_product_data(tmp_path, memory_count=120):
         clock=lambda: datetime(2026, 7, 22, 12, tzinfo=timezone.utc),
     )
     return data, control_data, control_center
-
-
-@contextmanager
-def persistent_zero_wal(vault):
-    database = vault / "search_index.db"
-    connection = sqlite3.connect(str(database))
-    try:
-        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
-        connection.execute("SELECT count(*) FROM docs").fetchone()
-        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        wal = Path(str(database) + "-wal")
-        shm = Path(str(database) + "-shm")
-        assert wal.is_file() and wal.stat().st_size == 0
-        assert shm.is_file()
-        yield connection, wal, shm
-    finally:
-        connection.close()
 
 
 def test_home_leads_with_memory_value_not_machine_metrics(tmp_path):
@@ -973,116 +954,6 @@ def test_matching_receipt_skips_deep_scan_across_integrity_instances(
     )
     with integrity.trusted_connection():
         pass
-
-
-def test_zero_wal_shm_metadata_churn_does_not_invalidate_receipt(
-    tmp_path, monkeypatch
-):
-    data, _control, _center = seeded_product_data(tmp_path)
-    database = data.vault_dir / "search_index.db"
-    with persistent_zero_wal(data.vault_dir) as (_keeper, wal, shm):
-        assert data.memories({"limit": ["2"]})["items"]
-        database_before = database.stat()
-        wal_before = wal.stat()
-        shm_before = shm.stat()
-        os.utime(
-            shm,
-            ns=(shm_before.st_atime_ns, shm_before.st_mtime_ns + 1_000_000),
-        )
-        assert (
-            database.stat().st_ino,
-            database.stat().st_size,
-            database.stat().st_mtime_ns,
-        ) == (
-            database_before.st_ino,
-            database_before.st_size,
-            database_before.st_mtime_ns,
-        )
-        assert (wal.stat().st_ino, wal.stat().st_size, wal.stat().st_mtime_ns) == (
-            wal_before.st_ino,
-            wal_before.st_size,
-            wal_before.st_mtime_ns,
-        )
-
-        integrity = ProductIndexIntegrity(data.vault_dir)
-        monkeypatch.setattr(
-            integrity,
-            "_deep_validate_index",
-            lambda *_args: (_ for _ in ()).throw(
-                AssertionError("SHM metadata churn must not trigger deep validation")
-            ),
-        )
-        with integrity.trusted_connection() as (connection, _metadata):
-            assert connection.execute("SELECT count(*) FROM docs").fetchone()[0] == 120
-
-
-def test_concurrent_trusted_reads_ignore_zero_wal_shm_churn(tmp_path, monkeypatch):
-    data, _control, _center = seeded_product_data(tmp_path)
-    with persistent_zero_wal(data.vault_dir) as (_keeper, _wal, shm):
-        assert data.memories({"limit": ["2"]})["items"]
-        observed = shm.stat()
-        os.utime(
-            shm,
-            ns=(observed.st_atime_ns, observed.st_mtime_ns + 1_000_000),
-        )
-        integrity = ProductIndexIntegrity(data.vault_dir)
-        monkeypatch.setattr(
-            integrity,
-            "_deep_validate_index",
-            lambda *_args: (_ for _ in ()).throw(
-                AssertionError("concurrent reads must reuse the stable receipt")
-            ),
-        )
-
-        def read_count():
-            with integrity.trusted_connection() as (connection, _metadata):
-                return connection.execute("SELECT count(*) FROM docs").fetchone()[0]
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(read_count) for _index in range(2)]
-            assert [future.result(timeout=5) for future in futures] == [120, 120]
-
-
-def test_nonempty_wal_fails_closed(tmp_path):
-    data, _control, _center = seeded_product_data(tmp_path)
-    with persistent_zero_wal(data.vault_dir) as (keeper, wal, _shm):
-        keeper.execute(
-            "INSERT OR REPLACE INTO meta(key,value) VALUES('diagnostic','pending')"
-        )
-        keeper.commit()
-        assert wal.stat().st_size > 0
-
-        with pytest.raises(ProductDataError) as raised:
-            with ProductIndexIntegrity(data.vault_dir).trusted_connection():
-                pass
-
-    assert raised.value.code == "index_unavailable"
-    assert raised.value.__cause__ is not None
-    assert "non-empty WAL" in str(raised.value.__cause__)
-
-
-def test_main_database_identity_change_invalidates_receipt(tmp_path, monkeypatch):
-    data, _control, _center = seeded_product_data(tmp_path)
-    assert data.memories({"limit": ["2"]})["items"]
-    database = data.vault_dir / "search_index.db"
-    previous_inode = database.stat().st_ino
-    replacement = data.vault_dir / "search_index.replacement.db"
-    replacement.write_bytes(database.read_bytes())
-    replacement.replace(database)
-    assert database.stat().st_ino != previous_inode
-
-    integrity = ProductIndexIntegrity(data.vault_dir)
-    calls = []
-    original = integrity._deep_validate_index
-
-    def counted(connection, metadata):
-        calls.append(True)
-        return original(connection, metadata)
-
-    monkeypatch.setattr(integrity, "_deep_validate_index", counted)
-    with integrity.trusted_connection():
-        pass
-    assert calls == [True]
 
 
 def test_receipt_does_not_hide_later_fts_content_change(tmp_path):

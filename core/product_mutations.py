@@ -47,7 +47,7 @@ ID_RE = re.compile(r"\A[A-Za-z0-9._:@+-]{1,180}\Z")
 HASH_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 ACTOR = {"kind": "owner", "id": "local-owner"}
 SAFE_DOMAIN_CODES = frozenset({
-    "card_id_required", "claim_event_corruption", "claim_id_required", "claim_not_found",
+    "card_id_required", "claim_event_corruption", "claim_id_required",
     "compile_commit_failed", "context_budget_too_small", "context_not_ready",
     "context_budget_exceeded", "context_expired", "context_not_found",
     "custom_scope_id_required", "derived_store_invalid", "derived_store_limit",
@@ -457,7 +457,7 @@ class ProductMutationCoordinator:
         if route == "/api/v2/contexts":
             return "compile", "collection"
         routes = (
-            (r"/api/v2/claims/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject", "reconsider", "correct"}, "claim_action"),
+            (r"/api/v2/claims/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject"}, "claim_action"),
             (r"/api/v2/self/items/([A-Za-z0-9._:@+-]{1,180})/actions", {"correct"}, "self_action"),
             (r"/api/v2/self/versions/([A-Za-z0-9._:@+-]{1,180})/restore", None, "restore"),
             (r"/api/v2/judgments/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject", "correct", "record_outcome", "retire"}, "judgment_action"),
@@ -725,27 +725,10 @@ class ProductMutationCoordinator:
         raise MutationError("not_found", "mutation route was not found")
 
     def _claim_action(self, claim_id: str, body: Mapping[str, Any], **meta: Any) -> Dict[str, Any]:
-        action = body.get("action")
-        contracts = {
-            "confirm": (),
-            "reject": (),
-            "reconsider": ("evidence_ids",),
-            "correct": ("statement",),
-        }
-        if action not in contracts:
+        _fields(body, ("action", "expected_version", "reason"), ("action", "expected_version", "reason"))
+        action = body["action"]
+        if action not in {"confirm", "reject"}:
             raise MutationError("invalid_transition", "Claim action is not supported")
-        specific = contracts[action]
-        common = ("action", "expected_version", "reason")
-        _fields(body, common + specific, common + specific)
-        expected_revision = _integer(body["expected_version"], "expected_version")
-        reason = _text(body["reason"], "reason", maximum=500)
-        native = {
-            "expected_revision": expected_revision,
-            "request_id": meta["request_id"],
-            "idempotency_key": meta["idempotency_key"],
-            "actor": ACTOR,
-            "reason": reason,
-        }
         try:
             current = self.living_self.current()
         except FileNotFoundError:
@@ -755,31 +738,15 @@ class ProductMutationCoordinator:
             if isinstance(current, Mapping)
             else None
         )
-        claim_key = _identifier(claim_id, "claim_id")
-        if action in {"confirm", "reject"}:
-            claim = self.claims.transition(
-                claim_key,
-                "confirmed" if action == "confirm" else "rejected",
-                **native,
-            )
-        elif action == "reconsider":
-            evidence_ids = body["evidence_ids"]
-            if not isinstance(evidence_ids, list) or any(
-                not isinstance(item, str) or ID_RE.fullmatch(item) is None
-                for item in evidence_ids
-            ):
-                raise MutationError("invalid_request", "evidence_ids is invalid")
-            claim = self.claims.reconsider(
-                claim_key,
-                evidence_ids=list(evidence_ids),
-                **native,
-            )
-        else:
-            claim = self.claims.correct(
-                claim_key,
-                _text(body["statement"], "statement", maximum=8000),
-                **native,
-            )
+        claim = self.claims.transition(
+            _identifier(claim_id, "claim_id"),
+            "confirmed" if action == "confirm" else "rejected",
+            expected_revision=_integer(body["expected_version"], "expected_version"),
+            request_id=meta["request_id"],
+            idempotency_key=meta["idempotency_key"],
+            actor=ACTOR,
+            reason=_text(body["reason"], "reason", maximum=500),
+        )
         result_id = meta["preallocated"].get("version_id")
         if (
             meta.get("recovering")
