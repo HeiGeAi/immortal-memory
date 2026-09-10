@@ -498,6 +498,7 @@ EXPECTED_ACCESS_BOUNDARY_MARKERS = (
     "no permission to access this meeting's minute",
     "user lacks permission for the requested resource",
     "resource deleted",
+    "data not exist",
 )
 
 

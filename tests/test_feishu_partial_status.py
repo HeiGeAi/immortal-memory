@@ -85,3 +85,16 @@ class OrchestratorPartialTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_deleted_recording_is_skipped_not_failed(self):
+        # 已在飞书端删除的会议录像：搜索窗口会反复带回该会议，必须降级为 skip，
+        # 否则一条坏 id 会把 feishu-vc-recording 源打成 partial 并污染 doctor/health。
+        self.assertTrue(feishu_collect.is_expected_access_boundary(
+            "feishu-vc-recording", "7682642044683439304: failed to query recording: data not exist"
+        ))
+        self.assertTrue(feishu_collect.is_expected_access_boundary(
+            "feishu-vc-recording", "resource deleted"
+        ))
+        self.assertFalse(feishu_collect.is_expected_access_boundary(
+            "feishu-vc-recording", "internal server error"
+        ))
