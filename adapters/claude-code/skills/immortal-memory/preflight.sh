@@ -14,4 +14,4 @@ if [ ! -f "$CORE" ]; then
 EOF
   exit 3
 fi
-exec python3 "$CORE" preflight --json "$@"
+exec python3 -B "$CORE" preflight --json "$@"

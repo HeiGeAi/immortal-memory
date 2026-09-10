@@ -1,56 +1,49 @@
 ---
 name: immortal-memory
-description: Use this skill whenever the user asks about personal memory, long-term context, writing style, historical decisions, anti-loss backup, digital agent training, task-local context, recall, or using their own corpus inside Codex. This skill connects Codex to the standalone Immortal Memory product through the local agent bridge.
+description: Use when a task depends on the user's personal memory, writing style, project history, preferences, relationships, past decisions, or digital agent training. Connects Codex to the standalone Immortal Memory product.
 ---
 
 # Immortal Memory Adapter
 
-This is a thin Codex adapter for the standalone Immortal Memory product.
-
-The product core is installed outside this skill at:
-
-```text
-~/.local/share/immortal-memory/core/
-```
-
-Private data lives in:
-
-```text
-~/.immortal/
-```
-
-## Default Flow
-
-For tasks involving the user's preferences, history, writing style, relationships,
-projects, decisions, or digital agent behavior, first create a reviewable preview:
+Before doing a task that depends on user-specific context, create a reviewable
+preview:
 
 ```bash
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer
+python3 -B ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer
 ```
 
 Read the returned `context_json`. A preview is not task context. After reviewing
 its selection, compile that exact preview:
 
 ```bash
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer --preview-id "<preview_id>" --preview-hash "<preview_hash>" --print
+python3 -B ~/.local/share/immortal-memory/core/immortal.py agent-context "<current task>" --mode reviewer --preview-id "<preview_id>" --preview-hash "<preview_hash>" --print
 ```
 
-Continue only when the command reports `lifecycle_status=compiled`. Use the
-printed pack as task-local context. Do not read the full raw vault by default.
+`lifecycle_status=compiled` alone does not authorize use. It means the exact
+pack is frozen and ready for verification, not that Codex has accepted
+it for this run.
 
-## Commands
+Verify the compiled metadata fields `context_id`, `content_hash`,
+`context_markdown_hash`, `pack_snapshot_hash`, and `stream_version` against the
+pack actually loaded for this run. Only after Codex has accepted that
+exact pack, acknowledge it:
 
 ```bash
-python3 ~/.local/share/immortal-memory/core/immortal.py health
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-entry
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-context "<task>" --mode reviewer
-python3 ~/.local/share/immortal-memory/core/immortal.py recall "<topic>"
-python3 ~/.local/share/immortal-memory/core/immortal.py agent-factory
+python3 -B ~/.local/share/immortal-memory/core/immortal.py context-ack "<context_id>" --expected-version "<stream_version>" --content-hash "<content_hash>" --context-markdown-hash "<context_markdown_hash>" --pack-snapshot-hash "<pack_snapshot_hash>" --adapter Codex --run-ref "<stable opaque run id>"
 ```
 
-## Safety
+Continue only when the acknowledgement returns `lifecycle_status=consumed`;
+then use the printed pack as task-local memory. The run ID must be opaque and
+contain no task or session text. Retrying the same acknowledgement returns the
+same receipt. Do not read the full raw vault, acknowledge an unused pack, or
+write an Outcome automatically. Human manual confirmation remains a separate
+fallback.
 
-- Summarize sensitive records.
-- Verify factual claims with `recall` when the exact source matters.
-- Do not claim to fully replace the user.
-- Do not expose raw private chats unless explicitly requested and appropriate.
+Useful commands:
+
+```bash
+python3 -B ~/.local/share/immortal-memory/core/immortal.py health
+python3 -B ~/.local/share/immortal-memory/core/immortal.py recall "<topic>"
+python3 -B ~/.local/share/immortal-memory/core/immortal.py agent-entry
+python3 -B ~/.local/share/immortal-memory/core/immortal.py context-ack "<context_id>" --expected-version "<stream_version>" --content-hash "<content_hash>" --context-markdown-hash "<context_markdown_hash>" --pack-snapshot-hash "<pack_snapshot_hash>" --adapter Codex --run-ref "<run id>"
+```
