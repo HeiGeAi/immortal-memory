@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
-from control_center import ControlCenter, candidate_scheduler_labels
+import control_center
+from control_center import ControlCenter, candidate_scheduler_labels, default_scheduler_probe
 
 
 NOW = datetime(2026, 7, 18, 10, 0, tzinfo=timezone.utc)
@@ -181,3 +183,52 @@ def test_scheduler_candidates_are_discovered_without_owner_specific_code(tmp_pat
 
     assert "com.example.immortal.daily-backup" in labels
     assert "com.example.unrelated" not in labels
+
+
+def test_scheduler_probe_marks_nonzero_last_exit_as_attention(monkeypatch):
+    monkeypatch.setattr(
+        control_center,
+        "candidate_scheduler_labels",
+        lambda: ["com.example.immortal.daily-backup"],
+    )
+    monkeypatch.setattr(control_center.os, "getuid", lambda: 501)
+    monkeypatch.setattr(
+        control_center.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="state = running\nlast exit code = 2\n",
+            stderr="",
+        ),
+    )
+
+    result = default_scheduler_probe()
+
+    assert result["status"] == "attention"
+    assert "最近一次退出码 2" in result["detail"]
+    assert "查看运行记录" in result["detail"]
+    assert "last_exit_code=2" in result["evidence"]
+
+
+def test_feedback_partial_is_an_explicit_attention_proof(tmp_path):
+    write_json(
+        tmp_path / "feedback" / "latest.json",
+        {
+            "generated_at": (NOW - timedelta(minutes=2)).isoformat(),
+            "status": "partial",
+            "run_status": 0,
+            "notification": {"requested": True, "status": "sent"},
+        },
+    )
+
+    snapshot = make_center(
+        tmp_path,
+        scheduler={"status": "healthy", "detail": "LaunchAgent 已加载"},
+    ).build_snapshot()
+    feedback = next(item for item in snapshot["proofs"] if item["id"] == "feedback")
+
+    assert snapshot["status"] == "attention"
+    assert feedback["status"] == "attention"
+    assert "部分成功" in feedback["detail"]
+    assert "pipeline=partial" in feedback["evidence"]
+    assert "notification=sent" in feedback["evidence"]

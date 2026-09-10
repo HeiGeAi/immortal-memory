@@ -36,6 +36,10 @@
   ],
   "owner_display_name": "Your Name",
   "owner_name": "",
+  "people_index": {
+    "categories": {},
+    "identities": []
+  },
   "primary_account": "Main Account",
   "role_defaults": {
     "goal": "写稿审稿流程",

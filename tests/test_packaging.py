@@ -23,6 +23,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PackagingTest(unittest.TestCase):
+    def test_asset_directories_are_explicit_distribution_packages(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        for package in (
+            "immortal_memory.agents",
+            "immortal_memory.product_assets",
+            "immortal_memory.product_assets.views",
+        ):
+            self.assertIn(f'"{package}"', pyproject)
+
+    def test_agent_adapters_document_preview_then_approved_compile(self) -> None:
+        paths = [
+            ROOT / "adapters" / "codex" / "skills" / "immortal-memory" / "SKILL.md",
+            ROOT
+            / "adapters"
+            / "claude-code"
+            / "skills"
+            / "immortal-memory"
+            / "SKILL.md",
+            ROOT / "adapters" / "claude-code" / "CLAUDE.md",
+        ]
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("--preview-id", text, msg=str(path))
+            self.assertIn("--preview-hash", text, msg=str(path))
+            self.assertIn("lifecycle_status=compiled", text, msg=str(path))
+
     def test_cli_command_shell_quotes_each_argument(self) -> None:
         hostile_path = "/tmp/$(touch /tmp/immortal-command-injection)"
         command = cli_command("restore-check", hostile_path)
@@ -82,6 +108,7 @@ class PackagingTest(unittest.TestCase):
                 0,
                 msg=f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}",
             )
+            self.assertNotIn("Package would be ignored", build.stdout + build.stderr)
             wheels = list(wheel_dir.glob("immortal_memory-*.whl"))
             self.assertEqual(len(wheels), 1, msg=f"built wheels: {wheels}")
 
@@ -189,6 +216,17 @@ class PackagingTest(unittest.TestCase):
             self.assertIn("immortal-memory restore-check", restore_guide.stdout)
             self.assertNotIn("python3 install.py", restore_guide.stdout)
             self.assertNotIn("~/.codex/skills/immortal/immortal.py", restore_guide.stdout)
+
+            cards = subprocess.run(
+                [str(command), "cards", "stats"],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+            self.assertEqual(cards.returncode, 0, msg=cards.stderr)
+            self.assertEqual(json.loads(cards.stdout)["total"], 0)
+            self.assertNotIn("cards.py", cards.stdout + cards.stderr)
 
             product = subprocess.run(
                 [str(command), "product"],

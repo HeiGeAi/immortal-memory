@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import export_restore
 from redact_common import redact
 
 
@@ -36,11 +37,15 @@ class ControlData:
         skill_dir: Path | None = None,
         listen_address: str = "127.0.0.1",
         listen_port: int = 8765,
+        actions_enabled: bool = True,
+        action_reason: str = "",
     ) -> None:
         self.immortal_dir = Path(immortal_dir)
         self.skill_dir = Path(skill_dir) if skill_dir else Path(__file__).resolve().parent
         self.listen_address = listen_address
         self.listen_port = int(listen_port)
+        self.actions_enabled = bool(actions_enabled)
+        self.action_reason = str(action_reason or "")
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def capabilities(self) -> dict[str, Any]:
@@ -68,7 +73,9 @@ class ControlData:
                 }
                 for module_id in MODULE_IDS
             ],
-            "actions": ["run", "health", "backup_verify", "profile_refresh"],
+            "actions": ["run", "health", "backup_verify", "profile_refresh"] if self.actions_enabled else [],
+            "actions_available": self.actions_enabled,
+            "action_reason": self.action_reason if not self.actions_enabled else "",
         }
 
     def readiness(self) -> tuple[int, dict[str, Any]]:
@@ -387,6 +394,13 @@ class ControlData:
     def sources(self) -> dict[str, Any]:
         state = self._read_json(self.immortal_dir / "orchestrator_state.json")
         web = self._read_json(self.immortal_dir / "web" / "state.json")
+        config = self._read_json(self.immortal_dir / "config.json")
+        feishu = config.get("feishu") if isinstance(config.get("feishu"), dict) else {}
+        daily_sources = {item.strip() for item in str(feishu.get("daily_sources") or "").split(",") if item.strip()}
+        external_config = config.get("external_sources") if isinstance(config.get("external_sources"), dict) else {}
+        external_state = self._read_json(self.immortal_dir / "external_sources" / "state.json")
+        external_results = external_state.get("sources") if isinstance(external_state.get("sources"), dict) else {}
+        external_last = str(external_state.get("generated_at") or "")
         source_specs = [
             {
                 "id": "local",
@@ -409,6 +423,43 @@ class ControlData:
                 "errors": sum("feishu" in str(item) for item in (state.get("errors") or [])),
                 "evidence": "feishu/state.json",
             },
+            {
+                "id": "feishu-mail",
+                "label": "飞书邮件（显式授权）",
+                "last": str(state.get("last_feishu_collect") or "") if "mail" in daily_sources else "",
+                "status": self._source_status(state.get("last_feishu_status"), has_success=bool(state.get("last_feishu_collect")))
+                if "mail" in daily_sources else "skipped",
+                "increment": 0,
+                "errors": 0,
+                "evidence": "config.json + feishu/state.json",
+            },
+            *[
+                {
+                    "id": source_id,
+                    "label": label,
+                    "last": external_last if enabled else "",
+                    "status": self._source_status(result.get("status"), has_success=bool(external_last)) if enabled else "skipped",
+                    "increment": int(result.get("records_written") or 0),
+                    "errors": int(result.get("error_count") or 0),
+                    "evidence": "config.json + external_sources/state.json",
+                }
+                for kind, source_id, label in (
+                    ("git", "git-history", "Git 本地历史"),
+                    ("github", "github-history", "GitHub PR / Issue"),
+                    ("claude-web", "claude-web", "Claude Web 导出"),
+                    ("chatgpt", "chatgpt", "ChatGPT 导出"),
+                    ("cursor", "cursor", "Cursor 导出"),
+                )
+                for configured in [external_config.get(kind) if isinstance(external_config.get(kind), dict) else {}]
+                for enabled in [bool(
+                    configured.get("enabled")
+                    and (
+                        configured.get("paths")
+                        or (kind == "github" and configured.get("repositories"))
+                    )
+                )]
+                for result in [external_results.get(kind) if isinstance(external_results.get(kind), dict) else {}]
+            ],
             {
                 "id": "web",
                 "label": "网页访问",
@@ -519,7 +570,15 @@ class ControlData:
                 {
                     "id": "create_context",
                     "fields": ["goal", "mode"],
-                    "modes": ["auto", "answer", "code", "research", "plan"],
+                    "modes": [
+                        "auto",
+                        "advisor",
+                        "writer",
+                        "reviewer",
+                        "business",
+                        "project",
+                        "custom",
+                    ],
                 }
             ],
         }
@@ -543,6 +602,109 @@ class ControlData:
                 name: self._file_metadata(manifest_path.parent / name)
                 for name in ("TASK_CONTEXT.md", "SYSTEM_PROMPT.md", "manifest.json")
             },
+        }
+
+    def _cloud_recovery(self) -> dict[str, str]:
+        """Map private recovery proof to the tiny safe System-view contract."""
+        unavailable = {
+            "status": "unknown",
+            "provider": "",
+            "last_verified_at": "",
+            "verification": "",
+            "source_binding": "missing",
+            "reason_code": "cloud_recovery_status_unavailable",
+            "action": "在终端完成加密上传与恢复演练",
+        }
+        allowed_reasons = {
+            "cloud_not_configured",
+            "cloud_recovery_drill_pending",
+            "cloud_upload_receipt_invalid",
+            "cloud_drill_receipt_missing_or_unsafe",
+            "cloud_drill_receipt_invalid",
+            "cloud_source_index_unreadable",
+            "cloud_source_index_hash_mismatch",
+            "cloud_vault_unsafe",
+            "cloud_recovery_validator_unavailable",
+        }
+        try:
+            evidence = export_restore.get_feishu_recovery_backup_status(
+                self.immortal_dir
+            )
+        except Exception:
+            return unavailable
+        if not isinstance(evidence, dict):
+            return unavailable
+
+        warnings = evidence.get("warnings")
+        raw_reason = str(warnings[0]) if isinstance(warnings, list) and warnings else ""
+        reason = raw_reason if raw_reason in allowed_reasons else ""
+        raw_timestamp = str(evidence.get("generated_at") or "")
+        try:
+            parsed_timestamp = datetime.fromisoformat(raw_timestamp.replace("Z", "+00:00"))
+            timestamp = raw_timestamp if parsed_timestamp.tzinfo is not None else ""
+        except ValueError:
+            timestamp = ""
+        verification = evidence.get("verification")
+        verification_mode = (
+            str(verification.get("mode") or "")
+            if isinstance(verification, dict)
+            else ""
+        )
+        if verification_mode != "remote-download-sha256+decrypt-restore":
+            verification_mode = ""
+        recovery_drill = evidence.get("recovery_drill")
+        source_binding = evidence.get("source_binding")
+        is_verified = bool(
+            evidence.get("ok") is True
+            and evidence.get("provider") == "feishu_drive"
+            and isinstance(verification, dict)
+            and verification.get("ok") is True
+            and verification_mode
+            and isinstance(recovery_drill, dict)
+            and recovery_drill.get("ok") is True
+            and recovery_drill.get("mode") == "decrypt-restore"
+            and isinstance(source_binding, dict)
+            and source_binding.get("ok") is True
+        )
+        if is_verified:
+            return {
+                "status": "verified",
+                "provider": "Feishu Drive",
+                "last_verified_at": timestamp,
+                "verification": verification_mode,
+                "source_binding": "matched",
+                "reason_code": "",
+                "action": "无需操作",
+            }
+
+        binding_state = (
+            "mismatch" if reason == "cloud_source_index_hash_mismatch" else "missing"
+        )
+        if reason == "cloud_not_configured":
+            return {
+                **unavailable,
+                "reason_code": reason,
+            }
+        if reason == "cloud_recovery_drill_pending":
+            return {
+                "status": "attention",
+                "provider": "Feishu Drive",
+                "last_verified_at": timestamp,
+                "verification": verification_mode,
+                "source_binding": binding_state,
+                "reason_code": reason,
+                "action": "在终端执行恢复演练",
+            }
+        return {
+            "status": "attention",
+            "provider": "Feishu Drive"
+            if evidence.get("provider") == "feishu_drive"
+            else "",
+            "last_verified_at": timestamp,
+            "verification": verification_mode,
+            "source_binding": binding_state,
+            "reason_code": reason or "cloud_recovery_status_unavailable",
+            "action": "在终端核对证据并重新恢复演练",
         }
 
     def backups(self) -> dict[str, Any]:
@@ -616,6 +778,7 @@ class ControlData:
             )
         return {
             "items": items,
+            "cloud_recovery": self._cloud_recovery(),
             "actions": [{"id": "verify", "label": "校验最新备份"}],
             "restore_available": False,
             "delete_available": False,

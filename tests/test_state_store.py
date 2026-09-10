@@ -1,4 +1,6 @@
 import json
+import multiprocessing
+import os
 import tempfile
 import threading
 import unittest
@@ -6,6 +8,18 @@ from pathlib import Path
 from unittest import mock
 
 import state_store
+
+
+def _hold_state_lock(path, ready, release):
+    def delayed_update(current):
+        ready.set()
+        release.wait(timeout=5)
+        current["holder"] = True
+        return current
+
+    state_store.mutate_state_atomic(
+        Path(path), delayed_update, timeout=1.0, stale_after=0.0
+    )
 
 
 class StateStoreTest(unittest.TestCase):
@@ -55,6 +69,150 @@ class StateStoreTest(unittest.TestCase):
             state_store.update_state_atomic(self.path, {"new": "value"})
 
         self.assertEqual(self.path.read_text(encoding="utf-8"), "{broken")
+
+    def test_live_owner_is_not_reclaimed_only_because_lock_is_old(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        release = context.Event()
+        holder = context.Process(
+            target=_hold_state_lock, args=(str(self.path), ready, release)
+        )
+        holder.start()
+        self.addCleanup(lambda: holder.is_alive() and holder.terminate())
+        self.assertTrue(ready.wait(timeout=3), "holder did not acquire lock")
+
+        with self.assertRaises(TimeoutError):
+            state_store.update_state_atomic(
+                self.path,
+                {"contender": True},
+                timeout=0.15,
+                stale_after=0.0,
+            )
+
+        release.set()
+        holder.join(timeout=3)
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder.exitcode, 0)
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8")), {"holder": True}
+        )
+
+    def test_incomplete_lock_publication_is_not_reclaimed(self):
+        identity_started = threading.Event()
+        allow_identity = threading.Event()
+        contender_entered = threading.Event()
+        release_contender = threading.Event()
+        holder_errors = []
+        contender_errors = []
+        entered = []
+
+        def delayed_process_identity(_pid):
+            if threading.current_thread().name == "lock-owner":
+                identity_started.set()
+                allow_identity.wait(timeout=3)
+            return "stable-process-start"
+
+        def holder():
+            try:
+                state_store.mutate_state_atomic(
+                    self.path,
+                    lambda current: {**current, "holder": entered.append("holder") or True},
+                    timeout=0.15,
+                    stale_after=0.0,
+                )
+            except Exception as exc:
+                holder_errors.append(exc)
+
+        def contender_mutator(current):
+            entered.append("contender")
+            contender_entered.set()
+            release_contender.wait(timeout=3)
+            current["contender"] = True
+            return current
+
+        def contender():
+            try:
+                state_store.mutate_state_atomic(
+                    self.path,
+                    contender_mutator,
+                    timeout=1.0,
+                    stale_after=0.0,
+                )
+            except Exception as exc:
+                contender_errors.append(exc)
+
+        with mock.patch.object(
+            state_store,
+            "_process_start_identity",
+            side_effect=delayed_process_identity,
+        ):
+            owner = threading.Thread(target=holder, name="lock-owner")
+            owner.start()
+            self.assertTrue(
+                identity_started.wait(timeout=2),
+                "owner did not reach lock identity publication",
+            )
+            competing_writer = threading.Thread(
+                target=contender,
+                name="lock-contender",
+            )
+            competing_writer.start()
+            self.assertTrue(
+                contender_entered.wait(timeout=2),
+                "contender did not enter while owner publication was paused",
+            )
+            try:
+                allow_identity.set()
+                owner.join(timeout=2)
+            finally:
+                release_contender.set()
+                competing_writer.join(timeout=3)
+
+        self.assertFalse(owner.is_alive())
+        self.assertFalse(competing_writer.is_alive())
+        self.assertEqual(contender_errors, [])
+        self.assertEqual(len(holder_errors), 1)
+        self.assertIsInstance(holder_errors[0], TimeoutError)
+        self.assertEqual(entered, ["contender"])
+
+    def test_short_write_cannot_publish_a_partial_lock_identity(self):
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        original_write = state_store.os.write
+        calls = 0
+
+        def short_first_write(fd, payload):
+            nonlocal calls
+            calls += 1
+            chunk = payload[:1] if calls == 1 else payload
+            return original_write(fd, chunk)
+
+        with mock.patch.object(state_store.os, "write", side_effect=short_first_write):
+            fd, lock_id = state_store._acquire_lock(
+                lock_path,
+                timeout=0.5,
+                stale_after=0.0,
+            )
+        try:
+            published = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(published["lock_id"], lock_id)
+            self.assertGreater(calls, 1)
+        finally:
+            os.close(fd)
+            lock_path.unlink(missing_ok=True)
+
+    def test_dead_owner_lock_is_reclaimed(self):
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        lock_path.write_text(
+            json.dumps({"pid": 99999999, "created_at": 0}), encoding="utf-8"
+        )
+        os.utime(lock_path, (0, 0))
+
+        result = state_store.update_state_atomic(
+            self.path, {"recovered": True}, timeout=0.5, stale_after=0.0
+        )
+
+        self.assertEqual(result, {"recovered": True})
+        self.assertFalse(lock_path.exists())
 
 
 if __name__ == "__main__":

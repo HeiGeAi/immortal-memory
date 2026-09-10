@@ -29,3 +29,5 @@ jobs:
         run: PYTHONPATH=core python3 -m pytest -q
       - name: Run production-readiness scenarios
         run: python3 tests/regression_p0.py
+      - name: Living Self P0 regression
+        run: python3 tests/regression_living_self_p0.py

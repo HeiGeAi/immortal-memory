@@ -3,10 +3,13 @@
 
 import json
 import os
+import socket
+import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping
+from typing import Any, Callable, Dict, Mapping, Tuple
 
 
 def read_state(path: Path, default: Any = None) -> Any:
@@ -27,40 +30,110 @@ def _pid_is_alive(pid: int) -> bool:
         return True
 
 
+def _process_start_identity(pid: int):
+    """Return a stable-enough identity to distinguish PID reuse when available."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
 def _lock_is_stale(lock_path: Path, stale_after: float) -> bool:
     age = 0.0
     try:
         age = max(0.0, time.time() - lock_path.stat().st_mtime)
         payload = json.loads(lock_path.read_text(encoding="utf-8"))
-        pid = int(payload.get("pid") or 0) if isinstance(payload, dict) else 0
+        if not isinstance(payload, dict):
+            return lock_path.exists() and age >= stale_after
+        pid = int(payload.get("pid") or 0)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return lock_path.exists() and age >= stale_after
-    return not _pid_is_alive(pid) or age >= stale_after
+    if pid <= 0:
+        return age >= stale_after
+    recorded_host = payload.get("hostname")
+    if recorded_host and recorded_host != socket.gethostname():
+        return False
+    if not _pid_is_alive(pid):
+        return True
+    recorded_start = payload.get("process_start")
+    if recorded_start:
+        current_start = _process_start_identity(pid)
+        if current_start is None:
+            return False
+        return current_start != recorded_start
+    return False
 
 
-def _acquire_lock(lock_path: Path, timeout: float, stale_after: float) -> int:
+def _acquire_lock(lock_path: Path, timeout: float, stale_after: float) -> Tuple[int, str]:
     deadline = time.monotonic() + timeout
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            payload = json.dumps(
-                {"pid": os.getpid(), "created_at": time.time()},
-                ensure_ascii=True,
-            ).encode("ascii")
-            os.write(fd, payload)
-            os.fsync(fd)
-            return fd
-        except FileExistsError:
+    lock_id = uuid.uuid4().hex
+    payload = json.dumps(
+        {
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "process_start": _process_start_identity(os.getpid()),
+            "lock_id": lock_id,
+            "created_at": time.time(),
+        },
+        ensure_ascii=True,
+    ).encode("ascii")
+    fd, unpublished_path = tempfile.mkstemp(
+        dir=str(lock_path.parent),
+        prefix=f".{lock_path.name}.",
+        suffix=".pending",
+    )
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("failed to write complete state lock identity")
+            remaining = remaining[written:]
+        os.fsync(fd)
+        while True:
+            try:
+                os.link(unpublished_path, lock_path)
+                try:
+                    os.unlink(unpublished_path)
+                except OSError:
+                    pass
+                return fd, lock_id
+            except FileExistsError:
+                pass
+            try:
+                original_stat = lock_path.stat()
+            except FileNotFoundError:
+                continue
             if _lock_is_stale(lock_path, stale_after):
                 try:
-                    lock_path.unlink()
+                    current_stat = lock_path.stat()
+                    if (
+                        current_stat.st_dev == original_stat.st_dev
+                        and current_stat.st_ino == original_stat.st_ino
+                    ):
+                        lock_path.unlink()
                 except FileNotFoundError:
                     pass
                 continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out waiting for state lock: {lock_path}")
             time.sleep(0.02)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(unpublished_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
@@ -127,7 +200,7 @@ def mutate_state_atomic(
 ) -> Dict[str, Any]:
     """Apply a read-modify-write callback while holding the state lock."""
     lock_path = path.with_name(path.name + ".lock")
-    fd = _acquire_lock(lock_path, timeout, stale_after)
+    fd, lock_id = _acquire_lock(lock_path, timeout, stale_after)
     try:
         current = read_state(path, {})
         if not isinstance(current, dict):
@@ -140,6 +213,8 @@ def mutate_state_atomic(
     finally:
         os.close(fd)
         try:
-            lock_path.unlink()
-        except FileNotFoundError:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("lock_id") == lock_id:
+                lock_path.unlink()
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError):
             pass

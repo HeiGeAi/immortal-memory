@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from model_types import validate_living_self_version
+
 
 HOME = Path.home()
 SKILL_DIR = Path(__file__).resolve().parent
@@ -27,6 +29,7 @@ PROFILE_JSON = IMMORTAL_DIR / "profile.json"
 REVIEWED_PROFILE_JSONL = IMMORTAL_DIR / "reviewed" / "profile_memories.jsonl"
 OUTPUT_JSON = IMMORTAL_DIR / "profile_nuwa.json"
 OUTPUT_MD = IMMORTAL_DIR / "profile_nuwa.md"
+LIVING_SELF_CURRENT = IMMORTAL_DIR / "model" / "living-self" / "current.json"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 LANE_TITLES = {
@@ -534,13 +537,69 @@ def quality_gate(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_report() -> dict[str, Any]:
+def build_living_self_compat_report(current: dict[str, Any]) -> dict[str, Any]:
+    """Expose the confirmed Living Self through the legacy Nuwa entrypoint."""
+    validate_living_self_version(current)
+    if current["status"] != "confirmed":
+        raise ValueError("Living Self current must reference a confirmed version")
+    sections = current["sections"]
+    report = {
+        "version": "1.1-living-self-compat",
+        "generated_at": current["generated_at"],
+        "output_mode": "living_self_compat_export",
+        "legacy_rule_output": False,
+        "living_self": {
+            "version_id": current["version_id"],
+            "status": current["status"],
+            "content_hash": current["content_hash"],
+            "based_on_claim_seq": current["based_on_claim_seq"],
+        },
+        "inputs": {
+            "living_self_current": str(LIVING_SELF_CURRENT),
+            "living_self_version": current["version_id"],
+        },
+        "method": {
+            "source": "Confirmed Living Self compatibility export.",
+            "triple_validation": [
+                "cross_domain_recurrence",
+                "generative_power",
+                "distinctiveness",
+            ],
+        },
+        "sections": sections,
+        "identity_commitments": sections["identity_commitments"],
+        "values": sections["values"],
+        "mental_models": sections["mental_models"],
+        "decision_heuristics": sections["decision_heuristics"],
+        "expression_dna": sections["expression_dna"],
+        "anti_patterns": sections["anti_patterns"],
+        "tensions": sections["tensions"],
+        "honest_boundaries": sections["honest_boundaries"],
+        "research_lanes": {},
+        "evidence_stats": {},
+        "quality_gate": {
+            "status": "ok",
+            "checks": [
+                {
+                    "name": "Living Self contract",
+                    "ok": True,
+                    "detail": "validated current version",
+                }
+            ],
+        },
+    }
+    return report
+
+
+def build_legacy_rule_report() -> dict[str, Any]:
     profile = read_json(PROFILE_JSON, {})
     reviewed_rows = load_jsonl(REVIEWED_PROFILE_JSONL)
     evidence = load_profile_evidence(profile, reviewed_rows)
     report = {
         "version": "0.1-nuwa-profile",
         "generated_at": now_local(),
+        "output_mode": "legacy_rule_output",
+        "legacy_rule_output": True,
         "inputs": {
             "profile_json": str(PROFILE_JSON),
             "profile_generated_at": profile.get("generated_at"),
@@ -548,7 +607,7 @@ def build_report() -> dict[str, Any]:
             "evidence_records": len(evidence),
         },
         "method": {
-            "source": "Adapted from huashu-nuwa: six-lane research, triple validation, expression DNA, honest boundaries.",
+            "source": "Legacy rule output only. Accepted means a legacy candidate and never a confirmed Living Self item.",
             "triple_validation": ["cross_domain_recurrence", "generative_power", "distinctiveness"],
         },
         "research_lanes": build_research_lanes(evidence),
@@ -566,11 +625,61 @@ def build_report() -> dict[str, Any]:
     return report
 
 
+def build_report() -> dict[str, Any]:
+    if LIVING_SELF_CURRENT.is_file():
+        current = read_json(LIVING_SELF_CURRENT, {})
+        if not isinstance(current, dict):
+            raise ValueError("Living Self current must be a JSON object")
+        return build_living_self_compat_report(current)
+    return build_legacy_rule_report()
+
+
 def render_bool(value: bool) -> str:
     return "PASS" if value else "LOW"
 
 
+def render_living_self_markdown(report: dict[str, Any]) -> str:
+    living_self = report.get("living_self") or {}
+    lines = [
+        "# Living Self Compatibility Export",
+        "",
+        f"Generated: {report.get('generated_at')}",
+        f"Version: {living_self.get('version_id')}",
+        f"Status: {living_self.get('status')}",
+        f"Claim watermark: {living_self.get('based_on_claim_seq')}",
+        "",
+        "此文件直接导出已验证的 Living Self current，不使用旧 accepted 规则生成 confirmed 项。",
+        "",
+    ]
+    for section, items in (report.get("sections") or {}).items():
+        lines.extend([f"## {section}", ""])
+        if not items:
+            lines.extend(["No evidence-backed items.", ""])
+            continue
+        for item in items:
+            lines.append(f"### {item.get('title')}")
+            lines.append("")
+            lines.append(str(item.get("summary") or ""))
+            lines.append("")
+            lines.append(
+                f"- item_id: {item.get('item_id')} / status: {item.get('status')}"
+            )
+            lines.append(
+                f"- confidence: {item.get('confidence')} / claim_seq: {item.get('based_on_claim_seq')}"
+            )
+            lines.append(
+                f"- claims: {', '.join(item.get('claim_ids') or [])}"
+            )
+            lines.append(
+                f"- evidence: {', '.join(item.get('evidence_ids') or [])}"
+            )
+            lines.append("")
+    return "\n".join(lines)
+
+
 def render_markdown(report: dict[str, Any]) -> str:
+    if report.get("output_mode") == "living_self_compat_export":
+        return render_living_self_markdown(report)
     lines = [
         "# 用户本人 Nuwa Profile",
         "",
@@ -658,7 +767,10 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("## Honest Boundaries")
     lines.append("")
     for item in report.get("honest_boundaries") or []:
-        lines.append(f"- {item}")
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('summary') or item.get('title')}")
+        else:
+            lines.append(f"- {item}")
     lines.append("")
 
     lines.append("## Quality Gate")
@@ -681,6 +793,13 @@ def write_outputs(report: dict[str, Any], *, output_json: Path, output_md: Path)
 
 
 def summarize(report: dict[str, Any]) -> str:
+    if report.get("output_mode") == "living_self_compat_export":
+        living_self = report.get("living_self") or {}
+        return (
+            "Nuwa compatibility export built from Living Self: "
+            f"{living_self.get('version_id')}, "
+            f"claim_seq={living_self.get('based_on_claim_seq')}"
+        )
     accepted = sum(1 for item in report.get("mental_models") or [] if item.get("status") == "accepted")
     gate = report.get("quality_gate") or {}
     return (

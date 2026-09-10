@@ -44,6 +44,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "people": [],            # 关注人物名单，空=不做人物统计
         "topic_keywords": [],    # 话题词，空=用 distill 内置通用 AI/工作词
     },
+    "people_index": {
+        "identities": [],        # 本机私有的 canonical/aliases/category 规则
+        "categories": {},        # 无需合并别名的人物分类
+    },
     "automation": {
         "daily_launch_agent_label": "",
         "daily_schedule": [
@@ -93,8 +97,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "obsidian": {
         "enabled": True,
         "vault_path": "~/Documents/Immortal Obsidian Vault",
+        "notes_sync": {
+            "max_files": 1000,
+            "max_file_bytes": 1048576,
+            "max_total_bytes": 20971520,
+        },
     },
     "extra_sources": [],
+    "external_sources": {
+        "git": {"enabled": False, "paths": [], "max_commits": 200},
+        "github": {"enabled": False, "paths": [], "repositories": [], "max_items": 50},
+        "claude-web": {"enabled": False, "paths": []},
+        "chatgpt": {"enabled": False, "paths": []},
+        "cursor": {"enabled": False, "paths": []},
+    },
 }
 
 

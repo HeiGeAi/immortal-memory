@@ -94,6 +94,15 @@ class RuntimeTelemetry:
     ) -> dict[str, Any]:
         with self._lock:
             now = self._now()
+            previous = self._read_json(self.current_path)
+            if previous.get("status") in {"running", "stale"}:
+                previous["status"] = "interrupted"
+                previous["updated_at"] = now
+                previous["finished_at"] = now
+                previous["current_stage"] = ""
+                previous["error"] = "新运行启动前，上一运行未正常结束"
+                self._write_current(previous)
+                self._append_history(previous)
             value: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION,
                 "run_id": uuid.uuid4().hex,

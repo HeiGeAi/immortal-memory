@@ -21,6 +21,20 @@ class FeishuExitCodeTest(unittest.TestCase):
         self.assertEqual(feishu_collect.run_exit_code([{"source": "feishu-im", "message": "denied"}]), 2)
         self.assertEqual(feishu_collect.run_exit_code([]), 0)
 
+    def test_expected_access_boundaries_are_skipped_not_failed(self):
+        self.assertTrue(feishu_collect.is_expected_access_boundary(
+            "feishu-vc-note", "no notes available for this meeting"
+        ))
+        self.assertTrue(feishu_collect.is_expected_access_boundary(
+            "feishu-im", "Chat open Restricted Mode, don't allow copying or forwarding messages"
+        ))
+        self.assertTrue(feishu_collect.is_expected_access_boundary(
+            "feishu-minutes-note", "resource deleted"
+        ))
+        self.assertFalse(feishu_collect.is_expected_access_boundary(
+            "feishu-contact", "user lacks permission for the requested resource"
+        ))
+
 
 class UpdateSourcesBackupTest(unittest.TestCase):
     def test_feishu_updates_last_backup_only_for_successful_requested_sources(self):

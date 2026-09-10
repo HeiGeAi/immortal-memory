@@ -80,8 +80,8 @@ assert {item["id"] for item in capabilities["modules"]} == {
     "overview", "runs", "sources", "memories", "profile", "agent", "backup", "diagnostics"
 }
 page = urllib.request.urlopen(base + "/", timeout=5).read().decode()
-assert 'data-view="overview"' in page
-assert 'data-view="diagnostics"' in page
+assert 'data-view="home"' in page
+assert 'data-view="system"' in page
 PY
 kill "$CONTROL_PID" 2>/dev/null || true
 wait "$CONTROL_PID" 2>/dev/null || true
@@ -90,7 +90,7 @@ HOME="$TMP_HOME" python3 "$ROOT/core/immortal.py" agent-audit --limit 10 >/tmp/i
 test -s "$TMP_HOME/.immortal/agent/ENTRY.md"
 test -s "$TMP_HOME/.immortal/agent/latest-context.json"
 test -s "$TMP_HOME/.immortal/feedback/latest.md"
-test -s "$TMP_HOME/.immortal/sessions/latest.md"
+test -s "$TMP_HOME/.immortal/product/goal.json"
 test -s "$TMP_HOME/.immortal/agent/access.log"
 test -s "$TMP_HOME/.immortal/dashboard.html"
 grep -q "immortal_agent_context" /tmp/immortal-memory-mcp.txt

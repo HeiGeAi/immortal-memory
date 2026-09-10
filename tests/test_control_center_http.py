@@ -64,10 +64,11 @@ def post(url, body, *, origin=None):
         return exc.code, json.loads(exc.read())
 
 
-def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
+def test_root_serves_product_and_control_center_is_preserved(tmp_path):
     server, base = start_server(tmp_path)
     try:
         status, content_type, body = get(base + "/")
+        legacy_status, legacy_type, legacy_body = get(base + "/control-center")
         try:
             get(base + "/snapshot")
             raise AssertionError("retired snapshot unexpectedly returned success")
@@ -80,7 +81,10 @@ def test_root_serves_control_center_and_snapshot_route_is_preserved(tmp_path):
 
     assert status == 200
     assert content_type == "text/html"
-    assert b"CONTROL" in body
+    assert b"IMMORTAL" in body
+    assert legacy_status == 200
+    assert legacy_type == "text/html"
+    assert b"CONTROL" in legacy_body
     assert snapshot_status == 410
     assert "已停用".encode() in snapshot_body
 
@@ -138,10 +142,10 @@ def test_control_action_commands_are_fixed_allowlist(tmp_path):
     backup = factory._commands_for("backup_verify", {})
     profile = factory._commands_for("profile_refresh", {})
 
-    assert health[0][0][-3:] == ["health", "--max-age-hours", "30"]
-    assert "backup-status" in backup[0][0]
-    assert "--verify" in backup[0][0]
-    assert [command[0][-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
+    assert list(health[0].argv[-3:]) == ["health", "--max-age-hours", "30"]
+    assert "backup-status" in backup[0].argv
+    assert "--verify" in backup[0].argv
+    assert [command.argv[-1] for command in profile] == ["profile", "profile-nuwa", "quality"]
 
 
 def test_persisted_running_job_is_marked_interrupted_after_restart(tmp_path):
@@ -297,6 +301,10 @@ def test_agent_backup_and_diagnostic_routes_use_controlled_actions(tmp_path):
         diagnostic_status, diagnostics = get_json(base + "/api/v1/diagnostics")
         context_status, context_job = post(
             base + "/api/v1/agent/contexts",
+            {"goal": "prepare customer plan", "mode": "reviewer"},
+        )
+        invalid_mode_status, invalid_mode = post(
+            base + "/api/v1/agent/contexts",
             {"goal": "prepare customer plan", "mode": "plan"},
         )
         injection_status, injection = post(
@@ -317,9 +325,45 @@ def test_agent_backup_and_diagnostic_routes_use_controlled_actions(tmp_path):
     assert diagnostics["listen_address"] == "127.0.0.1"
     assert context_status == 202
     assert context_job["kind"] == "session"
+    assert invalid_mode_status == 400
+    assert invalid_mode["error"]["code"] == "invalid_request"
     assert injection_status == 400
     assert injection["error"]["code"] == "invalid_request"
     assert verify_status == 202
     assert verify_job["kind"] == "backup_verify"
     assert restore_status == 404
     assert restore["error"]["code"] == "not_found"
+
+
+def test_agent_capability_modes_match_executable_factory_modes(tmp_path):
+    server, base = start_server(tmp_path)
+    try:
+        status, agent = get_json(base + "/api/v1/agent")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    assert agent["supported_actions"][0]["modes"] == [
+        "auto",
+        "advisor",
+        "writer",
+        "reviewer",
+        "business",
+        "project",
+        "custom",
+    ]
+
+
+def test_control_center_context_options_use_executable_modes(tmp_path):
+    server, base = start_server(tmp_path)
+    try:
+        status, _, body = get(base + "/control-center")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert status == 200
+    page = body.decode("utf-8")
+    assert 'option value="reviewer"' in page
+    assert 'option value="plan"' not in page

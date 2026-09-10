@@ -87,3 +87,115 @@ def test_heartbeat_loop_keeps_long_stage_fresh(monkeypatch):
     orchestrator.telemetry_heartbeat_loop(TwoWaits(), interval=0)
 
     assert ("heartbeat", {}) in fake.calls
+
+
+def test_v11_model_stages_run_in_dependency_order(monkeypatch, tmp_path):
+    calls = []
+    vault = tmp_path / "vault"
+    monkeypatch.setattr(orchestrator, "IMMORTAL_DIR", vault)
+    monkeypatch.setattr(orchestrator, "claims_migrate", lambda _vault: calls.append("claims-migrate") or True)
+    monkeypatch.setattr(
+        orchestrator,
+        "profile_attribution_audit",
+        lambda _vault: calls.append("profile-attribution-audit") or True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "living_self_build",
+        lambda _vault: calls.append("living-self-build") or True,
+    )
+    monkeypatch.setattr(orchestrator, "cards_build", lambda: calls.append("cards build") or True)
+    monkeypatch.setattr(orchestrator, "quality_report", lambda: calls.append("quality") or True)
+    migration = {"staging_sha256": "bound"}
+    prewarm = {"receipt": "bound"}
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_v11_production_switch",
+        lambda actual_vault, actual_migration, actual_prewarm: {
+            "ok": actual_vault == vault
+            and actual_migration is migration
+            and actual_prewarm is prewarm,
+            "production_switch_allowed": True,
+        },
+    )
+
+    result = orchestrator.run_v11_model_stages(
+        vault,
+        migration,
+        prewarm,
+    )
+
+    assert result == {"ok": True, "completed": calls, "blockers": []}
+    assert calls == [
+        "profile-attribution-audit",
+        "claims-migrate",
+        "living-self-build",
+        "cards build",
+        "quality",
+    ]
+
+
+def test_v11_model_stages_stop_at_first_failed_dependency(monkeypatch, tmp_path):
+    calls = []
+    vault = tmp_path / "vault"
+    monkeypatch.setattr(orchestrator, "IMMORTAL_DIR", vault)
+    monkeypatch.setattr(orchestrator, "claims_migrate", lambda _vault: calls.append("claims-migrate") or True)
+    monkeypatch.setattr(
+        orchestrator,
+        "profile_attribution_audit",
+        lambda _vault: calls.append("profile-attribution-audit") or False,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "living_self_build",
+        lambda _vault: calls.append("living-self-build") or True,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_v11_production_switch",
+        lambda _vault, _migration, _prewarm: {
+            "ok": True,
+            "production_switch_allowed": True,
+        },
+    )
+
+    result = orchestrator.run_v11_model_stages(
+        vault,
+        {"staging": "bound"},
+        {"receipt": "bound"},
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == ["profile-attribution-audit_failed"]
+    assert calls == ["profile-attribution-audit"]
+
+
+def test_v11_model_stages_require_bound_production_gate(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    monkeypatch.setattr(orchestrator, "IMMORTAL_DIR", vault)
+    monkeypatch.setattr(
+        orchestrator,
+        "profile_attribution_audit",
+        lambda _vault: (_ for _ in ()).throw(AssertionError("must not run")),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_v11_production_switch",
+        lambda _vault, _migration, _prewarm: {
+            "ok": False,
+            "production_switch_allowed": False,
+            "blockers": ["published_source_generation_mismatch"],
+        },
+    )
+
+    result = orchestrator.run_v11_model_stages(
+        vault,
+        {"staging": "unbound"},
+        {"receipt": "unbound"},
+    )
+
+    assert result["ok"] is False
+    assert result["blockers"] == ["production_switch_gate_required"]
+    assert result["switch_gate"]["blockers"] == [
+        "published_source_generation_mismatch"
+    ]
