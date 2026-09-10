@@ -49,6 +49,7 @@ def run_cmd(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProce
 def worker_command(args: argparse.Namespace) -> list[str]:
     cmd = [
         sys.executable,
+        "-B",
         str(SKILL_DIR / "immortal.py"),
         "feishu-mirror",
         "--mode",
@@ -106,6 +107,7 @@ def make_plist(args: argparse.Namespace) -> dict:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     program = [
         sys.executable,
+        "-B",
         str(SKILL_DIR / "feishu_mirror_worker.py"),
         "run-once",
         "--actions",
@@ -127,6 +129,7 @@ def make_plist(args: argparse.Namespace) -> dict:
                 "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             ),
             "HOME": str(Path.home()),
+            "PYTHONDONTWRITEBYTECODE": "1",
         },
         "StandardOutPath": str(LOG_DIR / "launchd-worker.out.log"),
         "StandardErrorPath": str(LOG_DIR / "launchd-worker.err.log"),

@@ -160,6 +160,33 @@ CONTEXT_SOURCE_REVISION_FIELDS = frozenset(
         "policy_version",
     }
 )
+SELECTION_TRACE_CANDIDATE_LIMIT = 100
+SELECTION_TRACE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "engine",
+        "candidate_count",
+        "truncated",
+        "candidates",
+        "exclusion_counts",
+    }
+)
+SELECTION_TRACE_CANDIDATE_FIELDS = frozenset(
+    {"kind", "id", "revision", "section", "rank", "decision", "reason_code"}
+)
+SELECTION_TRACE_DECISION_REASONS = {
+    "selected": "within_budget",
+}
+SELECTION_TRACE_EXCLUSION_REASONS = frozenset(
+    {
+        "budget_limit",
+        "private",
+        "unconfirmed",
+        "scope_mismatch",
+        "expired",
+        "future",
+    }
+)
 CONTEXT_SECTION_CONTRACTS = {
     "verified_facts": {
         "kind": frozenset({"claim"}),
@@ -289,6 +316,95 @@ def _require_hash(value: Any, code: str = "invalid_content_hash") -> None:
         int(value[7:], 16)
     except ValueError:
         raise ModelValidationError(code, "content hash must use hexadecimal sha256")
+
+
+def validate_selection_trace(value: Mapping[str, Any]) -> None:
+    trace = _require_mapping(value)
+    _require_exact_fields(
+        trace,
+        SELECTION_TRACE_FIELDS,
+        code="invalid_selection_trace",
+    )
+    if (
+        type(trace["schema_version"]) is not int
+        or trace["schema_version"] != 1
+        or not isinstance(trace["engine"], str)
+        or trace["engine"] != "compiler_scope_v1"
+    ):
+        raise ModelValidationError(
+            "invalid_selection_trace", "selection trace version or engine is invalid"
+        )
+    _require_nonnegative_int(
+        trace["candidate_count"],
+        "invalid_selection_trace",
+        "candidate_count",
+    )
+    if not isinstance(trace["truncated"], bool):
+        raise ModelValidationError(
+            "invalid_selection_trace", "truncated must be boolean"
+        )
+    _require_list(trace["candidates"], "invalid_selection_trace", "candidates")
+    candidates = trace["candidates"]
+    if (
+        len(candidates) > SELECTION_TRACE_CANDIDATE_LIMIT
+        or trace["candidate_count"] < len(candidates)
+        or trace["truncated"] != (trace["candidate_count"] > len(candidates))
+    ):
+        raise ModelValidationError(
+            "invalid_selection_trace", "selection trace candidate bound is invalid"
+        )
+    identities = []
+    for expected_rank, raw in enumerate(candidates, start=1):
+        item = _require_mapping(raw)
+        _require_exact_fields(
+            item,
+            SELECTION_TRACE_CANDIDATE_FIELDS,
+            code="invalid_selection_trace",
+        )
+        if item["kind"] != "claim" or item["section"] != "verified_facts":
+            raise ModelValidationError(
+                "invalid_selection_trace", "selection trace candidate type is invalid"
+            )
+        _require_text(item["id"], "invalid_selection_trace", "candidate id")
+        _require_positive_int(
+            item["revision"], "invalid_selection_trace", "candidate revision"
+        )
+        _require_positive_int(
+            item["rank"], "invalid_selection_trace", "candidate rank"
+        )
+        if item["rank"] != expected_rank:
+            raise ModelValidationError(
+                "invalid_selection_trace", "selection trace ranks are not contiguous"
+            )
+        if SELECTION_TRACE_DECISION_REASONS.get(item["decision"]) != item[
+            "reason_code"
+        ]:
+            raise ModelValidationError(
+                "invalid_selection_trace", "selection trace decision is invalid"
+            )
+        identities.append((item["kind"], item["id"]))
+    if len(identities) != len(set(identities)):
+        raise ModelValidationError(
+            "invalid_selection_trace", "selection trace candidates must be unique"
+        )
+    exclusions = _require_mapping(trace["exclusion_counts"])
+    if not set(exclusions).issubset(SELECTION_TRACE_EXCLUSION_REASONS):
+        raise ModelValidationError(
+            "invalid_selection_trace", "selection trace exclusion reason is invalid"
+        )
+    for reason, count in exclusions.items():
+        _require_positive_int(
+            count,
+            "invalid_selection_trace",
+            "exclusion count for " + str(reason),
+        )
+    if trace["candidate_count"] != len(candidates) + exclusions.get(
+        "budget_limit", 0
+    ):
+        raise ModelValidationError(
+            "invalid_selection_trace",
+            "selection trace candidate count is not accounted for",
+        )
 
 
 def _parse_timestamp(

@@ -214,10 +214,12 @@ def state_time(state: dict, key: str) -> datetime | None:
 
 
 def run_script(script: str, args: list[str] | None = None) -> int:
-    cmd = [sys.executable, str(SKILL_DIR / script)]
+    cmd = [sys.executable, "-B", str(SKILL_DIR / script)]
     if args:
         cmd.extend(args)
-    return subprocess.call(cmd)
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return subprocess.call(cmd, env=env)
 
 
 def command_run(_args=None) -> int:
@@ -990,7 +992,7 @@ def command_context(args) -> int:
         run_script("search.py", [args.query, "--since", args.since])
     else:
         print("Relevant recall: skipped for speed. Run with --with-recall, or use:")
-        print(f"python3 {SKILL_DIR / 'immortal.py'} recall {json.dumps(args.query, ensure_ascii=False)} --since {args.since}")
+        print(cli_command("recall", args.query, "--since", args.since))
     return 0
 
 
@@ -1014,10 +1016,11 @@ def write_daily_backup_script(config: dict) -> Path:
                 f"LOG={json.dumps(str(log_path))}",
                 f"CODEX_IMMORTAL={json.dumps(str(SKILL_DIR / 'immortal.py'))}",
                 'export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"',
+                "export PYTHONDONTWRITEBYTECODE=1",
                 'echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] === immortal daily run ===" >> "$LOG"',
-                'python3 "$CODEX_IMMORTAL" run >> "$LOG" 2>&1',
+                'python3 -B "$CODEX_IMMORTAL" run >> "$LOG" 2>&1',
                 "STATUS=$?",
-                'python3 "$CODEX_IMMORTAL" feedback --run-status "$STATUS" --notify >> "$LOG" 2>&1',
+                'python3 -B "$CODEX_IMMORTAL" feedback --run-status "$STATUS" --notify >> "$LOG" 2>&1',
                 "FEEDBACK_STATUS=$?",
                 'echo "[$(date \'+%Y-%m-%d %H:%M:%S\')] === finished status=$STATUS feedback_status=$FEEDBACK_STATUS ===" >> "$LOG"',
                 'echo "" >> "$LOG"',
@@ -1584,6 +1587,28 @@ def command_agent_context(args) -> int:
     if args.force:
         bridge_args.append("--force")
     return run_script("agent_bridge.py", bridge_args)
+
+
+def command_context_ack(args) -> int:
+    return run_script(
+        "agent_bridge.py",
+        [
+            "ack",
+            args.context_id,
+            "--expected-version",
+            str(args.expected_version),
+            "--content-hash",
+            args.content_hash,
+            "--context-markdown-hash",
+            args.context_markdown_hash,
+            "--pack-snapshot-hash",
+            args.pack_snapshot_hash,
+            "--adapter",
+            args.adapter,
+            "--run-ref",
+            args.run_ref,
+        ],
+    )
 
 
 def command_preflight(args) -> int:
@@ -2370,6 +2395,20 @@ def build_parser() -> argparse.ArgumentParser:
     agent_context.add_argument("--print", action="store_true")
     agent_context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     agent_context.set_defaults(func=command_agent_context)
+
+    context_ack = sub.add_parser(
+        "context-ack", help="Acknowledge one exact compiled Context delivery"
+    )
+    context_ack.add_argument("context_id")
+    context_ack.add_argument("--expected-version", type=int, required=True)
+    context_ack.add_argument("--content-hash", required=True)
+    context_ack.add_argument("--context-markdown-hash", required=True)
+    context_ack.add_argument("--pack-snapshot-hash", required=True)
+    context_ack.add_argument(
+        "--adapter", choices=("codex", "claude-code"), required=True
+    )
+    context_ack.add_argument("--run-ref", required=True)
+    context_ack.set_defaults(func=command_context_ack)
 
     preflight = sub.add_parser("preflight", help="Read-only readiness check: is the memory actually usable, protected, and current?")
     preflight.add_argument("query", nargs="?", default="")

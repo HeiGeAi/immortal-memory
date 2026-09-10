@@ -1102,18 +1102,18 @@ def test_model_cursor_is_invalidated_when_authority_generation_changes(
 
 
 @pytest.mark.parametrize(
-    ("authority", "code"),
+    ("authority", "section", "code"),
     [
-        ("claims", "trust_unavailable"),
-        ("living", "self_model_unavailable"),
-        ("judgments", "judgment_unavailable"),
-        ("contexts", "context_unavailable"),
-        ("outcomes", "outcome_unavailable"),
-        ("system", "system_unavailable"),
+        ("claims", "claim_review", "trust_unavailable"),
+        ("living", "claim_review", "self_model_unavailable"),
+        ("judgments", "claim_review", "judgment_unavailable"),
+        ("contexts", "agent_use", "context_unavailable"),
+        ("outcomes", "agent_use", "outcome_unavailable"),
+        ("system", "system", "system_unavailable"),
     ],
 )
 def test_home_converts_each_authority_failure_to_stable_safe_error(
-    tmp_path, authority, code
+    tmp_path, authority, section, code
 ):
     data, _control, center = seeded_product_data(tmp_path)
     failure = lambda: (_ for _ in ()).throw(
@@ -1137,11 +1137,14 @@ def test_home_converts_each_authority_failure_to_stable_safe_error(
         data.outcome_store.list = failure
     else:
         center.build_snapshot = failure
-    with pytest.raises(ProductDataError) as raised:
-        data.home()
-    assert raised.value.code == code
-    assert "stderr" not in str(raised.value)
-    assert "private-owner" not in str(raised.value)
+    # New runtime behavior: home() degrades per section instead of raising,
+    # exposing the stable safe error code in the affected section's evidence.
+    payload = data.home()
+    evidence = payload[section]
+    assert evidence["status"] == "blocked"
+    assert evidence["error"]["code"] == code
+    assert "stderr" not in json.dumps(payload, default=str)
+    assert "private-owner" not in json.dumps(payload, default=str)
 
 
 def test_product_payload_redacts_all_supported_private_shapes(tmp_path):

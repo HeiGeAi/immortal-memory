@@ -410,9 +410,12 @@ class OutcomeStore:
     ) -> Dict[str, Any]:
         try:
             current = self.contexts.get(context_id)
-            if current["lifecycle_status"] == "compiled":
+            pack = (
                 self.compiler.load_compiled(context_id)
-            return self.contexts.consume(
+                if current["lifecycle_status"] == "compiled"
+                else self.compiler.load_outcome_snapshot(context_id)
+            )
+            return self.contexts.acknowledge(
                 context_id,
                 expected_version=expected_version,
                 request_id=request_id,
@@ -423,7 +426,72 @@ class OutcomeStore:
                     field="reason",
                     maximum=MAX_OUTCOME_REASON_CHARS,
                 ),
+                adapter="manual",
+                transport="manual",
+                run_ref=idempotency_key,
+                content_hash=pack["content_hash"],
+                context_markdown_hash=pack["context_markdown_hash"],
+                pack_snapshot_hash=current["pack_snapshot_hash"],
             )
+        except (ContextCompilerError, ContextStoreError) as exc:
+            raise OutcomeStoreError(exc.code, str(exc)) from exc
+
+    def acknowledge(
+        self,
+        context_id: str,
+        *,
+        expected_version: int,
+        request_id: str,
+        idempotency_key: str,
+        actor: Mapping[str, str],
+        reason: str,
+        adapter: str,
+        transport: str,
+        run_ref: str,
+        content_hash: str,
+        context_markdown_hash: str,
+        pack_snapshot_hash: str,
+    ) -> Dict[str, Any]:
+        try:
+            current = self.contexts.get(context_id)
+            if current["lifecycle_status"] == "compiled":
+                pack = self.compiler.load_compiled(context_id)
+            elif current["lifecycle_status"] in {"consumed", "outcome_recorded"}:
+                pack = self.compiler.load_outcome_snapshot(context_id)
+            else:
+                raise OutcomeStoreError(
+                    "invalid_transition",
+                    "context acknowledgement requires a compiled Context",
+                )
+            if (
+                content_hash != pack["content_hash"]
+                or context_markdown_hash != pack["context_markdown_hash"]
+                or pack_snapshot_hash != current["pack_snapshot_hash"]
+            ):
+                raise OutcomeStoreError(
+                    "context_receipt_mismatch",
+                    "delivery receipt does not match compiled Context",
+                )
+            return self.contexts.acknowledge(
+                context_id,
+                expected_version=expected_version,
+                request_id=request_id,
+                idempotency_key=idempotency_key,
+                actor=actor,
+                reason=_safe_text(
+                    reason,
+                    field="reason",
+                    maximum=MAX_OUTCOME_REASON_CHARS,
+                ),
+                adapter=adapter,
+                transport=transport,
+                run_ref=run_ref,
+                content_hash=content_hash,
+                context_markdown_hash=context_markdown_hash,
+                pack_snapshot_hash=pack_snapshot_hash,
+            )
+        except OutcomeStoreError:
+            raise
         except (ContextCompilerError, ContextStoreError) as exc:
             raise OutcomeStoreError(exc.code, str(exc)) from exc
 

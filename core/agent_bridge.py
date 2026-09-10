@@ -20,6 +20,7 @@ from config import configured_vault_dir, owner_display_name
 from command_hints import cli_command
 from context_compiler import ContextCompiler, ContextCompilerError
 from event_store import safe_atomic_write_text, safe_read_text
+from outcome_store import OutcomeStore, OutcomeStoreError
 from preflight import STATUS_DEGRADED, STATUS_UNAVAILABLE, gather_preflight, render_summary
 from redact_common import redact as redact_credentials
 
@@ -621,6 +622,22 @@ def command_context(args: argparse.Namespace) -> int:
         _write_verified_delivery(output, content, content_hash)
     except (ContextCompilerError, OSError, RuntimeError, ValueError) as exc:
         return _write_authoritative_error(args, preflight, exc)
+    pack_snapshot_hash = None
+    snapshot_hash = getattr(compiler, "_snapshot_hash", None)
+    if callable(snapshot_hash) and "sections" in compiled:
+        pack_snapshot_hash = snapshot_hash(
+            {
+                key: value
+                for key, value in compiled.items()
+                if key
+                not in {
+                    "context_json",
+                    "context_md",
+                    "context_markdown",
+                    "context_markdown_hash",
+                }
+            }
+        )
     payload = {
         "generated_at": now_local(),
         "query": compiled["task"],
@@ -637,6 +654,8 @@ def command_context(args: argparse.Namespace) -> int:
         "context_id": compiled["context_id"],
         "content_hash": compiled["content_hash"],
         "context_markdown_hash": content_hash,
+        "pack_snapshot_hash": pack_snapshot_hash,
+        "stream_version": 2,
         "expires_at": compiled["expires_at"],
         "source_revision": compiled["source_revision"],
         "context_json": compiled["context_json"],
@@ -662,6 +681,72 @@ def command_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def acknowledge_context(
+    *,
+    context_id: str,
+    expected_version: int,
+    content_hash: str,
+    context_markdown_hash: str,
+    pack_snapshot_hash: str,
+    adapter: str,
+    transport: str,
+    run_ref: str,
+    vault_dir: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        store = OutcomeStore(vault_dir or IMMORTAL_DIR)
+        acknowledged = store.acknowledge(
+            context_id,
+            expected_version=expected_version,
+            request_id="req_context_ack_" + uuid.uuid4().hex,
+            idempotency_key=(
+                "context-ack:v1:" + context_id + ":" + str(expected_version)
+            ),
+            actor=ACTOR,
+            reason="Agent acknowledged exact Context delivery",
+            adapter=adapter,
+            transport=transport,
+            run_ref=run_ref,
+            content_hash=content_hash,
+            context_markdown_hash=context_markdown_hash,
+            pack_snapshot_hash=pack_snapshot_hash,
+        )
+        return {
+            "ok": True,
+            "context_id": acknowledged["context_id"],
+            "lifecycle_status": acknowledged["lifecycle_status"],
+            "stream_version": acknowledged["stream_version"],
+            "delivery_receipt": acknowledged["delivery_receipt"],
+        }
+    except OutcomeStoreError as exc:
+        return {
+            "ok": False,
+            "error_code": exc.code,
+            "message": redact_external_text(str(exc), max_chars=500),
+        }
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return {
+            "ok": False,
+            "error_code": "context_ack_failed",
+            "message": "Context acknowledgement failed closed",
+        }
+
+
+def command_ack(args: argparse.Namespace) -> int:
+    result = acknowledge_context(
+        context_id=args.context_id,
+        expected_version=args.expected_version,
+        content_hash=args.content_hash,
+        context_markdown_hash=args.context_markdown_hash,
+        pack_snapshot_hash=args.pack_snapshot_hash,
+        adapter=args.adapter,
+        transport="cli",
+        run_ref=args.run_ref,
+    )
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["ok"] else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create external-agent bridge files and task-local context packs")
     sub = parser.add_subparsers(dest="command")
@@ -683,6 +768,15 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--print", action="store_true", help="Also print the generated context to stdout")
     context.add_argument("--force", action="store_true", help="Generate a context pack even when preflight reports the vault as unavailable (debugging only)")
     context.set_defaults(func=command_context)
+    ack = sub.add_parser("ack", help="Acknowledge one exact compiled Context")
+    ack.add_argument("context_id")
+    ack.add_argument("--expected-version", type=int, required=True)
+    ack.add_argument("--content-hash", required=True)
+    ack.add_argument("--context-markdown-hash", required=True)
+    ack.add_argument("--pack-snapshot-hash", required=True)
+    ack.add_argument("--adapter", choices=("codex", "claude-code"), required=True)
+    ack.add_argument("--run-ref", required=True)
+    ack.set_defaults(func=command_ack)
     return parser
 
 

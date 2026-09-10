@@ -15,7 +15,12 @@ class AgentBridgeCorsTest(unittest.TestCase):
             encoding="utf-8"
         ).strip()
         response = agent_bridge_server.handle_mcp_message(
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"},
+            }
         )
 
         self.assertEqual(response["result"]["serverInfo"]["version"], expected)

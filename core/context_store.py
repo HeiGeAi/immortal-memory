@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
+import stat
 import sys
 import threading
 import uuid
@@ -19,6 +22,7 @@ from event_store import (
     EventCorruption,
     EventPathError,
     JsonlEventStore,
+    _exclusive_lock,
     safe_atomic_write_text,
     safe_read_text,
 )
@@ -27,7 +31,9 @@ from model_types import (
     CONTEXT_DEFAULT_MAX_BYTES,
     CONTEXT_MODES,
     CONTEXT_SECTIONS,
+    ModelValidationError,
     new_event,
+    validate_selection_trace,
 )
 
 
@@ -54,6 +60,7 @@ RECORD_FIELDS = {
     "mode",
     "source_revision",
     "selection",
+    "selection_trace",
     "privacy_policy",
     "preview_hash",
     "preview_body_hash",
@@ -66,9 +73,20 @@ RECORD_FIELDS = {
     "outcome_id",
     "outcome_hash",
     "pack_snapshot_hash",
+    "delivery_receipt",
     "based_on_event_seq",
     "stream_version",
 }
+DELIVERY_RECEIPT_FIELDS = {
+    "delivery_id",
+    "adapter",
+    "transport",
+    "run_ref_hash",
+    "content_hash",
+    "context_markdown_hash",
+}
+DELIVERY_ADAPTERS = frozenset({"codex", "claude-code", "manual"})
+DELIVERY_TRANSPORTS = frozenset({"cli", "http", "mcp", "manual"})
 MAX_PREVIEW_TTL_SECONDS = 24 * 60 * 60
 LIFECYCLE_EVENTS = {
     "context.preview_created": (None, "preview"),
@@ -79,6 +97,8 @@ LIFECYCLE_EVENTS = {
 IDENTIFIER_PATTERN = re.compile(r"\A(?:prv|ctx)_[0-9a-f]{32}\Z")
 PREVIEW_IDENTIFIER_PATTERN = re.compile(r"\Aprv_[0-9a-f]{32}\Z")
 CONTEXT_IDENTIFIER_PATTERN = re.compile(r"\Actx_[0-9a-f]{32}\Z")
+DELIVERY_IDENTIFIER_PATTERN = re.compile(r"\Adlv_[0-9a-f]{32}\Z")
+RUN_REF_HASH_PATTERN = re.compile(r"\Ahmac-sha256:[0-9a-f]{64}\Z")
 
 
 class ContextStoreError(ValueError):
@@ -257,6 +277,69 @@ def _selection(value: Any) -> Dict[str, Any]:
     }
 
 
+def _empty_selection_trace() -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "engine": "compiler_scope_v1",
+        "candidate_count": 0,
+        "truncated": False,
+        "candidates": [],
+        "exclusion_counts": {},
+    }
+
+
+def _validate_selection_trace_binding(
+    trace: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    privacy_policy: Mapping[str, Any],
+) -> None:
+    traced_ids = sorted(item["id"] for item in trace["candidates"])
+    if traced_ids != selection["section_item_ids"]["verified_facts"]:
+        raise ContextStoreError(
+            "invalid_selection_trace",
+            "selection trace does not match selected Claim IDs",
+        )
+    privacy_counts = {
+        reason: count
+        for reason, count in trace["exclusion_counts"].items()
+        if reason != "budget_limit"
+    }
+    if (
+        not set(privacy_counts).issubset(privacy_policy["reasons"])
+        or sum(privacy_counts.values()) > privacy_policy["excluded_count"]
+    ):
+        raise ContextStoreError(
+            "invalid_selection_trace",
+            "selection trace exclusions are not covered by privacy policy",
+        )
+
+
+def _delivery_receipt(value: Any) -> Dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) != DELIVERY_RECEIPT_FIELDS:
+        raise ContextStoreError(
+            "invalid_delivery_receipt", "delivery receipt has an invalid schema"
+        )
+    receipt = {field: value[field] for field in DELIVERY_RECEIPT_FIELDS}
+    if (
+        not isinstance(receipt["delivery_id"], str)
+        or DELIVERY_IDENTIFIER_PATTERN.fullmatch(receipt["delivery_id"]) is None
+        or not isinstance(receipt["adapter"], str)
+        or receipt["adapter"] not in DELIVERY_ADAPTERS
+        or not isinstance(receipt["transport"], str)
+        or receipt["transport"] not in DELIVERY_TRANSPORTS
+        or (receipt["adapter"] == "manual")
+        != (receipt["transport"] == "manual")
+        or not isinstance(receipt["run_ref_hash"], str)
+        or RUN_REF_HASH_PATTERN.fullmatch(receipt["run_ref_hash"]) is None
+        or not _is_hash(receipt["content_hash"])
+        or not _is_hash(receipt["context_markdown_hash"])
+    ):
+        raise ContextStoreError(
+            "invalid_delivery_receipt", "delivery receipt is invalid"
+        )
+    return receipt
+
+
 class ContextStore:
     """Persist safe Context lifecycle metadata and rebuildable projections."""
 
@@ -275,6 +358,8 @@ class ContextStore:
         self.events = JsonlEventStore(self.root / "events.jsonl")
         self.current_path = self.root / "current.jsonl"
         self.previews_dir = self.root / "previews"
+        self.delivery_key_path = self.root / "delivery-hmac.key"
+        self.delivery_key_lock = self.root / "delivery-hmac.lock"
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._write_lock = threading.RLock()
         try:
@@ -350,6 +435,21 @@ class ContextStore:
             record["outcome_hash"] = None
         if "pack_snapshot_hash" not in record:
             record["pack_snapshot_hash"] = None
+        if "delivery_receipt" not in record:
+            record["delivery_receipt"] = None
+        if "selection_trace" not in record:
+            revision = record.get("source_revision")
+            if (
+                isinstance(revision, Mapping)
+                and isinstance(revision.get("policy_version"), int)
+                and revision["policy_version"] >= 2
+            ):
+                raise EventCorruption(
+                    "invalid_context_event",
+                    "selection trace is required by the context policy",
+                    line_number=int(event["seq"]),
+                )
+            record["selection_trace"] = _empty_selection_trace()
         return record
 
     @staticmethod
@@ -417,7 +517,7 @@ class ContextStore:
                 _validated_identifier(record["context_id"], kind="context")
             _text(record["task"], "task")
             _source_revision(record["source_revision"])
-            _privacy_policy(record["privacy_policy"])
+            policy = _privacy_policy(record["privacy_policy"])
             outcome_id = record["outcome_id"]
             outcome_hash = record["outcome_hash"]
             if (outcome_id is None) != (outcome_hash is None):
@@ -433,6 +533,9 @@ class ContextStore:
                     raise ContextStoreError(
                         "invalid_outcome_link", "outcome linkage is invalid"
                     )
+            receipt = record["delivery_receipt"]
+            if receipt is not None:
+                receipt = _delivery_receipt(receipt)
             if (
                 record["pack_snapshot_hash"] is not None
                 and not _is_hash(record["pack_snapshot_hash"])
@@ -442,7 +545,31 @@ class ContextStore:
                 )
         except ContextStoreError as exc:
             raise cls._corruption(event, str(exc)) from exc
-        cls._validate_selection(record["selection"], event)
+        if (
+            record["lifecycle_status"] in {"preview", "compiled"}
+            and receipt is not None
+        ):
+            raise cls._corruption(event, "delivery receipt precedes acknowledgement")
+        operation = event.get("payload", {}).get("operation", {})
+        if (
+            event.get("event_type") == "context.consumed"
+            and isinstance(operation, Mapping)
+            and operation.get("method") == "acknowledge"
+            and receipt is None
+        ):
+            raise cls._corruption(event, "acknowledged Context lacks a receipt")
+        selection = cls._validate_selection(record["selection"], event)
+        try:
+            validate_selection_trace(record["selection_trace"])
+        except ModelValidationError as exc:
+            raise cls._corruption(event, str(exc)) from exc
+        if record["source_revision"]["policy_version"] >= 2:
+            try:
+                _validate_selection_trace_binding(
+                    record["selection_trace"], selection, policy
+                )
+            except ContextStoreError as exc:
+                raise cls._corruption(event, str(exc)) from exc
         try:
             generated = _timestamp(record["generated_at"], field="generated_at")
             expires = _timestamp(record["expires_at"], field="expires_at")
@@ -481,23 +608,42 @@ class ContextStore:
         cls, event: Mapping[str, Any], operation: Mapping[str, Any]
     ) -> Dict[str, Any]:
         safe_input = operation.get("input")
+        base_input_fields = {
+            "mode",
+            "compile_policy",
+            "privacy_policy",
+            "preview_body_hash",
+            "selection",
+            "source_revision",
+            "task",
+            "ttl_seconds",
+        }
+        source_revision = (
+            safe_input.get("source_revision")
+            if isinstance(safe_input, Mapping)
+            else None
+        )
+        policy_version = (
+            source_revision.get("policy_version")
+            if isinstance(source_revision, Mapping)
+            else None
+        )
+        accepted_input_fields = {frozenset(base_input_fields)}
+        if isinstance(policy_version, int) and policy_version < 2:
+            accepted_input_fields.add(
+                frozenset(base_input_fields | {"selection_trace"})
+            )
+        else:
+            accepted_input_fields = {
+                frozenset(base_input_fields | {"selection_trace"})
+            }
         if (
             set(operation)
             != {"actor", "expected_version", "input", "method", "reason"}
             or operation.get("method") != "create_preview"
             or operation.get("expected_version") != 0
             or not isinstance(safe_input, Mapping)
-            or set(safe_input)
-            != {
-                "mode",
-                "compile_policy",
-                "privacy_policy",
-                "preview_body_hash",
-                "selection",
-                "source_revision",
-                "task",
-                "ttl_seconds",
-            }
+            or frozenset(safe_input) not in accepted_input_fields
         ):
             raise cls._corruption(event, "preview creation intent is invalid")
         ttl = safe_input["ttl_seconds"]
@@ -520,6 +666,9 @@ class ContextStore:
             "mode": safe_input["mode"],
             "source_revision": safe_input["source_revision"],
             "selection": safe_input["selection"],
+            "selection_trace": safe_input.get(
+                "selection_trace", _empty_selection_trace()
+            ),
             "privacy_policy": safe_input["privacy_policy"],
             "preview_hash": _digest(safe_input),
             "preview_body_hash": safe_input["preview_body_hash"],
@@ -532,6 +681,7 @@ class ContextStore:
             "outcome_id": None,
             "outcome_hash": None,
             "pack_snapshot_hash": None,
+            "delivery_receipt": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -557,16 +707,21 @@ class ContextStore:
                 expected_fields.add("pack_snapshot_hash")
         elif method == "mark_outcome_recorded":
             expected_fields = base_fields | {"outcome_id", "outcome_hash"}
+        elif method == "acknowledge":
+            expected_fields = base_fields | {
+                "delivery_receipt",
+                "pack_snapshot_hash",
+            }
         else:
             expected_fields = base_fields
-        expected_method = {
-            "compiled": "begin_compile",
-            "consumed": "consume",
-            "outcome_recorded": "mark_outcome_recorded",
+        expected_methods = {
+            "compiled": {"begin_compile"},
+            "consumed": {"acknowledge", "consume"},
+            "outcome_recorded": {"mark_outcome_recorded"},
         }[next_status]
         if (
             set(operation) != expected_fields
-            or method != expected_method
+            or method not in expected_methods
             or operation.get("expected_version") != previous["stream_version"]
             or operation.get("identifier")
             not in {previous["preview_id"], previous.get("context_id")}
@@ -616,7 +771,28 @@ class ContextStore:
                 if not _is_hash(operation["pack_snapshot_hash"]):
                     raise cls._corruption(event, "pack snapshot authority is invalid")
                 expected["pack_snapshot_hash"] = operation["pack_snapshot_hash"]
+        elif method == "acknowledge":
+            try:
+                receipt = _delivery_receipt(operation["delivery_receipt"])
+            except ContextStoreError as exc:
+                raise cls._corruption(event, str(exc)) from exc
+            if (
+                not _is_hash(operation["pack_snapshot_hash"])
+                or (
+                    previous["pack_snapshot_hash"] is not None
+                    and operation["pack_snapshot_hash"]
+                    != previous["pack_snapshot_hash"]
+                )
+                or record["delivery_receipt"] != receipt
+            ):
+                raise cls._corruption(
+                    event, "delivery receipt does not match compiled authority"
+                )
+            expected["consumed_at"] = event["occurred_at"]
+            expected["delivery_receipt"] = receipt
         elif method == "consume":
+            if record["delivery_receipt"] is not None:
+                raise cls._corruption(event, "legacy consume cannot contain a receipt")
             expected["consumed_at"] = event["occurred_at"]
         elif method == "mark_outcome_recorded":
             if (
@@ -817,6 +993,91 @@ class ContextStore:
             why,
         )
 
+    def _delivery_key(self) -> bytes:
+        try:
+            with _exclusive_lock(
+                self.delivery_key_lock,
+                timeout=3.0,
+                stale_after=30.0,
+            ):
+                raw = safe_read_text(self.delivery_key_path)
+                if raw is None:
+                    safe_atomic_write_text(
+                        self.delivery_key_path, secrets.token_hex(32) + "\n"
+                    )
+                    raw = safe_read_text(self.delivery_key_path)
+                metadata = os.lstat(str(self.delivery_key_path))
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or raw is None
+                    or re.fullmatch(r"[0-9a-f]{64}\n?", raw) is None
+                ):
+                    raise ValueError("delivery HMAC key is unsafe")
+                return bytes.fromhex(raw.strip())
+        except ContextStoreError:
+            raise
+        except (
+            EventPathError,
+            OSError,
+            RuntimeError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise ContextStoreError(
+                "receipt_key_unavailable", "delivery receipt key is unavailable"
+            ) from exc
+
+    def _run_ref_hash(self, run_ref: Any) -> str:
+        if (
+            not isinstance(run_ref, str)
+            or not run_ref.strip()
+            or len(run_ref) > 512
+            or "\x00" in run_ref
+            or "\n" in run_ref
+            or "\r" in run_ref
+        ):
+            raise ContextStoreError(
+                "invalid_delivery_receipt", "run_ref is invalid"
+            )
+        digest = hmac.new(
+            self._delivery_key(), run_ref.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+        return "hmac-sha256:" + digest
+
+    def _ready_authority(
+        self, context_id: str, current: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        raw = safe_read_text(self.root / "packs" / context_id / "READY.json")
+        try:
+            ready = json.loads(raw or "")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ContextStoreError(
+                "context_not_ready", "compiled pack marker is unavailable"
+            ) from exc
+        if (
+            not isinstance(ready, Mapping)
+            or set(ready)
+            != {
+                "context_id",
+                "content_hash",
+                "context_json_hash",
+                "context_md_hash",
+                "source_revision",
+            }
+            or ready["context_id"] != context_id
+            or ready["source_revision"] != current["source_revision"]
+            or not _is_hash(ready["content_hash"])
+            or not _is_hash(ready["context_json_hash"])
+            or not _is_hash(ready["context_md_hash"])
+        ):
+            raise ContextStoreError(
+                "context_not_ready", "compiled pack marker is invalid"
+            )
+        return dict(ready)
+
     @staticmethod
     def _operation_intent(operation: Mapping[str, Any]) -> str:
         return _canonical(operation)
@@ -1011,6 +1272,7 @@ class ContextStore:
         actor: Mapping[str, str],
         reason: str,
         compile_policy: Optional[Mapping[str, int]] = None,
+        selection_trace: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         expected, request, idem, actor_value, why = self._metadata(
             expected_version=expected_version,
@@ -1041,6 +1303,29 @@ class ContextStore:
         revision = _source_revision(source_revision)
         selection = _selection(sections)
         policy = _privacy_policy(privacy_policy)
+        if selection_trace is None and revision["policy_version"] >= 2:
+            raise ContextStoreError(
+                "invalid_selection_trace",
+                "selection trace is required by the context policy",
+            )
+        try:
+            trace = json.loads(
+                json.dumps(
+                    selection_trace
+                    if selection_trace is not None
+                    else _empty_selection_trace(),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            validate_selection_trace(trace)
+        except (ModelValidationError, TypeError, ValueError) as exc:
+            raise ContextStoreError(
+                "invalid_selection_trace", "selection trace is invalid"
+            ) from exc
+        if revision["policy_version"] >= 2:
+            _validate_selection_trace_binding(trace, selection, policy)
         compile_policy_value = _compile_policy(
             compile_policy
             if compile_policy is not None
@@ -1073,6 +1358,7 @@ class ContextStore:
                 }
             ),
             "selection": selection,
+            "selection_trace": trace,
             "source_revision": revision,
             "task": task_value,
             "ttl_seconds": ttl_seconds,
@@ -1103,6 +1389,7 @@ class ContextStore:
             "mode": mode_value,
             "source_revision": revision,
             "selection": selection,
+            "selection_trace": trace,
             "privacy_policy": policy,
             "preview_hash": _digest(safe_input),
             "preview_body_hash": safe_input["preview_body_hash"],
@@ -1115,6 +1402,7 @@ class ContextStore:
             "outcome_id": None,
             "outcome_hash": None,
             "pack_snapshot_hash": None,
+            "delivery_receipt": None,
             "based_on_event_seq": 0,
             "stream_version": 1,
         }
@@ -1190,6 +1478,41 @@ class ContextStore:
             reason=reason,
         )
 
+    def acknowledge(
+        self,
+        context_id: str,
+        *,
+        expected_version: int,
+        request_id: str,
+        idempotency_key: str,
+        actor: Mapping[str, str],
+        reason: str,
+        adapter: str,
+        transport: str,
+        run_ref: str,
+        content_hash: str,
+        context_markdown_hash: str,
+        pack_snapshot_hash: str,
+    ) -> Dict[str, Any]:
+        return self._transition(
+            context_id,
+            method="acknowledge",
+            event_type="context.consumed",
+            required_status="compiled",
+            next_status="consumed",
+            expected_version=expected_version,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            actor=actor,
+            reason=reason,
+            adapter=adapter,
+            transport=transport,
+            run_ref=run_ref,
+            content_hash=content_hash,
+            context_markdown_hash=context_markdown_hash,
+            pack_snapshot_hash=pack_snapshot_hash,
+        )
+
     def mark_outcome_recorded(
         self,
         context_id: str,
@@ -1237,6 +1560,11 @@ class ContextStore:
         outcome_id: Optional[str] = None,
         outcome_hash: Optional[str] = None,
         pack_snapshot_hash: Optional[str] = None,
+        adapter: Optional[str] = None,
+        transport: Optional[str] = None,
+        run_ref: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        context_markdown_hash: Optional[str] = None,
     ) -> Dict[str, Any]:
         current = self.get(identifier)
         expected, request, idem, actor_value, why = self._metadata(
@@ -1270,6 +1598,36 @@ class ContextStore:
                     "outcome_hash": outcome_hash,
                 }
             )
+        elif method == "acknowledge":
+            ready = self._ready_authority(identifier, current)
+            if (
+                content_hash != ready["content_hash"]
+                or context_markdown_hash != ready["context_md_hash"]
+                or not _is_hash(pack_snapshot_hash)
+                or pack_snapshot_hash != current["pack_snapshot_hash"]
+            ):
+                raise ContextStoreError(
+                    "context_receipt_mismatch",
+                    "delivery receipt does not match compiled Context",
+                )
+            delivery_seed = self._public_key(idem) + ":" + identifier
+            receipt = _delivery_receipt(
+                {
+                    "delivery_id": "dlv_"
+                    + hashlib.sha256(delivery_seed.encode("utf-8")).hexdigest()[:32],
+                    "adapter": adapter,
+                    "transport": transport,
+                    "run_ref_hash": self._run_ref_hash(run_ref),
+                    "content_hash": content_hash,
+                    "context_markdown_hash": context_markdown_hash,
+                }
+            )
+            operation.update(
+                {
+                    "delivery_receipt": receipt,
+                    "pack_snapshot_hash": pack_snapshot_hash,
+                }
+            )
         prior = self._find_idempotent(idem, operation)
         if prior is not None:
             return self._return_event(prior)
@@ -1283,6 +1641,11 @@ class ContextStore:
         if current["availability_status"] == "expired" and method != "mark_outcome_recorded":
             code = "stale_preview" if required_status == "preview" else "context_expired"
             raise ContextStoreError(code, "context metadata has expired")
+        if method == "consume":
+            raise ContextStoreError(
+                "delivery_receipt_required",
+                "Context consumption requires explicit acknowledgement",
+            )
         if method == "begin_compile":
             self._verify_preview_cache(current)
             try:
@@ -1325,6 +1688,8 @@ class ContextStore:
                     "invalid_outcome_link", "outcome linkage is invalid"
                 )
             excluded = []
+        elif method == "acknowledge":
+            excluded = []
         else:
             excluded = []
         now = self._operation_time(current)
@@ -1341,6 +1706,9 @@ class ContextStore:
             updated["context_id"] = _identifier("ctx_")
             updated["compiled_at"] = now.isoformat()
             updated["pack_snapshot_hash"] = pack_snapshot_hash
+        elif method == "acknowledge":
+            updated["consumed_at"] = now.isoformat()
+            updated["delivery_receipt"] = receipt
         elif method == "consume":
             updated["consumed_at"] = now.isoformat()
         else:

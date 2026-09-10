@@ -429,7 +429,7 @@ def test_source_revision_and_evidence_resolution_are_exact_and_bounded(tmp_path)
         "living_self_version": model["version_id"],
         "judgments_event_seq": 1,
         "compiler_version": "1.1.0",
-        "policy_version": 1,
+        "policy_version": 2,
     }
     assert set(evidence.requested) == {
         "ev_clm_fact",
@@ -538,6 +538,24 @@ def compile_preview(instance, preview_result, *, suffix="one", **kwargs):
     )
 
 
+def acknowledge_compiled(instance, compiled, *, suffix="one"):
+    record = instance.context_store.get(compiled["context_id"])
+    return instance.context_store.acknowledge(
+        compiled["context_id"],
+        expected_version=2,
+        request_id="req_ack_" + suffix,
+        idempotency_key="idem_ack_" + suffix,
+        actor=ACTOR,
+        reason="Agent receipt",
+        adapter="codex",
+        transport="cli",
+        run_ref="run_" + suffix,
+        content_hash=compiled["content_hash"],
+        context_markdown_hash=compiled["context_markdown_hash"],
+        pack_snapshot_hash=record["pack_snapshot_hash"],
+    )
+
+
 def test_compile_rejects_stale_source_before_and_during_authorization(tmp_path):
     from context_compiler import ContextCompilerError
 
@@ -604,13 +622,10 @@ def test_consumed_snapshot_verifier_does_not_relax_agent_delivery_gate(tmp_path)
         claims=[claim("clm_fact", "客户技术方案需要可回滚")],
     )
     compiled = compile_preview(instance, preview(instance))
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_snapshot",
-        idempotency_key="idem_consume_snapshot",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="snapshot",
     )
     instance.claims.rows.append(
         claim("clm_after", "使用后新增约束", event_seq=2)
@@ -632,13 +647,10 @@ def test_consumed_snapshot_remains_verifiable_after_preview_cache_cleanup(tmp_pa
     )
     result = preview(instance)
     compiled = compile_preview(instance, result)
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_cleanup",
-        idempotency_key="idem_consume_cleanup",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="cleanup",
     )
     (instance.context_store.previews_dir / (result["preview_id"] + ".json")).unlink()
 
@@ -653,13 +665,10 @@ def test_legacy_consumed_snapshot_uses_preview_authority_fallback(tmp_path):
         claims=[claim("clm_fact", "客户技术方案需要可回滚")],
     )
     compiled = compile_preview(instance, preview(instance))
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_legacy_anchor",
-        idempotency_key="idem_consume_legacy_anchor",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="legacy_anchor",
     )
     rows = []
     for raw in instance.context_store.events.path.read_text(
@@ -694,13 +703,10 @@ def test_outcome_snapshot_rejects_valid_republished_pack_with_unapproved_item(tm
         claims=[claim("clm_fact", "客户技术方案需要可回滚")],
     )
     compiled = compile_preview(instance, preview(instance))
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_tamper",
-        idempotency_key="idem_consume_tamper",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="tamper",
     )
     tampered = dict(compiled)
     tampered.pop("context_json", None)
@@ -728,13 +734,10 @@ def test_outcome_snapshot_rejects_rehashed_revision_and_summary_rewrite(tmp_path
         claims=[claim("clm_fact", "客户技术方案需要可回滚")],
     )
     compiled = compile_preview(instance, preview(instance))
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_rewrite",
-        idempotency_key="idem_consume_rewrite",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="rewrite",
     )
     tampered = {
         key: value
@@ -806,13 +809,10 @@ def test_consumed_outcome_rejects_malicious_markdown_with_rehashed_ready(tmp_pat
         claims=[claim("clm_fact", "客户技术方案需要可回滚")],
     )
     compiled = compile_preview(instance, preview(instance))
-    instance.context_store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume_markdown_attack",
-        idempotency_key="idem_consume_markdown_attack",
-        actor=ACTOR,
-        reason="Agent receipt",
+    acknowledge_compiled(
+        instance,
+        compiled,
+        suffix="markdown_attack",
     )
     _replace_markdown_and_rehash_ready(instance, compiled["context_id"])
 

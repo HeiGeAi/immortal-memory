@@ -74,6 +74,37 @@ def compile_preview(store, preview, *, suffix="one"):
     )
 
 
+CONTENT_HASH = "sha256:" + "b" * 64
+CONTEXT_MD_HASH = "sha256:" + "d" * 64
+
+
+def acknowledge_compiled(store, compiled, *, suffix="one"):
+    ready = {
+        "context_id": compiled["context_id"],
+        "content_hash": CONTENT_HASH,
+        "context_json_hash": "sha256:" + "c" * 64,
+        "context_md_hash": CONTEXT_MD_HASH,
+        "source_revision": compiled["source_revision"],
+    }
+    pack_dir = store.root / "packs" / compiled["context_id"]
+    pack_dir.mkdir(parents=True)
+    (pack_dir / "READY.json").write_text(json.dumps(ready), encoding="utf-8")
+    return store.acknowledge(
+        compiled["context_id"],
+        expected_version=compiled["stream_version"],
+        request_id="req_ack_" + suffix,
+        idempotency_key="idem_ack_" + suffix,
+        actor=ACTOR,
+        reason="Agent acknowledged Context delivery",
+        adapter="codex",
+        transport="cli",
+        run_ref="run_" + suffix,
+        content_hash=CONTENT_HASH,
+        context_markdown_hash=CONTEXT_MD_HASH,
+        pack_snapshot_hash=compiled["pack_snapshot_hash"],
+    )
+
+
 def test_empty_initialization_is_side_effect_free(tmp_path):
     from context_store import ContextStore
 
@@ -176,14 +207,7 @@ def test_compiled_context_consumes_and_expired_consumed_accepts_outcome(
     store = ContextStore(tmp_path, clock=clock)
     preview = create_preview(store, ttl_seconds=1)
     compiled = compile_preview(store, preview)
-    consumed = store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_consume",
-        idempotency_key="idem_consume",
-        actor=ACTOR,
-        reason="Agent accepted Context",
-    )
+    consumed = acknowledge_compiled(store, compiled, suffix="one")
     clock.advance(seconds=2)
     outcome = store.mark_outcome_recorded(
         compiled["context_id"],
@@ -207,14 +231,7 @@ def test_legacy_compiled_and_consumed_events_replay_with_empty_outcome_link(tmp_
     clock = Clock()
     store = ContextStore(tmp_path, clock=clock)
     compiled = compile_preview(store, create_preview(store))
-    store.consume(
-        compiled["context_id"],
-        expected_version=2,
-        request_id="req_legacy_consume",
-        idempotency_key="idem_legacy_consume",
-        actor=ACTOR,
-        reason="legacy Agent receipt",
-    )
+    acknowledge_compiled(store, compiled, suffix="legacy")
     rows = []
     for raw in store.events.path.read_text(encoding="utf-8").splitlines():
         event = json.loads(raw)

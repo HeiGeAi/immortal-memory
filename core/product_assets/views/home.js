@@ -60,6 +60,11 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     facts.className = "fact-grid";
     facts.setAttribute("aria-label", "当前档案摘要");
     const remembered = Array.isArray(data.remembered_today) ? data.remembered_today : [];
+    const memorySection = data.memory_evidence || {};
+    const memoryStatus = data.memory_evidence?.status;
+    const reviewStatus = data.claim_review?.status;
+    const agentStatus = data.agent_use?.status;
+    const systemStatus = data.system?.status;
     const newest = remembered[0] || {};
     const counts = data.understanding_changes?.counts || {};
     const confirmations = Array.isArray(data.needs_confirmation) ? data.needs_confirmation : [];
@@ -75,20 +80,63 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
       card.append(text("span", label, "fact-label"), text("strong", value, "fact-value"), text("small", note, "fact-note"));
       facts.append(card);
     };
-    fact("今日记忆", String(remembered.length), newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录");
-    fact("理解变化", String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)), `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`);
-    fact(
-      "待确认",
+    const sectionFact = (status, blockedNote, attentionNote, value, note) => {
+      if (status === "blocked") return { value: "不可用", note: blockedNote };
+      if (status === "attention") return { value: "需关注", note: attentionNote };
+      return { value, note };
+    };
+    const memoryFact = sectionFact(
+      memoryStatus,
+      "记忆索引暂不可用",
+      "记忆索引需要关注",
+      String(remembered.length),
+      newest.timestamp ? `${formatTimestamp(newest.timestamp)} · ${newest.source || "来源未知"}` : "今天尚无索引记录",
+    );
+    fact("今日记忆", memoryFact.value, memoryFact.note);
+    const changeFact = sectionFact(
+      reviewStatus,
+      "审核数据暂不可用",
+      "审核数据需要关注",
+      String((counts.added || 0) + (counts.changed || 0) + (counts.removed || 0)),
+      `新增 ${counts.added || 0} · 调整 ${counts.changed || 0} · 移除 ${counts.removed || 0}`,
+    );
+    fact("理解变化", changeFact.value, changeFact.note);
+    const reviewFact = sectionFact(
+      reviewStatus,
+      "审核数据暂不可用",
+      "审核数据需要关注",
       String(safeConfirmationTotal),
       safeConfirmationTotal > confirmations.length
         ? `当前展示 ${confirmations.length} 条，逐条处理后继续加载`
         : confirmations[0]?.summary || "没有待确认项目",
     );
-    fact("最近 Context", context.context_id ? "已使用" : "无", context.task || context.goal || context.context_id || "暂无已使用 Context");
-    fact("最近 Outcome", outcome.outcome_id ? "已记录" : "无", outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果");
-    fact("系统连续性", health.status_label || health.status || "未知", `版本 ${health.version || "未知"} · 关注项 ${health.attention_count ?? "未知"}`);
+    fact("待确认", reviewFact.value, reviewFact.note);
+    const contextFact = sectionFact(
+      agentStatus,
+      "Agent 使用记录暂不可用",
+      "Agent 使用记录需要关注",
+      context.context_id ? "已使用" : "无",
+      context.task || context.goal || context.context_id || "暂无已使用 Context",
+    );
+    fact("最近 Context", contextFact.value, contextFact.note);
+    const outcomeFact = sectionFact(
+      agentStatus,
+      "Agent 使用记录暂不可用",
+      "Agent 使用记录需要关注",
+      outcome.outcome_id ? "已记录" : "无",
+      outcome.summary || outcome.result || outcome.outcome_id || "暂无任务结果",
+    );
+    fact("最近 Outcome", outcomeFact.value, outcomeFact.note);
+    const systemFact = sectionFact(
+      systemStatus,
+      "系统状态暂不可用",
+      "系统状态需要关注",
+      health.status_label || health.status || "未知",
+      `版本 ${health.version || "未知"} · 关注项 ${health.attention_count ?? "未知"}`,
+    );
+    fact("系统连续性", systemFact.value, systemFact.note);
     fragment.append(facts);
-    const claimConfirmations = confirmations.filter((item) => item.kind === "claim");
+    const claimConfirmations = reviewStatus === "blocked" ? [] : confirmations.filter((item) => item.kind === "claim");
     if (claimConfirmations.length) {
       const review = text("section", "", "confirmation-list");
       review.append(text("h2", "等待你确认的理解"), text("p", "只有你确认后，它才会进入 Living Self。", "state-message"));
@@ -110,10 +158,49 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     }
     const actions = document.createElement("div");
     actions.className = "honest-actions";
+    let recoveryFeedback = null;
     const memoryButton = document.createElement("button");
     memoryButton.type = "button";
     memoryButton.textContent = "进入记忆档案";
     memoryButton.addEventListener("click", () => navigate("memories"));
+    if (memoryStatus === "blocked" && memorySection.action === "rebuild_derived_index") {
+      const recoveryButton = document.createElement("button");
+      recoveryButton.type = "button";
+      recoveryButton.textContent = "恢复记忆索引";
+      recoveryFeedback = text("p", "", "form-feedback");
+      recoveryFeedback.setAttribute("role", "status");
+      recoveryButton.addEventListener("click", async () => {
+        recoveryButton.disabled = true;
+        recoveryButton.className = "is-pending";
+        recoveryButton.textContent = "正在建立恢复任务……";
+        recoveryFeedback.textContent = "";
+        try {
+          const job = await api("/api/v1/jobs", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ kind: "index_rebuild", params: {} }),
+          });
+          if (!isCurrent()) return;
+          recoveryButton.className = "is-success";
+          recoveryButton.textContent = "恢复任务已建立";
+          recoveryFeedback.textContent = `任务 ${job.id} 已建立，正在打开真实运行记录。`;
+          navigate("system");
+        } catch (error) {
+          if (!isCurrent()) return;
+          const outcomeUnknown = !error.status || error.status >= 500;
+          recoveryButton.className = "is-failure";
+          if (outcomeUnknown) {
+            recoveryButton.textContent = "提交结果未知，请先核对";
+            recoveryFeedback.textContent = "连接中断，任务可能已经建立。为避免重复运行，请到系统页读取最新状态。";
+          } else {
+            recoveryButton.disabled = false;
+            recoveryButton.textContent = "服务端未接收，可重试";
+            recoveryFeedback.textContent = error.message || "服务端拒绝了这次恢复。";
+          }
+        }
+      });
+      actions.append(recoveryButton);
+    }
     const systemButton = document.createElement("button");
     systemButton.type = "button";
     systemButton.className = "secondary";
@@ -121,6 +208,7 @@ export async function renderHome(root, { signal, isCurrent, navigate, updateHeal
     systemButton.addEventListener("click", () => navigate("system"));
     actions.append(memoryButton, systemButton);
     fragment.append(actions);
+    if (recoveryFeedback) fragment.append(recoveryFeedback);
     root.replaceChildren(fragment);
   } catch (error) {
     if (error?.name === "AbortError" || !isCurrent()) return;

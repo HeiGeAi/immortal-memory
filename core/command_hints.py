@@ -14,7 +14,7 @@ SOURCE_ROOT = RUNTIME_DIR.parent
 def cli_prefix() -> str:
     """Return a runnable command prefix for the current installation mode."""
     if RUNTIME_DIR.name == "core":
-        return "%s %s" % (
+        return "%s -B %s" % (
             shlex.quote(sys.executable),
             shlex.quote(str(RUNTIME_DIR / "immortal.py")),
         )

@@ -47,7 +47,7 @@ ID_RE = re.compile(r"\A[A-Za-z0-9._:@+-]{1,180}\Z")
 HASH_RE = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 ACTOR = {"kind": "owner", "id": "local-owner"}
 SAFE_DOMAIN_CODES = frozenset({
-    "card_id_required", "claim_event_corruption", "claim_id_required",
+    "card_id_required", "claim_event_corruption", "claim_id_required", "claim_not_found",
     "compile_commit_failed", "context_budget_too_small", "context_not_ready",
     "context_budget_exceeded", "context_expired", "context_not_found",
     "custom_scope_id_required", "derived_store_invalid", "derived_store_limit",
@@ -457,7 +457,7 @@ class ProductMutationCoordinator:
         if route == "/api/v2/contexts":
             return "compile", "collection"
         routes = (
-            (r"/api/v2/claims/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject"}, "claim_action"),
+            (r"/api/v2/claims/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject", "reconsider", "correct"}, "claim_action"),
             (r"/api/v2/self/items/([A-Za-z0-9._:@+-]{1,180})/actions", {"correct"}, "self_action"),
             (r"/api/v2/self/versions/([A-Za-z0-9._:@+-]{1,180})/restore", None, "restore"),
             (r"/api/v2/judgments/([A-Za-z0-9._:@+-]{1,180})/actions", {"confirm", "reject", "correct", "record_outcome", "retire"}, "judgment_action"),
@@ -469,8 +469,15 @@ class ProductMutationCoordinator:
             if match is None:
                 continue
             action = default_action if actions is None else body.get("action")
-            if actions is not None and action not in actions:
-                raise MutationError("invalid_transition", "mutation action is not supported")
+            if actions is not None:
+                if not isinstance(action, str):
+                    raise MutationError(
+                        "invalid_request", "mutation action must be a string"
+                    )
+                if action not in actions:
+                    raise MutationError(
+                        "invalid_transition", "mutation action is not supported"
+                    )
             return str(action), match.group(1)
         raise MutationError("not_found", "mutation route was not found")
 
@@ -503,6 +510,8 @@ class ProductMutationCoordinator:
                     "idempotency key was reused for a different request",
                 )
             if prior is not None and prior.get("status") == "completed":
+                if route.startswith("/api/v2/claims/"):
+                    return self._public_result(prior["result"])
                 replay = self._dispatch(
                     route,
                     body,
@@ -724,11 +733,89 @@ class ProductMutationCoordinator:
             return self._context_outcome(context_id, body, **metadata)
         raise MutationError("not_found", "mutation route was not found")
 
+    def _published_claim_derivation(
+        self,
+        *,
+        action: str,
+        claim: Mapping[str, Any],
+        current: Optional[Mapping[str, Any]],
+        result_version_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if result_version_id is None or not isinstance(current, Mapping):
+            return None
+        try:
+            derived = self.living_self.load_version(result_version_id)
+        except (FileNotFoundError, KeyError, OSError):
+            return None
+        except (EventPathError, ValueError) as exc:
+            raise MutationError(
+                "mutation_authority_unavailable",
+                "Living Self authority is invalid",
+            ) from exc
+        claim_seq = claim.get("based_on_event_seq")
+        derived_seq = derived.get("based_on_claim_seq")
+        if (
+            not isinstance(claim_seq, int)
+            or isinstance(claim_seq, bool)
+            or not isinstance(derived_seq, int)
+            or isinstance(derived_seq, bool)
+            or derived_seq < claim_seq
+            or derived.get("generation_reason") != "claim_change"
+            or derived.get("reason") != "claim mutation " + action
+        ):
+            return None
+        cursor: Mapping[str, Any] = current
+        visited = set()
+        while True:
+            cursor_id = cursor.get("version_id")
+            if not isinstance(cursor_id, str) or cursor_id in visited:
+                raise MutationError(
+                    "mutation_authority_unavailable",
+                    "Living Self version chain is invalid",
+                )
+            if cursor_id == result_version_id:
+                return derived
+            visited.add(cursor_id)
+            parent_id = cursor.get("parent_version_id")
+            if parent_id is None:
+                return None
+            if not isinstance(parent_id, str):
+                raise MutationError(
+                    "mutation_authority_unavailable",
+                    "Living Self version chain is invalid",
+                )
+            try:
+                cursor = self.living_self.load_version(parent_id)
+            except (FileNotFoundError, KeyError, OSError):
+                return None
+            except (EventPathError, ValueError) as exc:
+                raise MutationError(
+                    "mutation_authority_unavailable",
+                    "Living Self version chain is invalid",
+                ) from exc
+
     def _claim_action(self, claim_id: str, body: Mapping[str, Any], **meta: Any) -> Dict[str, Any]:
-        _fields(body, ("action", "expected_version", "reason"), ("action", "expected_version", "reason"))
-        action = body["action"]
-        if action not in {"confirm", "reject"}:
+        action = body.get("action")
+        contracts = {
+            "confirm": (),
+            "reject": (),
+            "reconsider": ("evidence_ids",),
+            "correct": ("statement",),
+        }
+        if action not in contracts:
             raise MutationError("invalid_transition", "Claim action is not supported")
+        specific = contracts[action]
+        common = ("action", "expected_version", "reason")
+        _fields(body, common + specific, common + specific)
+        expected_revision = _integer(body["expected_version"], "expected_version")
+        reason = _text(body["reason"], "reason", maximum=500)
+        native = {
+            "expected_revision": expected_revision,
+            "request_id": meta["request_id"],
+            "idempotency_key": meta["idempotency_key"],
+            "actor": ACTOR,
+            "reason": reason,
+        }
         try:
             current = self.living_self.current()
         except FileNotFoundError:
@@ -738,22 +825,39 @@ class ProductMutationCoordinator:
             if isinstance(current, Mapping)
             else None
         )
-        claim = self.claims.transition(
-            _identifier(claim_id, "claim_id"),
-            "confirmed" if action == "confirm" else "rejected",
-            expected_revision=_integer(body["expected_version"], "expected_version"),
-            request_id=meta["request_id"],
-            idempotency_key=meta["idempotency_key"],
-            actor=ACTOR,
-            reason=_text(body["reason"], "reason", maximum=500),
-        )
+        claim_key = _identifier(claim_id, "claim_id")
+        if action in {"confirm", "reject"}:
+            claim = self.claims.transition(
+                claim_key,
+                "confirmed" if action == "confirm" else "rejected",
+                **native,
+            )
+        elif action == "reconsider":
+            evidence_ids = body["evidence_ids"]
+            if not isinstance(evidence_ids, list) or any(
+                not isinstance(item, str) or ID_RE.fullmatch(item) is None
+                for item in evidence_ids
+            ):
+                raise MutationError("invalid_request", "evidence_ids is invalid")
+            claim = self.claims.reconsider(
+                claim_key,
+                evidence_ids=list(evidence_ids),
+                **native,
+            )
+        else:
+            claim = self.claims.correct(
+                claim_key,
+                _text(body["statement"], "statement", maximum=8000),
+                **native,
+            )
         result_id = meta["preallocated"].get("version_id")
-        if (
-            meta.get("recovering")
-            and isinstance(current, Mapping)
-            and current.get("version_id") == result_id
-        ):
-            derived = self.living_self.load_version(result_id)
+        derived = self._published_claim_derivation(
+            action=action,
+            claim=claim,
+            current=current,
+            result_version_id=result_id,
+        )
+        if derived is not None:
             return {
                 "claim_id": claim["claim_id"],
                 "status": claim["status"],
@@ -768,6 +872,15 @@ class ProductMutationCoordinator:
                 expected_parent_version_id=parent_version,
             )
         except LivingSelfConflict as exc:
+            if exc.code == "version_conflict":
+                return {
+                    "claim_id": claim["claim_id"],
+                    "status": claim["status"],
+                    "revision": claim.get("revision"),
+                    "derived_update_pending": True,
+                    "derived_version_id": result_id,
+                    "error_code": "derived_update_pending",
+                }
             raise MutationError(exc.code, "Living Self materialization conflicted") from exc
         except (EventPathError, ValueError) as exc:
             raise MutationError(

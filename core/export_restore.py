@@ -1444,7 +1444,7 @@ def run_v11_migration(
 
 
 def verify_index_verification(vault_dir: str | Path) -> dict[str, Any]:
-    """Validate the exact source/main/WAL/SHM generation and classify receipt use."""
+    """Validate stable source/main DB identity and reject a non-empty WAL."""
     from product_data import ProductDataError, ProductIndexIntegrity
 
     vault = vault_path(vault_dir).absolute()
@@ -1559,7 +1559,7 @@ def v11_production_switch_gate(
     migration: dict[str, Any] | None,
     prewarm: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Bind migration, published source/DB generation, and receipt hit exactly."""
+    """Bind migration, stable source/main DB identity, and receipt hit exactly."""
     from product_data import INDEX_VERIFICATION_VERSION
     from index_integrity import INDEX_SCHEMA_VERSION
 
@@ -1635,31 +1635,31 @@ def v11_production_switch_gate(
             blockers.append("published_source_generation_mismatch")
         if full_identity.get("source_signature") != source_signature:
             blockers.append("published_source_signature_mismatch")
-    database_signatures: list[list[int] | None] = []
-    for suffix in ("", "-wal", "-shm"):
-        path = Path(str(vault / "search_index.db") + suffix)
-        if not os.path.lexists(path):
-            database_signatures.append(None)
-            continue
-        verified_file = _secure_file_size_and_sha256(path)
-        if verified_file is None:
+    database_path = vault / "search_index.db"
+    database_signature: list[int] | None = None
+    if os.path.lexists(database_path):
+        verified_database = _secure_file_size_and_sha256(database_path)
+        if verified_database is None:
             blockers.append("published_database_unsafe")
-            database_signatures.append(None)
-            continue
-        metadata = os.lstat(path)
-        database_signatures.append(
-            [
+        else:
+            metadata = os.lstat(database_path)
+            database_signature = [
                 metadata.st_dev,
                 metadata.st_ino,
                 metadata.st_size,
                 metadata.st_mtime_ns,
                 metadata.st_ctime_ns,
             ]
-        )
+    wal_path = Path(str(database_path) + "-wal")
+    if os.path.lexists(wal_path):
+        verified_wal = _secure_file_size_and_sha256(wal_path)
+        if verified_wal is None:
+            blockers.append("published_database_unsafe")
+        elif verified_wal[0]:
+            blockers.append("published_database_wal_nonempty")
     if (
-        not database_signatures
-        or database_signatures[0] is None
-        or full_identity.get("database_signature") != database_signatures
+        database_signature is None
+        or full_identity.get("database_signature") != [database_signature]
     ):
         blockers.append("published_database_generation_mismatch")
     blockers = list(dict.fromkeys(blockers))

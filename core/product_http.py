@@ -26,6 +26,7 @@ IDENTIFIER_RE = re.compile(r"\A[A-Za-z0-9._:@+-]{1,180}\Z")
 HEADER_ID_RE = re.compile(r"\A[A-Za-z0-9._:@+-]{1,128}\Z")
 BAD_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 SAFE_BAD_REQUEST_CODES = {
+    "invalid_claim_id",
     "invalid_context_id",
     "invalid_cursor",
     "invalid_judgment_id",
@@ -36,6 +37,7 @@ SAFE_BAD_REQUEST_CODES = {
     "query_too_short",
 }
 SAFE_NOT_FOUND_CODES = {
+    "claim_not_found",
     "context_not_found",
     "judgment_not_found",
     "memory_not_found",
@@ -44,11 +46,13 @@ SAFE_NOT_FOUND_CODES = {
     "self_version_not_found",
 }
 SAFE_UNAVAILABLE_CODES = {
+    "claim_unavailable",
     "clock_unavailable",
     "context_unavailable",
     "cursor_key_unavailable",
     "index_unavailable",
     "judgment_unavailable",
+    "memory_value_unavailable",
     "model_unavailable",
     "outcome_unavailable",
     "self_model_unavailable",
@@ -56,11 +60,11 @@ SAFE_UNAVAILABLE_CODES = {
     "trust_unavailable",
 }
 SAFE_MUTATION_RESPONSE_CODES = {
-    "context_budget_exceeded", "context_not_found", "evidence_not_found",
+    "claim_not_found", "context_budget_exceeded", "context_not_found", "evidence_not_found",
     "idempotency_conflict", "invalid_context_budget", "invalid_context_mode",
     "invalid_correction", "invalid_request", "invalid_transition",
     "judgment_not_found", "mutation_authority_unavailable",
-    "private_content_blocked", "scope_mismatch", "self_item_not_found",
+    "new_evidence_required", "private_content_blocked", "scope_mismatch", "self_item_not_found",
     "stale_preview", "statement_required", "task_required",
     "unresolved_context_mode", "version_conflict",
 }
@@ -333,7 +337,7 @@ def _exception_response(exc: Exception) -> Tuple[int, Dict[str, Any]]:
         status = 400
         if exc.code in {"version_conflict", "idempotency_conflict"}:
             status = 409
-        elif exc.code in {"not_found", "self_item_not_found", "judgment_not_found", "context_not_found"}:
+        elif exc.code in {"not_found", "claim_not_found", "self_item_not_found", "judgment_not_found", "context_not_found"}:
             status = 404
         elif exc.code in {"mutation_authority_unavailable", "mutation_failed"}:
             status = 503
@@ -341,7 +345,7 @@ def _exception_response(exc: Exception) -> Tuple[int, Dict[str, Any]]:
             exc.code,
             str(exc) if exc.code in {
                 "version_conflict", "idempotency_conflict", "invalid_request",
-                "invalid_transition", "scope_mismatch", "stale_preview",
+                "invalid_transition", "new_evidence_required", "scope_mismatch", "stale_preview",
             } else "写操作暂时无法完成",
             retryable=bool(exc.retryable or status == 503),
         )
@@ -410,6 +414,22 @@ class ProductRouter:
         if len(segments) == 4 and list(segments[:3]) == ["api", "v2", "memories"]:
             _without_query(query)
             return self.data.memory_detail(_identifier(segments[3]))
+        if list(segments) == ["api", "v2", "claims"]:
+            return self.data.claims(query)
+        if len(segments) == 4 and list(segments[:3]) == ["api", "v2", "claims"]:
+            _without_query(query)
+            return self.data.claim_detail(_identifier(segments[3]))
+        if (
+            len(segments) == 5
+            and list(segments[:3]) == ["api", "v2", "claims"]
+            and segments[4] == "history"
+        ):
+            return self.data.claim_history(_identifier(segments[3]), query)
+        if list(segments) == ["api", "v2", "memory-value", "overview"]:
+            _without_query(query)
+            return self.data.memory_value_overview()
+        if list(segments) == ["api", "v2", "memory-value", "claims"]:
+            return self.data.memory_value_claims(query)
         if list(segments) == ["api", "v2", "self"]:
             _without_query(query)
             return self.data.self_model()

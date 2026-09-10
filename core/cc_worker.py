@@ -30,7 +30,7 @@ READ_ONLY_ALLOWED = ",".join(
         "Bash(find *)",
         "Bash(sqlite3 *)",
         "Bash(python3 -m py_compile *)",
-        "Bash(python3 */immortal.py *status*)",
+        "Bash(python3 -B */immortal.py *status*)",
     ]
 )
 

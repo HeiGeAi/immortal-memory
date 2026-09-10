@@ -195,9 +195,9 @@ def render_web_index(immortal_dir: Path) -> str:
 ## 命令
 
 ```bash
-python3 ~/.codex/skills/immortal/immortal.py web-collect
-python3 ~/.codex/skills/immortal/immortal.py web-save "https://example.com" --note "为什么要留"
-python3 ~/.codex/skills/immortal/immortal.py web-status
+python3 -B ~/.codex/skills/immortal/immortal.py web-collect
+python3 -B ~/.codex/skills/immortal/immortal.py web-save "https://example.com" --note "为什么要留"
+python3 -B ~/.codex/skills/immortal/immortal.py web-status
 ```
 """
 
@@ -230,8 +230,8 @@ def render_notes_index(immortal_dir: Path) -> str:
 ## 命令
 
 ```bash
-python3 ~/.codex/skills/immortal/immortal.py notes-sync
-python3 ~/.codex/skills/immortal/immortal.py notes-status
+python3 -B ~/.codex/skills/immortal/immortal.py notes-sync
+python3 -B ~/.codex/skills/immortal/immortal.py notes-status
 ```
 
 写作规范见 [[笔记/_说明|笔记文件夹说明]]。

@@ -25,6 +25,7 @@ from model_types import (
     DOMAIN_SCOPES,
     ModelValidationError,
     ROLE_SCOPES,
+    SELECTION_TRACE_CANDIDATE_LIMIT,
     validate_claim,
     new_context_pack,
     validate_context_pack,
@@ -36,7 +37,7 @@ from redact_common import redact as redact_credentials
 
 
 COMPILER_VERSION = "1.1.0"
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 MAX_SECTION_ITEMS = 20
 MAX_SUMMARY_CHARS = 500
 MAX_SOURCE_RECORDS = 10_000
@@ -209,18 +210,21 @@ class ContextCompiler:
         return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     @staticmethod
-    def _rehash_pack(pack: Dict[str, Any]) -> Dict[str, Any]:
-        value = dict(pack)
-        value["content_hash"] = ""
+    def _pack_content_hash(pack: Mapping[str, Any]) -> str:
         encoded = json.dumps(
-            {key: item for key, item in value.items() if key != "content_hash"},
+            {key: item for key, item in pack.items() if key != "content_hash"},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-        value["content_hash"] = "sha256:" + hashlib.sha256(
+        return "sha256:" + hashlib.sha256(
             encoded.encode("utf-8")
         ).hexdigest()
+
+    @staticmethod
+    def _rehash_pack(pack: Dict[str, Any]) -> Dict[str, Any]:
+        value = dict(pack)
+        value["content_hash"] = ContextCompiler._pack_content_hash(value)
         validate_context_pack(value)
         return value
 
@@ -560,8 +564,9 @@ class ContextCompiler:
         now: datetime,
         excluded: List[str],
         reasons: set,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         ranked = []
+        exclusion_counts: Dict[str, int] = {}
         for source in rows:
             try:
                 validate_claim(source)
@@ -586,6 +591,7 @@ class ContextCompiler:
             if reason is not None:
                 excluded.append(str(claim["claim_id"]))
                 reasons.add(reason)
+                exclusion_counts[reason] = exclusion_counts.get(reason, 0) + 1
                 continue
             if claim["source_kind"] not in {
                 "direct",
@@ -595,6 +601,9 @@ class ContextCompiler:
             }:
                 excluded.append(str(claim["claim_id"]))
                 reasons.add("unconfirmed")
+                exclusion_counts["unconfirmed"] = (
+                    exclusion_counts.get("unconfirmed", 0) + 1
+                )
                 continue
             timestamp = _parse_time(claim["updated_at"], "updated_at").timestamp()
             ranked.append(
@@ -603,7 +612,10 @@ class ContextCompiler:
                     self._claim_item(claim),
                 )
             )
-        return [item for _key, item in sorted(ranked, key=lambda pair: pair[0])]
+        return (
+            [item for _key, item in sorted(ranked, key=lambda pair: pair[0])],
+            exclusion_counts,
+        )
 
     def _select_self_models(
         self,
@@ -829,7 +841,7 @@ class ContextCompiler:
         excluded: List[str] = []
         exclusion_reasons: set = set()
         candidates = {name: [] for name in CONTEXT_SECTIONS}
-        candidates["verified_facts"] = self._select_claims(
+        claim_candidates, claim_exclusion_counts = self._select_claims(
             claim_rows,
             roles=roles,
             domains=domains,
@@ -838,6 +850,7 @@ class ContextCompiler:
             excluded=excluded,
             reasons=exclusion_reasons,
         )
+        candidates["verified_facts"] = claim_candidates
         candidates["confirmed_self_models"] = self._select_self_models(
             living,
             mode=mode,
@@ -860,6 +873,36 @@ class ContextCompiler:
             max_chars=max_chars,
             max_bytes=max_bytes,
         )
+        selection_trace_candidates = [
+            {
+                "kind": "claim",
+                "id": item["id"],
+                "revision": item["revision"],
+                "section": "verified_facts",
+                "rank": rank,
+                "decision": "selected",
+                "reason_code": "within_budget",
+            }
+            for rank, item in enumerate(
+                sections["verified_facts"][:SELECTION_TRACE_CANDIDATE_LIMIT],
+                start=1,
+            )
+        ]
+        budget_excluded = len(claim_candidates) - len(selection_trace_candidates)
+        trace_exclusion_counts = dict(claim_exclusion_counts)
+        if budget_excluded:
+            trace_exclusion_counts["budget_limit"] = budget_excluded
+        selection_trace = {
+            "schema_version": 1,
+            "engine": "compiler_scope_v1",
+            "candidate_count": len(claim_candidates),
+            "truncated": len(claim_candidates) > len(selection_trace_candidates),
+            "candidates": selection_trace_candidates,
+            "exclusion_counts": {
+                reason: trace_exclusion_counts[reason]
+                for reason in sorted(trace_exclusion_counts)
+            },
+        }
         selected_items = [
             item
             for section in SECTION_ORDER
@@ -937,6 +980,7 @@ class ContextCompiler:
                 "excluded_count": len(set(excluded)),
                 "reasons": sorted(exclusion_reasons),
             },
+            selection_trace=selection_trace,
             ttl_seconds=ttl_seconds,
             expected_version=0,
             request_id=request,
@@ -1162,6 +1206,7 @@ class ContextCompiler:
         context_id: str,
         *,
         allowed_lifecycle_statuses: Sequence[str],
+        allow_expired: bool = False,
     ) -> Dict[str, Any]:
         try:
             record = self.context_store.get(context_id)
@@ -1170,6 +1215,10 @@ class ContextCompiler:
         if record["lifecycle_status"] not in set(allowed_lifecycle_statuses):
             raise ContextCompilerError(
                 "stale_context", "context lifecycle does not permit this operation"
+            )
+        if record["availability_status"] != "active" and not allow_expired:
+            raise ContextCompilerError(
+                "stale_context", "context snapshot has expired"
             )
         root = self.context_store.root / "packs" / context_id
         context_path = root / "context.json"
@@ -1187,10 +1236,11 @@ class ContextCompiler:
             ready = json.loads(ready_text)
             validate_context_pack(pack)
         except ModelValidationError as exc:
-            if (
-                exc.code != "context_expired"
-                or "compiled" in set(allowed_lifecycle_statuses)
-            ):
+            if exc.code != "context_expired" or not allow_expired:
+                raise ContextCompilerError(
+                    "context_not_ready", "compiled pack publication is invalid"
+                ) from exc
+            if pack.get("content_hash") != self._pack_content_hash(pack):
                 raise ContextCompilerError(
                     "context_not_ready", "compiled pack publication is invalid"
                 ) from exc
@@ -1304,6 +1354,19 @@ class ContextCompiler:
         return self._load_verified_snapshot(
             context_id,
             allowed_lifecycle_statuses=("consumed", "outcome_recorded"),
+            allow_expired=True,
+        )
+
+    def load_historical_snapshot(self, context_id: str) -> Dict[str, Any]:
+        """Verify an immutable compiled snapshot without applying the delivery gate."""
+        return self._load_verified_snapshot(
+            context_id,
+            allowed_lifecycle_statuses=(
+                "compiled",
+                "consumed",
+                "outcome_recorded",
+            ),
+            allow_expired=True,
         )
 
     def load_compiled(self, context_id: str) -> Dict[str, Any]:
@@ -1325,4 +1388,5 @@ class ContextCompiler:
         return self._load_verified_snapshot(
             context_id,
             allowed_lifecycle_statuses=("compiled",),
+            allow_expired=False,
         )

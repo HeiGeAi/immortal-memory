@@ -10,10 +10,10 @@
 - SQLite 是可重建读模型，index.jsonl 是事实源。
 
 CLI:
-  python3 index_db.py reindex   # 全量重建
-  python3 index_db.py sync      # 增量同步
-  python3 index_db.py stats     # 索引状态
-  python3 index_db.py search <关键词>
+  python3 -B index_db.py reindex   # 全量重建
+  python3 -B index_db.py sync      # 增量同步
+  python3 -B index_db.py stats     # 索引状态
+  python3 -B index_db.py search <关键词>
 """
 
 import sys
@@ -461,7 +461,7 @@ def _channels_unlocked(query: str, limit: int = 20, source: Optional[str] = None
 
 def stats() -> None:
     if not DB_FILE.exists():
-        print("索引未构建。运行: python3 index_db.py reindex")
+        print("索引未构建。运行: python3 -B index_db.py reindex")
         return
     with database_lock(DB_FILE, exclusive=False):
         _stats_unlocked()
@@ -469,7 +469,7 @@ def stats() -> None:
 
 def _stats_unlocked() -> None:
     if not DB_FILE.exists():
-        print("索引未构建。运行: python3 index_db.py reindex")
+        print("索引未构建。运行: python3 -B index_db.py reindex")
         return
     con = _connect()
     total = con.execute("SELECT count(*) FROM docs").fetchone()[0]

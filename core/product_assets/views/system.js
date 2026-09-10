@@ -35,6 +35,7 @@ const JOB_KINDS = {
   health: "健康检查",
   backup_verify: "备份核验",
   profile_refresh: "刷新长期画像",
+  index_rebuild: "恢复派生记忆索引",
 };
 
 const JOB_STATUS = {
@@ -216,6 +217,7 @@ function automationFeedbackCard(feedback = {}) {
 
 function commandLabel(command = "") {
   const value = String(command);
+  if (value.includes("index_db.py") && value.includes(" reindex")) return "重建派生记忆索引";
   if (value.includes("backup-status")) return "核验备份";
   if (value.includes("profile-nuwa")) return "生成 Nuwa 画像";
   if (value.includes("profile") && !value.includes("profile-nuwa")) return "生成长期画像";
@@ -272,6 +274,8 @@ function openJob(jobId, trigger) {
     appendFact(details, "耗时", Number.isFinite(job.elapsed_seconds) ? `${job.elapsed_seconds} 秒` : "尚未结束");
     appendFact(details, "结果说明", job.summary);
     appendFact(details, "失败原因", job.error || job.error_code);
+    appendFact(details, "事实源 SHA256（执行前）", job.source_sha256_before);
+    appendFact(details, "事实源 SHA256（执行后）", job.source_sha256_after);
     fragment.append(details, node("h3", "脱敏运行日志"));
     const log = node("pre", logs.text || "服务端尚未产生运行日志。", "context-markdown");
     fragment.append(log);

@@ -29,6 +29,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 from zoneinfo import ZoneInfo
 
+from command_hints import cli_command
 from control_center import ControlCenter
 from control_center_ui import control_center_page_html
 from control_data import ControlData
@@ -55,6 +56,7 @@ from product_http import (
 )
 from product_mutations import ProductMutationCoordinator
 from product_ui import PRODUCT_ASSETS, PRODUCT_ASSET_ROOT, product_page_html
+from secret_scan import file_sha256
 
 
 HOME = Path.home()
@@ -722,10 +724,16 @@ class FactoryStore:
             "jobs": jobs[:JOB_HISTORY_LIMIT],
             "commands": (
                 {
-                    "collect": "python3 ~/.codex/skills/immortal/immortal.py run",
-                    "clean": "python3 ~/.codex/skills/immortal/immortal.py feishu-clean && feishu-distill && profile-auto-review",
-                    "role": "python3 ~/.codex/skills/immortal/immortal.py task-compile \"目标\" --mode auto",
-                    "health": "python3 ~/.codex/skills/immortal/immortal.py health --max-age-hours 30",
+                    "collect": cli_command("run"),
+                    "clean": " && ".join(
+                        (
+                            cli_command("feishu-clean"),
+                            cli_command("feishu-distill"),
+                            cli_command("profile-auto-review"),
+                        )
+                    ),
+                    "role": cli_command("task-compile", "目标", "--mode", "auto"),
+                    "health": cli_command("health", "--max-age-hours", "30"),
                 }
                 if self.allow_commands
                 else {}
@@ -744,6 +752,7 @@ class FactoryStore:
             "run",
             "backup_verify",
             "profile_refresh",
+            "index_rebuild",
         }:
             raise ValueError("unknown factory job kind")
         if not self.allow_commands:
@@ -805,8 +814,12 @@ class FactoryStore:
     def _run_job(self, job_id: str, kind: str, body: dict[str, Any]) -> None:
         started = time.time()
         before_run = run_evidence_marker(self.immortal_dir / "runtime" / "current_run.json")
+        source_sha256_before = ""
         self._update_job(job_id, status="running", started_at=now_local())
         try:
+            if kind == "index_rebuild":
+                source_sha256_before = file_sha256(self.immortal_dir / "index.jsonl")
+                self._update_job(job_id, source_sha256_before=source_sha256_before)
             commands = self._commands_for(kind, body)
             self._update_job(
                 job_id,
@@ -843,6 +856,21 @@ class FactoryStore:
                 )
                 last_code = result.returncode
                 self._append_output(job_id, stdout=result.stdout, stderr=result.stderr)
+                if kind == "index_rebuild":
+                    try:
+                        source_sha256_after = file_sha256(self.immortal_dir / "index.jsonl")
+                    except OSError:
+                        source_sha256_after = ""
+                    self._update_job(job_id, source_sha256_after=source_sha256_after)
+                    if source_sha256_after != source_sha256_before:
+                        self._update_job(
+                            job_id,
+                            status="failed",
+                            error_code="source_changed_during_index_rebuild",
+                            error="事实源在派生索引恢复期间发生变化，恢复结果不可信。",
+                            returncode=last_code,
+                        )
+                        return
                 current = self.get_job(job_id) or {}
                 if current.get("status") == "cancel_requested":
                     self._update_job(
@@ -897,13 +925,22 @@ class FactoryStore:
                 returncode=1,
             )
         except Exception as exc:
-            self._update_job(
-                job_id,
-                status="failed",
-                error_code="command_failed",
-                error=sanitize_job_output(str(exc)),
-                returncode=1,
-            )
+            updates = {
+                "status": "failed",
+                "error_code": "command_failed",
+                "error": sanitize_job_output(str(exc)),
+                "returncode": 1,
+            }
+            if kind == "index_rebuild" and source_sha256_before:
+                try:
+                    source_sha256_after = file_sha256(self.immortal_dir / "index.jsonl")
+                except OSError:
+                    source_sha256_after = ""
+                updates["source_sha256_after"] = source_sha256_after
+                if source_sha256_after != source_sha256_before:
+                    updates["error_code"] = "source_changed_during_index_rebuild"
+                    updates["error"] = "事实源在派生索引恢复期间发生变化，恢复结果不可信。"
+            self._update_job(job_id, **updates)
         finally:
             self._update_job(job_id, finished_at=now_local(), elapsed_seconds=round(time.time() - started, 2))
             self._cancel_marker(job_id).unlink(missing_ok=True)
@@ -1013,6 +1050,14 @@ class FactoryStore:
                 StageCommand("profile", (python, immortal, "profile"), COMMAND_TIMEOUTS["profile"]),
                 StageCommand("profile-nuwa", (python, immortal, "profile-nuwa"), COMMAND_TIMEOUTS["profile_nuwa"]),
                 StageCommand("quality", (python, immortal, "quality"), COMMAND_TIMEOUTS["quality"]),
+            ]
+        if kind == "index_rebuild":
+            return [
+                StageCommand(
+                    "index-rebuild",
+                    (python, str(self.skill_dir / "index_db.py"), "reindex"),
+                    COMMAND_TIMEOUTS["profile"],
+                )
             ]
         raise ValueError("unknown factory job kind")
 

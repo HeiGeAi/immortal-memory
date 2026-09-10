@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -27,7 +28,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from config import configured_vault_dir, owner_display_name
-from agent_bridge import redact_external_text
+from agent_bridge import acknowledge_context, redact_external_text
 from context_compiler import ContextCompiler, ContextCompilerError
 
 
@@ -45,6 +46,10 @@ AUDIT_LATEST = AGENT_DIR / "access_latest.json"
 SERVER_NAME = "immortal-memory"
 SERVER_VERSION = (SKILL_DIR / "VERSION").read_text(encoding="utf-8").strip()
 DEFAULT_PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset(
+    {"2024-11-05", "2025-03-26", DEFAULT_PROTOCOL_VERSION}
+)
+PROTOCOL_VERSION_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
@@ -61,6 +66,22 @@ def is_allowed_origin(origin: str) -> bool:
         and parsed.password is None
         and parsed.path in {"", "/"}
         and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def is_allowed_host(host: str) -> bool:
+    try:
+        parsed = urlparse("//" + str(host or ""))
+        _ = parsed.port
+    except ValueError:
+        return False
+    return bool(
+        parsed.hostname in LOOPBACK_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in {"", "/"}
         and not parsed.query
         and not parsed.fragment
     )
@@ -375,9 +396,15 @@ def health_payload() -> dict[str, Any]:
             "health": "GET /health",
             "agent_entry": "GET /agent-entry or GET /api/agent-entry",
             "agent_context": "POST /agent-context",
+            "context_ack": "POST /context-ack",
             "recall": "POST /recall",
         },
-        "mcp_tools": ["immortal_agent_entry", "immortal_agent_context", "immortal_recall"],
+        "mcp_tools": [
+            "immortal_agent_entry",
+            "immortal_agent_context",
+            "immortal_context_ack",
+            "immortal_recall",
+        ],
     }
 
 
@@ -437,6 +464,21 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
         return payload if isinstance(payload, dict) else {}
+
+    def require_loopback_request(self) -> bool:
+        origin = self.headers.get("Origin", "")
+        remote = self.client_address[0] if self.client_address else ""
+        if (
+            is_loopback_host(remote)
+            and is_allowed_host(self.headers.get("Host", ""))
+            and (not origin or is_allowed_origin(origin))
+        ):
+            return True
+        self.send_json(
+            {"ok": False, "error_code": "loopback_required"},
+            HTTPStatus.FORBIDDEN,
+        )
+        return False
 
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
@@ -543,6 +585,8 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         started = time.monotonic()
         parsed = urlparse(self.path)
+        if parsed.path == "/context-ack" and not self.require_loopback_request():
+            return
         if not self.require_auth():
             audit_event(
                 {
@@ -559,6 +603,48 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
             )
             return
         payload = self.read_payload()
+        if parsed.path == "/context-ack":
+            result = acknowledge_context(
+                context_id=payload.get("context_id"),
+                expected_version=payload.get("expected_version"),
+                content_hash=payload.get("content_hash"),
+                context_markdown_hash=payload.get("context_markdown_hash"),
+                pack_snapshot_hash=payload.get("pack_snapshot_hash"),
+                adapter=payload.get("adapter"),
+                transport="http",
+                run_ref=payload.get("run_ref"),
+                vault_dir=VAULT_DIR,
+            )
+            if result["ok"]:
+                status = HTTPStatus.OK
+            elif result.get("error_code") == "context_not_found":
+                status = HTTPStatus.NOT_FOUND
+            elif result.get("error_code", "").startswith("invalid_"):
+                status = HTTPStatus.BAD_REQUEST
+            else:
+                status = HTTPStatus.CONFLICT
+            self.send_json(result, status)
+            audit_event(
+                {
+                    "transport": "http",
+                    "action": "context_ack",
+                    "method": "POST",
+                    "path": parsed.path,
+                    "status": int(status),
+                    "authorized": True,
+                    "context_id": payload.get("context_id"),
+                    "adapter": payload.get("adapter"),
+                    "ok": bool(result["ok"]),
+                    "error_code": result.get("error_code"),
+                    "remote": self.client_address[0]
+                    if self.client_address
+                    else "",
+                    "duration_ms": round(
+                        (time.monotonic() - started) * 1000, 2
+                    ),
+                }
+            )
+            return
         if parsed.path in {"/agent-context", "/api/agent-context"}:
             task = str(payload.get("task") or payload.get("query") or "当前任务")
             result = build_context(
@@ -645,6 +731,9 @@ def openapi_payload() -> dict[str, Any]:
             "/agent-entry": {"get": {"summary": "Read markdown handoff entry"}},
             "/api/agent-entry": {"get": {"summary": "Read handoff entry as JSON"}},
             "/agent-context": {"post": {"summary": "Build task-local context"}},
+            "/context-ack": {
+                "post": {"summary": "Acknowledge one exact compiled Context"}
+            },
             "/recall": {"post": {"summary": "Search memory for a topic"}},
         },
     }
@@ -711,6 +800,43 @@ def mcp_tool_definitions() -> list[dict[str, Any]]:
                 "required": ["task"],
                 "additionalProperties": False,
             },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "lifecycle_status": {"type": ["string", "null"]},
+                    "preview": {
+                        "type": "object",
+                        "properties": {
+                            "preview_id": {"type": "string"},
+                            "preview_hash": {"type": "string"},
+                        },
+                        "required": ["preview_id", "preview_hash"],
+                        "additionalProperties": False,
+                    },
+                    "ack": {
+                        "type": "object",
+                        "properties": {
+                            "context_id": {"type": "string"},
+                            "expected_version": {"type": "integer", "minimum": 1},
+                            "content_hash": {"type": "string"},
+                            "context_markdown_hash": {"type": "string"},
+                            "pack_snapshot_hash": {"type": "string"},
+                        },
+                        "required": [
+                            "context_id",
+                            "expected_version",
+                            "content_hash",
+                            "context_markdown_hash",
+                            "pack_snapshot_hash",
+                        ],
+                        "additionalProperties": False,
+                    },
+                    "error_code": {"type": "string"},
+                },
+                "required": ["ok", "lifecycle_status"],
+                "additionalProperties": False,
+            },
         },
         {
             "name": "immortal_recall",
@@ -727,11 +853,206 @@ def mcp_tool_definitions() -> list[dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "immortal_context_ack",
+            "description": "Acknowledge one exact compiled Context after the Agent has accepted it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "context_id": {"type": "string"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                    "content_hash": {"type": "string"},
+                    "context_markdown_hash": {"type": "string"},
+                    "pack_snapshot_hash": {"type": "string"},
+                    "adapter": {
+                        "type": "string",
+                        "enum": ["codex", "claude-code"],
+                    },
+                    "run_ref": {"type": "string"},
+                },
+                "required": [
+                    "context_id",
+                    "expected_version",
+                    "content_hash",
+                    "context_markdown_hash",
+                    "pack_snapshot_hash",
+                    "adapter",
+                    "run_ref",
+                ],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "context_id": {"type": "string"},
+                    "lifecycle_status": {"type": "string"},
+                    "stream_version": {"type": "integer"},
+                    "delivery_receipt": {"type": "object"},
+                    "error_code": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
 def text_result(text: str, *, is_error: bool = False) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+def _mcp_value_matches_type(value: Any, expected: str) -> bool:
+    return {
+        "array": isinstance(value, list),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "null": value is None,
+        "object": isinstance(value, dict),
+        "string": isinstance(value, str),
+    }.get(expected, False)
+
+
+def validate_mcp_input(
+    schema: dict[str, Any], value: Any, path: str = "arguments"
+) -> str | None:
+    expected = schema.get("type")
+    allowed_types = expected if isinstance(expected, list) else [expected]
+    if expected and not any(
+        _mcp_value_matches_type(value, item)
+        for item in allowed_types
+        if isinstance(item, str)
+    ):
+        return path + " has invalid type"
+    if isinstance(value, dict):
+        properties = (
+            schema.get("properties")
+            if isinstance(schema.get("properties"), dict)
+            else {}
+        )
+        for required in schema.get("required", []):
+            if required not in value:
+                return path + "." + str(required) + " is required"
+        if schema.get("additionalProperties") is False:
+            unexpected = sorted(set(value) - set(properties))
+            if unexpected:
+                return path + " contains an unexpected property"
+        for key, item in value.items():
+            child = properties.get(key)
+            if isinstance(child, dict):
+                error = validate_mcp_input(child, item, path + "." + key)
+                if error:
+                    return error
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for index, item in enumerate(value):
+            error = validate_mcp_input(schema["items"], item, f"{path}[{index}]")
+            if error:
+                return error
+    if "enum" in schema and value not in schema["enum"]:
+        return path + " is not an allowed value"
+    if isinstance(value, int) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            return path + " is below the minimum"
+        if "maximum" in schema and value > schema["maximum"]:
+            return path + " is above the maximum"
+    return None
+
+
+def _is_sha256(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 71
+        and value.startswith("sha256:")
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )
+
+
+def mcp_context_result(result: dict[str, Any], text: str) -> dict[str, Any]:
+    lifecycle = result.get("lifecycle_status")
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    structured: dict[str, Any] = {
+        "ok": bool(result.get("ok")),
+        "lifecycle_status": lifecycle,
+    }
+    if not result.get("ok"):
+        structured["error_code"] = str(
+            result.get("error_code") or "agent_context_failed"
+        )
+        response = text_result(
+            str(result.get("stderr") or "Context request failed."),
+            is_error=True,
+        )
+        response["structuredContent"] = structured
+        return response
+    if lifecycle == "preview":
+        preview_id = metadata.get("preview_id")
+        preview_hash = metadata.get("preview_hash")
+        if not (
+            isinstance(preview_id, str)
+            and bool(preview_id)
+            and _is_sha256(preview_hash)
+        ):
+            failed = {
+                "ok": False,
+                "lifecycle_status": lifecycle,
+                "error_code": "preview_contract_unavailable",
+            }
+            response = text_result(
+                "Preview authority contract is unavailable.", is_error=True
+            )
+            response["structuredContent"] = failed
+            return response
+        structured["preview"] = {
+            "preview_id": preview_id,
+            "preview_hash": preview_hash,
+        }
+    elif lifecycle == "compiled":
+        version = metadata.get("stream_version")
+        ack = {
+            "context_id": metadata.get("context_id"),
+            "expected_version": version,
+            "content_hash": metadata.get("content_hash"),
+            "context_markdown_hash": metadata.get("context_markdown_hash"),
+            "pack_snapshot_hash": metadata.get("pack_snapshot_hash"),
+        }
+        if not (
+            isinstance(ack["context_id"], str)
+            and bool(ack["context_id"])
+            and isinstance(version, int)
+            and not isinstance(version, bool)
+            and version >= 1
+            and _is_sha256(ack["content_hash"])
+            and _is_sha256(ack["context_markdown_hash"])
+            and _is_sha256(ack["pack_snapshot_hash"])
+        ):
+            failed = {
+                "ok": False,
+                "lifecycle_status": lifecycle,
+                "error_code": "context_ack_contract_unavailable",
+            }
+            response = text_result(
+                "Compiled Context acknowledgement contract is unavailable.",
+                is_error=True,
+            )
+            response["structuredContent"] = failed
+            return response
+        structured["ack"] = ack
+    else:
+        failed = {
+            "ok": False,
+            "lifecycle_status": lifecycle,
+            "error_code": "unsupported_context_lifecycle",
+        }
+        response = text_result(
+            "Context lifecycle is not supported by the MCP bridge.",
+            is_error=True,
+        )
+        response["structuredContent"] = failed
+        return response
+    response = text_result(text)
+    response["structuredContent"] = structured
+    return response
 
 
 def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -766,6 +1087,7 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         text = result.get("context") or result.get("stdout") or result.get("stderr") or ""
+        response = mcp_context_result(result, str(text))
         audit_event(
             {
                 "transport": "mcp",
@@ -773,13 +1095,16 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 "tool": name,
                 "task_hash": stable_hash(task),
                 "task_preview": preview(task),
-                "ok": bool(result["ok"]),
+                "ok": not response["isError"],
                 "exit_code": result.get("exit_code"),
+                "error_code": response.get("structuredContent", {}).get(
+                    "error_code"
+                ),
                 "response_chars": len(str(text)),
                 "duration_ms": round((time.monotonic() - started) * 1000, 2),
             }
         )
-        return text_result(str(text), is_error=not result["ok"])
+        return response
     if name == "immortal_recall":
         query = str(arguments.get("query") or "")
         result = recall(
@@ -803,6 +1128,36 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             }
         )
         return text_result(str(text), is_error=not result["ok"])
+    if name == "immortal_context_ack":
+        result = acknowledge_context(
+            context_id=arguments.get("context_id"),
+            expected_version=arguments.get("expected_version"),
+            content_hash=arguments.get("content_hash"),
+            context_markdown_hash=arguments.get("context_markdown_hash"),
+            pack_snapshot_hash=arguments.get("pack_snapshot_hash"),
+            adapter=arguments.get("adapter"),
+            transport="mcp",
+            run_ref=arguments.get("run_ref"),
+            vault_dir=VAULT_DIR,
+        )
+        audit_event(
+            {
+                "transport": "mcp",
+                "action": "tool_call",
+                "tool": name,
+                "context_id": arguments.get("context_id"),
+                "adapter": arguments.get("adapter"),
+                "ok": bool(result["ok"]),
+                "error_code": result.get("error_code"),
+                "duration_ms": round((time.monotonic() - started) * 1000, 2),
+            }
+        )
+        response = text_result(
+            json.dumps(result, ensure_ascii=False, sort_keys=True),
+            is_error=not result["ok"],
+        )
+        response["structuredContent"] = result
+        return response
     audit_event(
         {
             "transport": "mcp",
@@ -827,34 +1182,115 @@ def jsonrpc_error(message_id: Any, code: int, message: str, data: Any | None = N
     return {"jsonrpc": "2.0", "id": message_id, "error": error}
 
 
-def handle_mcp_message(message: dict[str, Any]) -> dict[str, Any] | None:
-    method = str(message.get("method") or "")
+class McpSession:
+    def __init__(self) -> None:
+        self.state = "new"
+        self.protocol_version: str | None = None
+
+
+def _valid_jsonrpc_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        or (isinstance(value, int) and not isinstance(value, bool))
+    )
+
+
+def handle_mcp_message(
+    message: dict[str, Any], *, session: McpSession | None = None
+) -> dict[str, Any] | None:
+    active_session = session or McpSession()
+    method = message.get("method")
+    has_id = "id" in message
     message_id = message.get("id")
-    params = message.get("params") if isinstance(message.get("params"), dict) else {}
-    if message_id is None and method.startswith("notifications/"):
+    if (
+        message.get("jsonrpc") != "2.0"
+        or not isinstance(method, str)
+        or not method
+        or (has_id and not _valid_jsonrpc_id(message_id))
+    ):
+        return jsonrpc_error(None, -32600, "Invalid Request")
+    raw_params = message.get("params")
+    if "params" in message and not isinstance(raw_params, (dict, list)):
+        if not has_id:
+            return None
+        return jsonrpc_error(None, -32600, "Invalid Request")
+    params = raw_params if isinstance(raw_params, dict) else {}
+    if not has_id:
+        if (
+            method == "notifications/initialized"
+            and active_session.state == "initializing"
+            and (raw_params is None or isinstance(raw_params, dict))
+        ):
+            active_session.state = "operational"
         return None
     try:
+        if method.startswith("notifications/"):
+            return jsonrpc_error(message_id, -32600, "Notification must not include an id")
+        if method == "ping":
+            return jsonrpc_result(message_id, {})
         if method == "initialize":
-            protocol = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
+            protocol = params.get("protocolVersion")
+            if (
+                not isinstance(raw_params, dict)
+                or not isinstance(protocol, str)
+                or not PROTOCOL_VERSION_PATTERN.fullmatch(protocol)
+            ):
+                return jsonrpc_error(
+                    message_id,
+                    -32602,
+                    "Unsupported protocol version",
+                    {
+                        "supportedProtocolVersions": sorted(
+                            SUPPORTED_PROTOCOL_VERSIONS
+                        )
+                    },
+                )
+            # MCP requires the server to answer an unsupported-but-well-formed
+            # version with one it does support, not an error, and let the client
+            # decide whether to continue.
+            negotiated = (
+                protocol
+                if protocol in SUPPORTED_PROTOCOL_VERSIONS
+                else DEFAULT_PROTOCOL_VERSION
+            )
+            if active_session.state != "new":
+                return jsonrpc_error(message_id, -32600, "Already initialized")
+            active_session.state = "initializing"
+            active_session.protocol_version = negotiated
             return jsonrpc_result(
                 message_id,
                 {
-                    "protocolVersion": protocol,
+                    "protocolVersion": negotiated,
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
                     "instructions": "Use immortal_agent_context before tasks that depend on the user's history, preferences, relationships, or prior decisions.",
                 },
             )
-        if method == "ping":
-            return jsonrpc_result(message_id, {})
+        if active_session.state != "operational":
+            return jsonrpc_error(message_id, -32002, "Server not initialized")
         if method == "tools/list":
             return jsonrpc_result(message_id, {"tools": mcp_tool_definitions()})
         if method == "tools/call":
-            name = str(params.get("name") or "")
-            arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            if not isinstance(raw_params, dict):
+                return jsonrpc_error(message_id, -32602, "Invalid tools/call params")
+            name = params.get("name")
+            definitions = {
+                item["name"]: item for item in mcp_tool_definitions()
+            }
+            if not isinstance(name, str) or name not in definitions:
+                return jsonrpc_error(message_id, -32602, "Unknown tool")
+            arguments = params.get("arguments", {})
+            error = validate_mcp_input(
+                definitions[name]["inputSchema"], arguments
+            )
+            if error:
+                return jsonrpc_error(
+                    message_id,
+                    -32602,
+                    "Invalid tool arguments",
+                    {"detail": error, "tool": name},
+                )
             return jsonrpc_result(message_id, call_mcp_tool(name, arguments))
-        if method.startswith("notifications/"):
-            return None
         return jsonrpc_error(message_id, -32601, f"Method not found: {method}")
     except Exception as exc:
         return jsonrpc_error(message_id, -32603, "Internal error", {"detail": str(exc)})
@@ -862,6 +1298,7 @@ def handle_mcp_message(message: dict[str, Any]) -> dict[str, Any] | None:
 
 def serve_mcp(_args: argparse.Namespace) -> int:
     audit_event({"transport": "mcp", "action": "server_start"})
+    session = McpSession()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -874,7 +1311,7 @@ def serve_mcp(_args: argparse.Namespace) -> int:
         if not isinstance(message, dict):
             print(json.dumps(jsonrpc_error(None, -32600, "Invalid request"), ensure_ascii=False), flush=True)
             continue
-        response = handle_mcp_message(message)
+        response = handle_mcp_message(message, session=session)
         if response is not None:
             print(json.dumps(response, ensure_ascii=False), flush=True)
     return 0
