@@ -446,10 +446,8 @@ def _load_source(
             if not raw:
                 break
             line_number += 1
-            if not raw.endswith(b"\n"):
-                raise IndexIntegrityError(
-                    f"malformed JSONL at line {line_number}: unterminated record"
-                )
+            # readline() 返回的无换行行只可能出现在 EOF，按完整末行记录处理，
+            # 一行缺尾换行不再废掉整个索引重建/增量同步。
             row = _decode_record(raw, line_number)
             rec_id = str(row["id"])
             if rec_id in ids:
@@ -534,10 +532,7 @@ def _scan_jsonl_once(
                 line_number += 1
                 digest.update(raw)
                 read_size += len(raw)
-                if not raw.endswith(b"\n"):
-                    raise IndexIntegrityError(
-                        f"malformed JSONL at line {line_number}: unterminated record"
-                    )
+                # EOF 末行无换行按完整记录处理（readline 只在 EOF 返回无换行行）。
                 row = _decode_record(raw, line_number)
                 rec_id = str(row["id"])
                 if rec_id in ids:

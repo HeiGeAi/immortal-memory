@@ -865,7 +865,10 @@ def _scan_catalog(
                     if not is_gzip:
                         bytes_read += len(raw)
                     if not raw.endswith(b"\n"):
-                        break
+                        # 区分两种无换行：remaining 上限截断的半行留到下轮；
+                        # EOF 末行无换行按完整记录处理，避免永久卡在同一 offset。
+                        if handle.read(1):
+                            break
                     bytes_since_checkpoint += len(raw)
                     rows_since_checkpoint += 1
                     _catalog_row(con, relative, raw, seq, file_index)
