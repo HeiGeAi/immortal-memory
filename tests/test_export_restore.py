@@ -62,14 +62,26 @@ class RestoreCheckStrictTest(unittest.TestCase):
             result = export_restore.restore_check(base, strict=True)
             self.assertFalse(result["ok"])
 
-    def test_strict_rejects_manifest_warnings(self):
+    def test_strict_allows_advisory_manifest_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = self.make_export(tmp)
             good = write_file(base, "a.txt", b"hello")
-            write_manifest(base, [good], warnings=["missing: timeline.html"])
+            write_manifest(
+                base,
+                [good],
+                warnings=["missing: timeline.html", "export_same_disk: 同盘提示"],
+            )
+            result = export_restore.restore_check(base, strict=True)
+            self.assertTrue(result["ok"])
+            self.assertTrue(any("manifest_warning" in w for w in result["warnings"]))
+
+    def test_strict_rejects_integrity_manifest_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self.make_export(tmp)
+            good = write_file(base, "a.txt", b"hello")
+            write_manifest(base, [good], warnings=["secret_shapes_present: index.jsonl 含 1 个候选"])
             result = export_restore.restore_check(base, strict=True)
             self.assertFalse(result["ok"])
-            self.assertTrue(any("manifest_warning" in w for w in result["warnings"]))
 
     def test_strict_rejects_invalid_manifest_item(self):
         with tempfile.TemporaryDirectory() as tmp:

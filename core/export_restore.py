@@ -1776,6 +1776,33 @@ def _read_event_head_without_lock(path: Path) -> int:
     return head
 
 
+# strict 校验 fail-closed 的完整性类 warning 前缀；
+# 位置提示（export_inside_vault/export_same_disk）与可选路径 missing/v11 层缺失提示属于 Advisory，不判 strict 失败
+_STRICT_FATAL_WARNING_PREFIXES = (
+    "unsafe_relpath",
+    "duplicate_relpath",
+    "invalid_item",
+    "extra_files",
+    "manifest_items_missing_or_invalid",
+    "manifest_warning: secret_shapes_present",
+    "manifest_warning: secret_scan_incomplete",
+    "manifest_warning: v11_snapshot_invalid",
+    "v11_event_heads_mismatch",
+    "v11_current_watermarks_mismatch",
+    "v11_projection_mismatch",
+    "v11_event_replay_failed",
+)
+
+
+def _strict_fatal_warnings(warnings: list[str]) -> list[str]:
+    """筛出 strict 模式下判失败的完整性类 warning。"""
+    return [
+        warning
+        for warning in warnings
+        if str(warning).startswith(_STRICT_FATAL_WARNING_PREFIXES)
+    ]
+
+
 def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, Any]:
     """Validate exported files against manifest size and sha256 metadata."""
     export_dir = resolve_export_path(export_path)
@@ -1875,9 +1902,12 @@ def restore_check(export_path: str | Path, strict: bool = False) -> dict[str, An
     if not missing and not mismatched:
         warnings.extend(_v11_projection_warnings(export_dir, manifest))
 
-    # strict 模式 fail-closed：任何 warning（unsafe/duplicate/invalid/extra/manifest 自带）都不允许成功，
+    # strict 模式 fail-closed：只对完整性类 warning 判失败（unsafe/duplicate/invalid/extra/secret/v11 回放），
+    # 位置提示（export_inside_vault/export_same_disk）与可选路径 missing 类提示不计入 strict 失败；
     # 且必须逐一校验过 manifest 声明的每个安全条目
-    strict_ok = not warnings and checked_files == len(seen)
+    strict_ok = (
+        not _strict_fatal_warnings(warnings) and checked_files == len(seen)
+    )
     return {
         "ok": not missing and not mismatched and (not strict or strict_ok),
         "export_dir": str(export_dir),
