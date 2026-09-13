@@ -58,13 +58,16 @@ def load_owner_identity() -> tuple[list[str], str]:
 
 OWNER_ALIASES, OWNER_FEISHU_OPEN_ID = load_owner_identity()
 
-SECRET_RE = re.compile(
-    r"(?i)(sk-[A-Za-z0-9_\-]{8,}|ghp_[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9_\-]+|"
-    r"akia[0-9a-z]{16}|AIza[0-9A-Za-z_\-]{20,}|cli_[A-Za-z0-9_\-]{8,}|"
-    r"api[_ -]?key\s*[:=]\s*\S+|app\s*(id|secret)\s*[:=：]\s*\S+|"
-    r"password\s*[:=：]\s*\S+|密码\s*[:=：]\s*\S+|token\s*[:=：]\s*\S+|"
-    r"(access|refresh)[_-]?token\s*[:=：]\s*\S+|bearer\s+[A-Za-z0-9._\-]+)"
-)
+def _build_secret_re() -> re.Pattern:
+    """从 redact_common 单一真源表派生检测正则，消除第三套漂移模式表。"""
+    from redact_common import SECRET_PATTERNS
+
+    return re.compile(
+        "(" + "|".join(f"(?:{regex})" for _name, regex, _replacement in SECRET_PATTERNS) + ")"
+    )
+
+
+SECRET_RE = _build_secret_re()
 URL_RE = re.compile(r"https?://[^\s)）]+")
 TAG_RE = re.compile(r"<[^>]+>")
 
