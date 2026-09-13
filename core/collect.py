@@ -1077,7 +1077,16 @@ def collect_codex_output(since: Optional[str] = None) -> dict:
             continue
         if any(part in SKIP_DIRS for part in doc_file.parts):
             continue
-        if doc_file.name.startswith(".") and doc_file.name not in (".env",):
+        if doc_file.name.startswith("."):
+            continue
+        # 凭证类文件直接跳过，内容绝不入库（.env*、*.env、*.pem、*credential*）。
+        name_lower = doc_file.name.lower()
+        if (
+            name_lower.startswith(".env")
+            or name_lower.endswith(".env")
+            or name_lower.endswith(".pem")
+            or "credential" in name_lower
+        ):
             continue
         if doc_file.suffix.lower() in SKIP_EXTENSIONS:
             continue
