@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0a1 (Unreleased)
+
+### Fixed
+
+- Strict restore checks now only fail closed on integrity-class warnings; positional hints and missing optional paths no longer block disaster-recovery restores.
+- Isolated-vault profile merges no longer read or write the primary vault; the merge subprocess receives explicit vault paths and the primary profile rebuild is skipped for non-primary vaults.
+- A trailing line without a newline no longer stalls notes migration forever or fails index rebuilds outright; EOF-terminated final lines are treated as complete records.
+- Directory-fd anchoring resolves macOS firmlink prefixes (/var, /tmp, /etc) before O_NOFOLLOW walks, so vaults under those prefixes work, while symlinks inside the vault are still rejected.
+- Feishu document contents are re-collected after edits: the seen key now includes a content hash, matching meeting-note behavior.
+- Index publication quarantines old WAL/SHM sidecars before replacing the main database, closing the crash window that could pair a new database with a stale WAL.
+- Daily summary generation normalizes dirty record fields (null session ids, list-structured content, null tool lists) and isolates per-day failures.
+- Compat-mode expression DNA entries are no longer silently dropped, and both legacy (name/description) and compat (title/summary) schemas are supported.
+- Feishu transcript paths are resolve-checked against the vault Feishu directory, blocking ../ traversal reads of arbitrary local files.
+- Secret detection and redaction now share one pattern table: password key-values, any-scheme DSN URLs, and shorter token key-values can no longer bypass the export gate.
+- The Codex-output collector skips .env, .pem, and credential-like files entirely.
+- Web capture redacts credentials from page titles and bodies before writing records or Markdown snapshots.
+- The agent bridge server enforces loopback Host/Origin checks on all mutating routes (DNS-rebinding CSRF), requires JSON Content-Type with a 1MB payload cap and read timeout, clamps timeout parameters to [10, 600], and stops leaking owner name and vault path from /health.
+- Removed hardcoded private paths and persona titles from distillation; Claude project memory directories are discovered per user and the persona title comes from configuration.
+
 ## 1.3.4 - 2026-07-31
 
 - Declare the bundled agent metadata and web assets as explicit distribution packages.
