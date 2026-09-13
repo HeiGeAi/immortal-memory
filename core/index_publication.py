@@ -110,10 +110,32 @@ def replace_database(
 ) -> None:
     # Staging is a complete DELETE-journal snapshot. The generation lock
     # prevents readers from opening main/WAL/SHM while this unit is switched.
-    os.replace(str(staging), str(database))
+    #
+    # 先把旧 -wal/-shm rename 成带 token 的废弃名，再 replace 主库：
+    # 保证任何崩溃点都不会出现「新主库配旧 WAL」（SQLite 打开时会按 WAL
+    # salt 把旧帧回放进新主库，造成页级错乱）。replace 失败则把旧 WAL/SHM
+    # 放回原位，保持旧库一致可用。
+    token = f"{os.getpid()}.{uuid.uuid4().hex}"
+    quarantined = []
     for suffix in ("-wal", "-shm"):
         sidecar = Path(str(database) + suffix)
         if sidecar.exists():
-            sidecar.unlink()
+            stale = Path(str(sidecar) + f".stale-{token}")
+            os.replace(str(sidecar), str(stale))
+            quarantined.append((sidecar, stale))
+    try:
+        os.replace(str(staging), str(database))
+    except Exception:
+        for sidecar, stale in quarantined:
+            try:
+                os.replace(str(stale), str(sidecar))
+            except OSError:
+                pass
+        raise
+    for _sidecar, stale in quarantined:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     fsync_file(database)
     fsync_directory(database.parent)
