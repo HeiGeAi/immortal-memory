@@ -496,8 +496,22 @@ class ReviewStore:
 
     def merge(self) -> dict[str, Any]:
         started = time.time()
-        merge_cmd = [sys.executable, str(SKILL_DIR / "profile_merge.py")]
-        profile_cmd = [sys.executable, str(SKILL_DIR / "profile.py")]
+        reviewed_md = self.reviewed.with_suffix(".md")
+        merge_log = self.reviewed.parent / "profile_merge_log.jsonl"
+        merge_cmd = [
+            sys.executable,
+            str(SKILL_DIR / "profile_merge.py"),
+            "--proposal",
+            str(self.proposal),
+            "--memories",
+            str(self.memories),
+            "--reviewed-file",
+            str(self.reviewed),
+            "--reviewed-md",
+            str(reviewed_md),
+            "--log",
+            str(merge_log),
+        ]
         merge = subprocess.run(merge_cmd, capture_output=True, text=True, timeout=120)
         if merge.returncode != 0:
             self._audit_action("merge", "selected", result="failed", recoverable=True)
@@ -508,19 +522,33 @@ class ReviewStore:
                 "stdout": sanitize_job_output(merge.stdout),
                 "stderr": sanitize_job_output(merge.stderr),
             }
-        profile = subprocess.run(profile_cmd, capture_output=True, text=True, timeout=180)
+        # profile.py 只认识主 vault（~/.immortal），隔离 vault 跳过全局画像重建，
+        # 避免越界写主库 profile.json/profile.md。
+        is_primary_vault = normalized_path(self.reviewed) == normalized_path(DEFAULT_REVIEWED_FILE)
+        if is_primary_vault:
+            profile_cmd = [sys.executable, str(SKILL_DIR / "profile.py")]
+            profile = subprocess.run(profile_cmd, capture_output=True, text=True, timeout=180)
+            profile_stdout = profile.stdout
+            profile_stderr = profile.stderr
+            profile_returncode = profile.returncode
+            step = "profile"
+        else:
+            profile_stdout = "skipped: isolated vault, primary profile rebuild not applicable"
+            profile_stderr = ""
+            profile_returncode = 0
+            step = "profile_skipped_isolated_vault"
         self._audit_action(
             "merge",
             "selected",
-            result="ok" if profile.returncode == 0 else "failed",
+            result="ok" if profile_returncode == 0 else "failed",
             recoverable=True,
         )
         return {
-            "ok": profile.returncode == 0,
-            "step": "profile",
-            "returncode": profile.returncode,
-            "stdout": sanitize_job_output((merge.stdout + "\n" + profile.stdout).strip()),
-            "stderr": sanitize_job_output((merge.stderr + "\n" + profile.stderr).strip()),
+            "ok": profile_returncode == 0,
+            "step": step,
+            "returncode": profile_returncode,
+            "stdout": sanitize_job_output((merge.stdout + "\n" + profile_stdout).strip()),
+            "stderr": sanitize_job_output((merge.stderr + "\n" + profile_stderr).strip()),
             "elapsed_seconds": round(time.time() - started, 2),
             "state": self.build_state(),
         }
