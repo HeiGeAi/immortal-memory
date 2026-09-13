@@ -20,23 +20,40 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# 检测模式与 redact_common 的替换模式同源，但这里只做识别不做替换。
+from redact_common import SECRET_PATTERNS
+
+# 检测模式与 redact_common 共用同一真源表（SECRET_PATTERNS），消除双表漂移：
+# 脱敏能覆盖的形态，出口扫描必然能识别。这里只做识别不做替换。
 # 键为模式名，值为编译好的正则。
 DETECT_PATTERNS: dict[str, re.Pattern] = {
-    "sk_key": re.compile(r"sk-[A-Za-z0-9_\-]{12,}"),
-    "github_token": re.compile(r"\bgh[posru]_[A-Za-z0-9]{20,}\b"),
-    "github_pat": re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
-    "aws_key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    "getnote_key": re.compile(r"\bgk_live_[A-Za-z0-9._\-]{10,}"),
-    "slack_token": re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"),
-    "google_key": re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"),
-    "jwt": re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}"),
-    "url_credential": re.compile(r"https?://[^@\s/:]+:[^@\s/]+@"),
+    name: re.compile(regex) for name, regex, _replacement in SECRET_PATTERNS
 }
 
-# 快速预筛子串：一行不含任何触发子串就跳过正则，让 1GB 级 index 扫描保持在分钟内
-PREFILTER = ("sk-", "gh", "AKIA", "gk_live_", "xox", "AIza", "eyJ", "://")
+# 快速预筛子串（小写匹配，覆盖 (?i) 模式）：一行不含任何触发子串就跳过正则，
+# 让 1GB 级 index 扫描保持在分钟内
+PREFILTER = (
+    "sk-",
+    "gh",
+    "akia",
+    "gk_live_",
+    "xox",
+    "aiza",
+    "eyj",
+    "://",
+    "cli_",
+    "password",
+    "密码",
+    "secret",
+    "token",
+    "bearer",
+    "api",
+)
 MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
+
+
+def _has_prefilter(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in PREFILTER)
 
 
 def value_hash(value: str) -> str:
@@ -58,7 +75,7 @@ def file_sha256(path: Path) -> str:
 
 def scan_text_shapes(text: str) -> dict[str, int]:
     """Return high-confidence rule counts without returning matched values."""
-    if not any(token in text for token in PREFILTER):
+    if not _has_prefilter(text):
         return {}
     counts: dict[str, int] = {}
     for name, pattern in DETECT_PATTERNS.items():
@@ -93,7 +110,7 @@ def _redact_string(
     by_pattern: dict[str, int],
     findings: list[dict[str, Any]],
 ) -> str:
-    if not any(token in value for token in PREFILTER):
+    if not _has_prefilter(value):
         return value
     redacted = value
     for name, pattern in DETECT_PATTERNS.items():
@@ -196,7 +213,7 @@ def redact_jsonl_copy(source: Path, destination: Path) -> dict[str, Any]:
                     raise ValueError(
                         f"index.jsonl line {line_no} is not valid UTF-8; refusing secret redaction"
                     ) from exc
-                if not any(token in line for token in PREFILTER):
+                if not _has_prefilter(line):
                     writer.write(raw)
                     continue
                 try:
@@ -267,7 +284,7 @@ def scan_file(path: Path) -> dict[str, Any]:
             except UnicodeDecodeError:
                 invalid_json_lines.append(line_no)
                 continue
-            if not any(token in line for token in PREFILTER):
+            if not _has_prefilter(line):
                 continue
             try:
                 record = json.loads(line)
@@ -277,7 +294,7 @@ def scan_file(path: Path) -> dict[str, Any]:
             else:
                 values = _iter_string_values(record)
             for field, text in values:
-                if not any(token in text for token in PREFILTER):
+                if not _has_prefilter(text):
                     continue
                 for name, pattern in DETECT_PATTERNS.items():
                     for match in pattern.finditer(text):

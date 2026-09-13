@@ -11,28 +11,34 @@
 
 import re
 
-_PATTERNS = [
+# 单一真源：凭证模式表（名称、正则、脱敏替换）。
+# secret_scan 的出口检测模式从本表派生，禁止再复制一份漂移。
+SECRET_PATTERNS = [
     # 「键: 值」式
-    (r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
-    (r"(?i)(app\s*secret\s*[:：=]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-    (r"(?i)(api[_\- ]?key\s*[:：=]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
-    (r"(?i)(password\s*[:：=]?\s*)\S+", r"\1[REDACTED]"),
-    (r"(?i)(密码\s*[:：=]?\s*)\S+", r"\1[REDACTED]"),
-    (r"(?i)\b(token|bearer|secret)(\s*[:：=]\s*)\S{16,}", r"\1\2[REDACTED]"),
+    ("cli_token", r"\bcli_[A-Za-z0-9_\-]{8,}\b", "cli_[REDACTED]"),
+    ("app_secret", r"(?i)(app\s*secret\s*[:：=]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+    ("api_key", r"(?i)(api[_\- ]?key\s*[:：=]?\s*)[A-Za-z0-9_\-]{12,}", r"\1[REDACTED]"),
+    # password/密码 前不得紧跟字母数字或连字符，避免误伤 "not-a-password@host" 这类正文；
+    # 也不得位于 [REDACTED: 占位符内部，避免扫描器把出口占位符二次判为候选。
+    ("password", r"(?i)(?<!\[REDACTED:)(?<![A-Za-z0-9_\-])(password\s*[:：=]?\s*)\S+", r"\1[REDACTED]"),
+    ("password_zh", r"(?i)(?<!\[REDACTED:)(?<![A-Za-z0-9_\-])(密码\s*[:：=]?\s*)\S+", r"\1[REDACTED]"),
+    ("token_kv", r"(?i)\b(token|bearer|secret)(\s*[:：=]\s*)\S{12,}", r"\1\2[REDACTED]"),
     # 厂商特征 token
-    (r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
-    (r"gh[posru]_[A-Za-z0-9]{20,}", "gh_[REDACTED]"),
-    (r"github_pat_[A-Za-z0-9_]{20,}", "github_pat_[REDACTED]"),
-    (r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
-    (r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
-    (r"\bxox[baprs]-[A-Za-z0-9\-]{10,}", "xox-[REDACTED]"),
-    (r"\bAIza[0-9A-Za-z_\-]{35}\b", "AIza[REDACTED]"),
-    (r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}", "[REDACTED_JWT]"),
-    # URL 内嵌凭证 https://user:pass@host
-    (r"(https?://)[^@\s/:]+:[^@\s/]+@", r"\1[REDACTED]@"),
-    # URL 内嵌单段凭证 https://<token>@host（token 当用户名、无冒号）
-    (r"(https?://)[A-Za-z0-9_\-]{16,}@", r"\1[REDACTED]@"),
+    ("sk_key", r"sk-[A-Za-z0-9_\-]{12,}", "sk-[REDACTED]"),
+    ("github_token", r"gh[posru]_[A-Za-z0-9]{20,}", "gh_[REDACTED]"),
+    ("github_pat", r"github_pat_[A-Za-z0-9_]{20,}", "github_pat_[REDACTED]"),
+    ("aws_key", r"\bAKIA[0-9A-Z]{16}\b", "AKIA[REDACTED]"),
+    ("getnote_key", r"\bgk_live_[A-Za-z0-9._\-]{10,}", "gk_live_[REDACTED]"),
+    ("slack_token", r"\bxox[baprs]-[A-Za-z0-9\-]{10,}", "xox-[REDACTED]"),
+    ("google_key", r"\bAIza[0-9A-Za-z_\-]{35}\b", "AIza[REDACTED]"),
+    ("jwt", r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}", "[REDACTED_JWT]"),
+    # URL 内嵌凭证 <scheme>://user:pass@host（任意 scheme，含 postgres/mysql 等 DSN）
+    ("url_credential", r"([A-Za-z][A-Za-z0-9+.\-]*://)[^@\s/:]+:[^@\s/]+@", r"\1[REDACTED]@"),
+    # URL 内嵌单段凭证 <scheme>://<token>@host（token 当用户名、无冒号）
+    ("url_token", r"([A-Za-z][A-Za-z0-9+.\-]*://)[A-Za-z0-9_\-]{16,}@", r"\1[REDACTED]@"),
 ]
+
+_PATTERNS = [(regex, replacement) for _name, regex, replacement in SECRET_PATTERNS]
 
 _COMPILED = [(re.compile(p), r) for p, r in _PATTERNS]
 
