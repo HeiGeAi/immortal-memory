@@ -62,9 +62,14 @@ def _build_secret_re() -> re.Pattern:
     """从 redact_common 单一真源表派生检测正则，消除第三套漂移模式表。"""
     from redact_common import SECRET_PATTERNS
 
-    return re.compile(
-        "(" + "|".join(f"(?:{regex})" for _name, regex, _replacement in SECRET_PATTERNS) + ")"
-    )
+    parts = []
+    for _name, regex, _replacement in SECRET_PATTERNS:
+        if regex.startswith("(?i)"):
+            # 组合表达式里全局 flag 必须位于整体最前（Python 3.12 起否则 re.error），
+            # 改写为作用域形式 (?i:...) 保持各子模式语义不变。
+            regex = "(?i:" + regex[len("(?i)"):] + ")"
+        parts.append(f"(?:{regex})")
+    return re.compile("(" + "|".join(parts) + ")")
 
 
 SECRET_RE = _build_secret_re()

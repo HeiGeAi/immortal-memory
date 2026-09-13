@@ -6,8 +6,8 @@
 
 | 层 | 仓库/路径 | 版本 | 说明 |
 |---|---|---|---|
-| **v1 产品线（现役）** | `/Users/blakexu/Documents/开源项目/repos/immortal-memory`（main，origin=github.com/HeiGeAi/immortal-memory） | **1.4.0a1** | 采集、五层架构（Claim/Living Self/Judgment/Context/Outcome）、控制中心、Agent Bridge |
-| **v2 产品线（下一代）** | `/Users/blakexu/immortal-memory`（main，origin=github.com/HeiGeAi/immortal-memory-v2 私有仓） | **2.0.0** | 判断卡/事实卡/人物卡三层精炼 + L2 供给层（MCP/hook），Claude Code 已接入 |
+| **v1 产品线（现役）** | `~/Documents/开源项目/repos/immortal-memory`（main，origin=github.com/HeiGeAi/immortal-memory） | **1.4.0a1** | 采集、五层架构（Claim/Living Self/Judgment/Context/Outcome）、控制中心、Agent Bridge |
+| **v2 产品线（下一代）** | `~/immortal-memory`（main，origin=github.com/HeiGeAi/immortal-memory-v2 私有仓） | **2.0.0** | 判断卡/事实卡/人物卡三层精炼 + L2 供给层（MCP/hook），Claude Code 已接入 |
 
 两条线是不同代际的独立代码库，各自只有一个真相源。任何改动必须先落仓库，再部署。
 
@@ -28,19 +28,21 @@
 
 ## 4. 调度（launchd，无 crontab）
 
+launchd 标签实际以本机用户名为用户段（表中统一写作 com.example.* 脱敏）。
+
 | 标签 | 内容 | 归属 |
 |---|---|---|
 | com.blake.immortal.daily-backup | `immortal.py run` 4 时段采集 + feedback 通知 | v1 |
-| com.blakexu.immortal.daily-health-check | status/doctor/health 三连检 | v1 |
-| com.blakexu.immortal.feishu-mirror-worker | 飞书 Drive 镜像 run-once | v1 |
-| com.blakexu.immortal.profile-review | 8765 端口审阅台 | v1 |
+| com.example.immortal.daily-health-check | status/doctor/health 三连检 | v1 |
+| com.example.immortal.feishu-mirror-worker | 飞书 Drive 镜像 run-once | v1 |
+| com.example.immortal.profile-review | 8765 端口审阅台 | v1 |
 | com.immortal-memory.v2.prune | `mem daily`（v2 备份 + exports 轮换） | v2 |
 
 ## 5. 日常维护流程
 
 1. 改代码：只在上述两个仓库改，跑全量测试（v1：`PYTHONPATH=core /usr/bin/python3 -m pytest tests/ -q`，当前 1337 passed；v2：`.venv/bin/python -m pytest tests/ -q`）。
 2. 发版：main 打 tag（如 v1.4.0a1），GitHub tag + Release 为发布完成证据。
-3. 部署：按第 2 节 rsync/软链，改完 `immortal.py --version` 核对，重启 `launchctl kickstart -k gui/501/com.blakexu.immortal.profile-review`。
+3. 部署：按第 2 节 rsync/软链，改完 `immortal.py --version` 核对，重启 `launchctl kickstart -k gui/501/com.example.immortal.profile-review`。
 4. 禁止：直接改 `~/.local/share/` 或 skill 安装位的内容（它们只是部署产物）。
 
 ## 6. 已清理项（2026-09-11）
