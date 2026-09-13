@@ -464,17 +464,30 @@ def flatten_nuwa(nuwa: dict[str, Any]) -> list[dict[str, Any]]:
                 meta={"confidence": item.get("confidence"), "domains": item.get("domains") or []},
             )
         )
-    for item in (nuwa.get("expression_dna") or [])[1:]:
+    expression_dna = nuwa.get("expression_dna") or []
+    # legacy 模式首元素是 metrics 占位（见 profile_nuwa.build_expression_dna），
+    # 需要跳过；Living Self compat 模式的 expression_dna 是 title/summary
+    # 真实条目列表，首元素不能丢。
+    if (
+        expression_dna
+        and isinstance(expression_dna[0], dict)
+        and "metrics" in expression_dna[0]
+    ):
+        expression_dna = expression_dna[1:]
+    for item in expression_dna:
         if not isinstance(item, dict):
             continue
+        # 兼容 legacy（name/description）与 compat（title/summary）两套 schema。
+        dna_name = item.get("name") or item.get("title") or ""
+        dna_description = item.get("description") or item.get("summary") or ""
         rows.append(
             evidence_item(
-                text=f"{item.get('name') or ''}：{item.get('description') or ''}",
+                text=f"{dna_name}：{dna_description}",
                 source="profile_nuwa.expression_dna",
                 layer="long_profile",
                 kind="expression_dna",
                 weight=7.0,
-                ref=str(item.get("name") or ""),
+                ref=str(dna_name),
                 meta={"sources": item.get("sources") or []},
             )
         )
