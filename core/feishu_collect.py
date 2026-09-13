@@ -1573,10 +1573,18 @@ class Collector:
         path = Path(str(path_value))
         if not path.is_absolute():
             path = FEISHU_DIR / path
+        # 防路径穿越：transcript_file 来自 lark-cli 输出（受远端数据影响），
+        # resolve 后必须落在 FEISHU_DIR 内，否则拒绝读取。
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            resolved = path.resolve()
+            resolved.relative_to(FEISHU_DIR.resolve())
+        except (OSError, ValueError):
+            self.error("feishu-minutes-note", f"transcript path escapes FEISHU_DIR, rejected: {path_value}")
+            return ""
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="replace")
         except Exception as exc:
-            self.error("feishu-minutes-note", f"cannot read transcript {path}: {type(exc).__name__}: {exc}")
+            self.error("feishu-minutes-note", f"cannot read transcript {resolved}: {type(exc).__name__}: {exc}")
             return ""
         return text[: self.args.minutes_transcript_chars]
 
