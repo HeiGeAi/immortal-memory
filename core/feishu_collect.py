@@ -147,6 +147,12 @@ def mark_seen(conn: sqlite3.Connection, source: str, record_key: str) -> bool:
         return False
 
 
+def already_seen(conn: sqlite3.Connection, record_key: str) -> bool:
+    """只查不写：用于「先探测、fetch 成功再落标记」的采集顺序，避免失败时永久毒化。"""
+    row = conn.execute("select 1 from seen where record_key = ? limit 1", (record_key,)).fetchone()
+    return row is not None
+
+
 def parse_dt(value: str | None, *, end_of_day: bool = False) -> datetime | None:
     if not value:
         return None
