@@ -48,8 +48,10 @@ SKILL_DIR = Path(__file__).resolve().parent
 MEMORY_DIRS = [
     SKILL_DIR / "references" / "memory",
     Path.home() / ".codex/memories",
-    Path.home() / ".claude/projects/-Users-blakexu/memory",
 ]
+# Claude Code 项目记忆目录按工作目录编码命名，通配当前用户的所有项目，
+# 不写死任何具体用户路径。
+MEMORY_DIRS.extend(sorted(Path.home().glob(".claude/projects/*/memory")))
 INDEX_FILE = Path.home() / ".immortal/index.jsonl"
 OUTPUT_FILE = Path.home() / ".immortal/digital-soul.md"
 
@@ -367,7 +369,7 @@ def build_soul():
     print("阶段 3/3：合成数字人格...")
 
     lines = []
-    lines.append("# BLACK BROTHER — Digital Soul v2.0")
+    lines.append(f"# {PERSONA} — Digital Soul v2.0")
     lines.append("")
     lines.append(f"> 自动从 {stats.get('total_records', 0):,} 条记录中蒸馏")
     lines.append(f"> 真实用户发言 {stats.get('real_user_msgs', 0):,} 条")
