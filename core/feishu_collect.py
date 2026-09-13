@@ -147,12 +147,6 @@ def mark_seen(conn: sqlite3.Connection, source: str, record_key: str) -> bool:
         return False
 
 
-def already_seen(conn: sqlite3.Connection, record_key: str) -> bool:
-    """只查不写：用于「先探测、fetch 成功再落标记」的采集顺序，避免失败时永久毒化。"""
-    row = conn.execute("select 1 from seen where record_key = ? limit 1", (record_key,)).fetchone()
-    return row is not None
-
-
 def parse_dt(value: str | None, *, end_of_day: bool = False) -> datetime | None:
     if not value:
         return None
@@ -1714,11 +1708,9 @@ class Collector:
             return
         for item in docs:
             token = item["token"]
-            # 先探 seen（不落标记），fetch 成功后才 mark_seen：瞬时失败（超时/限流/权限抖动）
-            # 不能永久毒化文档。对齐 collect_vc_note_doc_contents 的正确顺序。
-            key = f"feishu-doc-content|{token}"
-            if already_seen(self.conn, key):
-                continue
+            # seen 键含内容哈希（对齐 collect_vc_note_doc_contents）：内容未变跳过，
+            # 内容变化产生新记录；fetch 失败不落标记，瞬时失败（超时/限流/权限抖动）
+            # 不能永久毒化文档。
             ok, body, err = run_lark(["docs", "+fetch", "--as", "user", "--doc", token, "--format", "json"], timeout=90)
             if not ok:
                 self.error("feishu-doc-content", f"{token}: {err}")
@@ -1726,7 +1718,10 @@ class Collector:
             content_text = self.extract_doc_fetch_text(body)
             if not content_text:
                 content_text = compact_json(data_part(body), 8000)
-            mark_seen(self.conn, "feishu-doc-content", key)
+            content_text = content_text[: self.args.doc_content_chars]
+            key = f"feishu-doc-content|{token}|{stable_hash(content_text)}"
+            if not mark_seen(self.conn, "feishu-doc-content", key):
+                continue
             document = item["document"]
             title = doc_search_title(document)
             url = doc_search_url(document)
@@ -1735,7 +1730,7 @@ class Collector:
                     source="feishu-doc-content",
                     record_type="document_content",
                     timestamp=iso_now(),
-                    content=f"Feishu document content: {title}\nurl: {url}\n\n{content_text[: self.args.doc_content_chars]}",
+                    content=f"Feishu document content: {title}\nurl: {url}\n\n{content_text}",
                     metadata={"document": document, "fetch": body},
                     session_id=token,
                 )
