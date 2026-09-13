@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from config import configured_vault_dir, owner_display_name
+from config import configured_vault_dir
 from agent_bridge import acknowledge_context, redact_external_text
 from context_compiler import ContextCompiler, ContextCompilerError
 
@@ -225,6 +225,15 @@ def load_ready_context(payload: dict[str, Any]) -> tuple[str, str, str]:
     return content, context_md, context_json
 
 
+def clamp_timeout(value: Any, default: int) -> int:
+    """timeout 参数钳制在 [10, 600] 秒，脏值回退默认。"""
+    try:
+        timeout = int(value or default)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(10, min(600, timeout))
+
+
 def build_context(
     task: str,
     *,
@@ -380,11 +389,10 @@ def recall(query: str, *, source: str | None = None, since: str | None = None, t
 def health_payload() -> dict[str, Any]:
     state = read_json(VAULT_DIR / "orchestrator_state.json", {})
     quality = read_json(VAULT_DIR / "quality" / "latest.json", {})
+    # 只返回最小字段：owner 与 vault_dir 属于本机隐私，不在未鉴权端点泄露。
     return {
         "ok": True,
         "server": {"name": SERVER_NAME, "version": SERVER_VERSION},
-        "owner": owner_display_name(),
-        "vault_dir": str(VAULT_DIR),
         "total_records": state.get("total_records"),
         "last_collect": state.get("last_collect"),
         "quality": {
@@ -455,10 +463,27 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
         return False
 
     def read_payload(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return {}
         if length <= 0:
             return {}
-        raw = self.rfile.read(length)
+        # Content-Type 必须为 application/json：挡住 no-cors text/plain 绕 CORS 预检的跨站 POST。
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            return {}
+        # Content-Length 上限 1MB + socket 读超时：声明超大长度不再挂死线程。
+        if length > 1024 * 1024:
+            return {}
+        previous_timeout = self.connection.gettimeout()
+        self.connection.settimeout(30)
+        try:
+            raw = self.rfile.read(length)
+        except OSError:
+            return {}
+        finally:
+            self.connection.settimeout(previous_timeout)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -518,6 +543,9 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
                     "duration_ms": round((time.monotonic() - started) * 1000, 2),
                 }
             )
+            return
+        # /health 之外的读路由同样要求 loopback 请求。
+        if not self.require_loopback_request():
             return
         if parsed.path == "/agent-entry":
             result = ensure_agent_entry()
@@ -585,7 +613,9 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         started = time.monotonic()
         parsed = urlparse(self.path)
-        if parsed.path == "/context-ack" and not self.require_loopback_request():
+        # 所有写路由统一先验 loopback（Host/Origin/对端地址），再验 token：
+        # 默认无 token 时 authorized() 直接放行，loopback 是 DNS rebinding 的最后防线。
+        if not self.require_loopback_request():
             return
         if not self.require_auth():
             audit_event(
@@ -651,7 +681,7 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
                 task,
                 since=str(payload.get("since") or "2026-03-01"),
                 with_recall=bool(payload.get("with_recall")),
-                timeout=int(payload.get("timeout") or 240),
+                timeout=clamp_timeout(payload.get("timeout"), 240),
                 mode=str(payload.get("mode") or "auto"),
                 preview_id=str(payload.get("preview_id") or ""),
                 preview_hash=str(payload.get("preview_hash") or ""),
@@ -686,7 +716,7 @@ class AgentBridgeHTTPHandler(BaseHTTPRequestHandler):
                 query,
                 source=str(payload.get("source") or "") or None,
                 since=str(payload.get("since") or "") or None,
-                timeout=int(payload.get("timeout") or 120),
+                timeout=clamp_timeout(payload.get("timeout"), 120),
             )
             self.send_json(result, HTTPStatus.OK if result["ok"] else HTTPStatus.BAD_REQUEST)
             audit_event(
@@ -1076,7 +1106,7 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             task,
             since=str(arguments.get("since") or "2026-03-01"),
             with_recall=bool(arguments.get("with_recall")),
-            timeout=int(arguments.get("timeout") or 240),
+            timeout=clamp_timeout(arguments.get("timeout"), 240),
             mode=str(arguments.get("mode") or "auto"),
             preview_id=str(arguments.get("preview_id") or ""),
             preview_hash=str(arguments.get("preview_hash") or ""),
@@ -1111,7 +1141,7 @@ def call_mcp_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             query,
             source=str(arguments.get("source") or "") or None,
             since=str(arguments.get("since") or "") or None,
-            timeout=int(arguments.get("timeout") or 120),
+            timeout=clamp_timeout(arguments.get("timeout"), 120),
         )
         text = result.get("stdout") or result.get("stderr") or ""
         audit_event(
