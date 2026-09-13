@@ -26,6 +26,7 @@ from typing import Any
 from config import configured_vault_dir, load_config
 from index_writer import append_jsonl_records
 from maintenance_gate import writer_access
+import redact_common
 
 
 UTC = timezone.utc
@@ -318,6 +319,18 @@ def _append_records_locked(vault_dir: Path, records: list[dict[str, Any]]) -> No
     paths = web_paths(vault_dir)
     paths["daily_dir"].mkdir(parents=True, exist_ok=True)
     paths["index"].parent.mkdir(parents=True, exist_ok=True)
+    # 网页正文可能含页面里的 password/API key/连接串，写入前统一过凭证脱敏；
+    # 下划线字段（_dedup_key 等内部哈希）保留原值。
+    redacted_records: list[dict[str, Any]] = []
+    for record in records:
+        clean = redact_common.redact_tree(
+            {k: v for k, v in record.items() if not k.startswith("_")}
+        )
+        for key, value in record.items():
+            if key.startswith("_"):
+                clean[key] = value
+        redacted_records.append(clean)
+    records = redacted_records
     by_date: dict[str, list[dict[str, Any]]] = {}
     for record in records:
         date = str(record.get("timestamp") or now_iso())[:10]
@@ -492,7 +505,9 @@ def save_page(
     if final_url and final_url != url:
         sanitized_url, domain, query_redacted = sanitize_url(final_url, strip_query=strip_query)
     title = normalize_space(title)[:300] or domain or "网页正文"
-    body = body[:max_chars].strip()
+    # 正文与标题先脱敏再落盘（md 快照与索引记录同一口径）。
+    body = redact_common.redact(body[:max_chars].strip())
+    title = redact_common.redact(title)
     saved_at = now_iso()
     date = saved_at[:10]
     page_hash = safe_hash(sanitized_url, 12)
