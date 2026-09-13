@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+from file_utils import normalize_platform_path
 from event_store import (
     EventConflict,
     JsonlEventStore,
@@ -157,12 +158,7 @@ class JudgmentStore:
         *,
         clock: Optional[Callable[[], datetime]] = None,
     ) -> None:
-        absolute = os.path.abspath(str(vault_dir))
-        if sys.platform == "darwin" and (
-            absolute == "/var" or absolute.startswith("/var/")
-        ):
-            absolute = "/private" + absolute
-        vault = Path(absolute)
+        vault = normalize_platform_path(vault_dir)
         self.root = vault / "judgment"
         self.events = JsonlEventStore(self.root / "events.jsonl")
         self.current_path = self.root / "current.jsonl"

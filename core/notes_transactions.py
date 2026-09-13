@@ -13,6 +13,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from file_utils import normalize_platform_path
 from index_locks import source_lock
 from maintenance_gate import MaintenanceInProgress, writer_access
 
@@ -79,7 +80,10 @@ def utc_now() -> str:
 
 
 def _open_directory_fd(path: Path, *, create: bool) -> int:
-    absolute = Path(os.path.abspath(os.fspath(path)))
+    # 先解析操作系统级符号链接前缀（macOS 的 /var、/tmp、/etc），
+    # 否则逐组件 O_NOFOLLOW 打开会在这些组件上失败；
+    # vault 内部的符号链接组件仍由 O_NOFOLLOW 拒绝。
+    absolute = normalize_platform_path(path)
     if not absolute.is_absolute():
         raise OSError("directory_path_not_absolute")
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

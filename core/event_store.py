@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, TypeVar
 
+from file_utils import normalize_platform_path
 from model_types import ModelValidationError, validate_event
 
 try:
@@ -118,7 +119,10 @@ def _open_verified_directory_at(parent_fd: int, name: str) -> int:
 
 @contextmanager
 def _anchored_parent(path: Path, *, create: bool) -> Iterator[tuple]:
-    absolute = Path(os.path.abspath(str(path)))
+    # 先解析操作系统级符号链接前缀（macOS 的 /var、/tmp、/etc），
+    # 否则逐组件 O_NOFOLLOW 打开会在这些组件上失败；
+    # vault 内部的符号链接组件仍由 O_NOFOLLOW 拒绝。
+    absolute = normalize_platform_path(path)
     parts = absolute.parent.parts
     descriptor = os.open(parts[0], _directory_flags())
     try:

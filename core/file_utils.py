@@ -3,9 +3,26 @@
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+
+def normalize_platform_path(path) -> Path:
+    """Return an absolute path with OS-level symlink prefixes resolved.
+
+    macOS 的 /var、/tmp、/etc 是指向 /private 的符号链接（firmlink），
+    逐组件 O_NOFOLLOW 打开会在这些组件上失败。这里只规范化操作系统级
+    前缀，不跟随 vault 内部的符号链接，供 dir_fd 锚定入口统一使用。
+    """
+    absolute = os.path.abspath(os.fspath(path))
+    if sys.platform == "darwin":
+        for prefix in ("/var", "/tmp", "/etc"):
+            if absolute == prefix or absolute.startswith(prefix + "/"):
+                absolute = "/private" + absolute
+                break
+    return Path(absolute)
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
