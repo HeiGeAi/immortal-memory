@@ -52,6 +52,21 @@ def load_daily_records(date: str) -> list:
     return records
 
 
+def _content_text(value) -> str:
+    """归一化消息 content：兼容 Claude content blocks（list）与脏数据（None 等）。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for block in value:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts)
+    return str(value or "")
+
+
 def generate_summary(date: str, records: list) -> str:
     """根据记录生成结构化摘要。"""
     if not records:
@@ -115,7 +130,7 @@ def generate_summary(date: str, records: list) -> str:
             # 对话类：提取用户说了什么
             sessions = {}
             for r in source_records:
-                sid = r.get("session_id", "")[:8]
+                sid = str(r.get("session_id") or "")[:8]
                 if sid not in sessions:
                     sessions[sid] = []
                 sessions[sid].append(r)
@@ -127,7 +142,7 @@ def generate_summary(date: str, records: list) -> str:
                 user_msgs_in_session = [m for m in msgs if m.get("role") == "user"]
                 if user_msgs_in_session:
                     # 取第一条用户消息作为话题摘要
-                    first_user = redact_common.redact(user_msgs_in_session[0].get("content", "")[:150].replace("\n", " "))
+                    first_user = redact_common.redact(_content_text(user_msgs_in_session[0].get("content"))[:150].replace("\n", " "))
                     project = sanitize_local_path(msgs[0].get("project", ""))
                     lines.append(f"  - **会话 {sid}** ({project})")
                     lines.append(f"    {first_user}")
@@ -138,7 +153,7 @@ def generate_summary(date: str, records: list) -> str:
             # 使用过的工具
             all_tools = []
             for r in source_records:
-                all_tools.extend(r.get("tools_used", []))
+                all_tools.extend(r.get("tools_used") or [])
             if all_tools:
                 tool_counts = Counter(all_tools)
                 top_tools = tool_counts.most_common(8)
@@ -223,12 +238,21 @@ def generate_all_summaries(since: Optional[str] = None):
             if summary_file.stat().st_mtime > daily_file.stat().st_mtime:
                 continue
 
-        records = load_daily_records(date)
+        try:
+            records = load_daily_records(date)
+        except Exception as exc:
+            print(f"  {date}: 读取日文件失败（已跳过）: {exc}")
+            continue
         if not records:
             continue
 
-        summary = generate_summary(date, records)
-        atomic_write_text(summary_file, summary)
+        try:
+            summary = generate_summary(date, records)
+            atomic_write_text(summary_file, summary)
+        except Exception as exc:
+            # 单日脏数据不拖垮其他日期的摘要生成。
+            print(f"  {date}: 摘要生成失败（已跳过）: {exc}")
+            continue
         generated += 1
         print(f"  {date}: {len(records)}条记录 -> 摘要已生成")
 

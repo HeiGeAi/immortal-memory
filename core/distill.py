@@ -265,7 +265,7 @@ def scan_index() -> dict:
         ts = record.get("timestamp", "")
 
         if ts:
-            date = ts[:10]
+            date = str(ts)[:10]
             if not earliest_ts or date < earliest_ts:
                 earliest_ts = date
             if not latest_ts or date > latest_ts:
