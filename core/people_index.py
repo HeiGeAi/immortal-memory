@@ -207,12 +207,15 @@ _RUNTIME_CONFIG = load_config()
 _OWNER_RULE = _IDENTITY_BY_ID.get("user") or {}
 _configured_owner = str(_OWNER_RULE.get("canonical") or owner_display_name(_RUNTIME_CONFIG)).strip()
 if _configured_owner and _configured_owner != "the configured user":
+    _legacy_owner_canonical = USER_CANONICAL
     USER_CANONICAL = _configured_owner
     USER_ALIASES = set(_OWNER_RULE.get("aliases") or owner_aliases(_RUNTIME_CONFIG))
     CANONICAL_ALIASES[USER_CANONICAL] = list(dict.fromkeys([USER_CANONICAL, *sorted(USER_ALIASES)]))
     for _owner_alias in CANONICAL_ALIASES[USER_CANONICAL]:
         ALIASES[_owner_alias] = USER_CANONICAL
     CATEGORY_BY_NAME[USER_CANONICAL] = "self"
+else:
+    _legacy_owner_canonical = ""
 
 for _identity_id, _constant_name in (("bibi", "BIBI_CANONICAL"), ("taozi", "TAOZI_CANONICAL"), ("mama", "MAMA_CANONICAL")):
     _rule = _IDENTITY_BY_ID.get(_identity_id) or {}
@@ -227,6 +230,19 @@ for _rule in IDENTITY_RULES:
         ALIASES[_alias] = _canonical
     if _rule.get("category"):
         CATEGORY_BY_NAME[_canonical] = str(_rule["category"])
+
+if _legacy_owner_canonical and USER_CANONICAL != _legacy_owner_canonical:
+    # 私有配置覆盖公开默认（脱敏）身份时，把默认身份的别名收编进配置身份，
+    # 否则默认泛称会残留成第二个 category=self 人物，污染身份质量分。
+    # 必须放在 IDENTITY_RULES 循环之后：user 规则会在循环里重建 CANONICAL_ALIASES。
+    _legacy_aliases = [str(value) for value in CANONICAL_ALIASES.pop(_legacy_owner_canonical, [])]
+    CATEGORY_BY_NAME.pop(_legacy_owner_canonical, None)
+    CANONICAL_ALIASES[USER_CANONICAL] = list(dict.fromkeys(
+        [*CANONICAL_ALIASES.get(USER_CANONICAL, []), _legacy_owner_canonical, *_legacy_aliases]
+    ))
+    USER_ALIASES |= set(_legacy_aliases)
+    for _legacy_alias in [_legacy_owner_canonical, *_legacy_aliases]:
+        ALIASES[_legacy_alias] = USER_CANONICAL
 
 _people_section = _RUNTIME_CONFIG.get("people_index") if isinstance(_RUNTIME_CONFIG.get("people_index"), dict) else {}
 for _name, _category in (_people_section.get("categories") or {}).items():

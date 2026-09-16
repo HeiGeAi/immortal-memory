@@ -93,3 +93,41 @@ print(json.dumps({
         "category": "self",
         "quality_rule_ids": ["user"],
     }
+
+
+def test_owner_override_folds_legacy_default_identity(tmp_path):
+    """私有配置覆盖默认脱敏身份后，默认身份的泛称别名必须收编进配置身份，
+    不允许残留第二个 category=self 人物（quality self_person_count 回归）。"""
+    vault = tmp_path / ".immortal"
+    vault.mkdir()
+    (vault / "config.json").write_text(json.dumps({
+        "owner_display_name": "Owner Card",
+        "owner_aliases": ["Owner Alias"],
+        "people_index": {
+            "identities": [
+                {"id": "user", "canonical": "Owner Card", "aliases": ["Owner Alias"], "category": "self"},
+            ],
+        },
+    }), encoding="utf-8")
+    script = """
+import json
+import people_index
+legacy = [name for name, cat in people_index.CATEGORY_BY_NAME.items() if cat == 'self']
+print(json.dumps({
+    'self_count': len(legacy),
+    'legacy_alias_target': people_index.ALIASES.get('Owner'),
+    'generic_alias_target': people_index.canonical_name('Owner'),
+    'legacy_canonical_gone': '（' not in ''.join(legacy) or len(legacy) == 1,
+    'aliases_of_owner': people_index.CANONICAL_ALIASES.get('Owner Card'),
+}))
+"""
+    env = dict(os.environ)
+    env["HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "core")
+    result = subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, env=env)
+
+    payload = json.loads(result.stdout)
+    assert payload["self_count"] == 1
+    assert payload["legacy_alias_target"] == "Owner Card"
+    assert payload["generic_alias_target"] == "Owner Card"
+    assert "Owner" in payload["aliases_of_owner"]
