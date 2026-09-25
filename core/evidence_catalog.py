@@ -458,10 +458,11 @@ class EvidenceCatalog:
                 "database_untrusted",
                 "SQLite source digest metadata is invalid",
             )
+        # source_dev is recorded but not compared: APFS may renumber st_dev
+        # for the Data volume across reboots while the file is unchanged.
         expected = {
             "last_size": source_stat.st_size,
             "source_size": source_stat.st_size,
-            "source_dev": source_stat.st_dev,
             "source_ino": source_stat.st_ino,
             "source_mtime_ns": source_stat.st_mtime_ns,
             "source_ctime_ns": source_stat.st_ctime_ns,

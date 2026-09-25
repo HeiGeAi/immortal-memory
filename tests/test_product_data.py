@@ -956,6 +956,32 @@ def test_matching_receipt_skips_deep_scan_across_integrity_instances(
         pass
 
 
+def test_dev_only_change_across_reboot_keeps_index_and_receipt_trusted(
+    tmp_path, monkeypatch
+):
+    # APFS may renumber st_dev for the Data volume across reboots while
+    # inode, size, mtime_ns and ctime_ns of unchanged files stay identical.
+    data, _control, _center = seeded_product_data(tmp_path)
+    assert data.memories({"limit": ["2"]})["items"]
+    original = ProductIndexIntegrity._signature
+
+    def rebooted(value):
+        dev, *rest = original(value)
+        return (dev + 2, *rest)
+
+    monkeypatch.setattr(ProductIndexIntegrity, "_signature", staticmethod(rebooted))
+    integrity = ProductIndexIntegrity(data.vault_dir)
+    monkeypatch.setattr(
+        integrity,
+        "_deep_validate_index",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("dev-only change must not invalidate the receipt")
+        ),
+    )
+    with integrity.trusted_connection():
+        pass
+
+
 def test_receipt_does_not_hide_later_fts_content_change(tmp_path):
     data, _control, _center = seeded_product_data(tmp_path)
     assert data.memories({"limit": ["2"]})["items"]

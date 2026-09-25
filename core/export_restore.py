@@ -1620,8 +1620,8 @@ def v11_production_switch_gate(
         blockers.append("published_source_unsafe")
     else:
         source_stat = os.lstat(vault / "index.jsonl")
+        # Receipt signatures omit st_dev (ProductIndexIntegrity._revision_signature).
         source_signature = [
-            source_stat.st_dev,
             source_stat.st_ino,
             source_stat.st_size,
             source_stat.st_mtime_ns,
@@ -1644,7 +1644,6 @@ def v11_production_switch_gate(
         else:
             metadata = os.lstat(database_path)
             database_signature = [
-                metadata.st_dev,
                 metadata.st_ino,
                 metadata.st_size,
                 metadata.st_mtime_ns,

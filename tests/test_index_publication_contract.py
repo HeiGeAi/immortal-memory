@@ -88,6 +88,28 @@ def test_ready_rejects_same_size_rewrite_with_restored_mtime(
     assert index_db.is_ready() is False
 
 
+def test_ready_survives_dev_only_source_change_across_reboot(
+    tmp_path,
+    monkeypatch,
+):
+    # APFS may renumber st_dev for the Data volume across reboots while
+    # inode, size, mtime_ns and ctime_ns of an unchanged file stay identical.
+    source = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(source, [record("a", "alpha")])
+    index_integrity.reconcile_index(source, database)
+    monkeypatch.setattr(index_db, "INDEX_FILE", source)
+    monkeypatch.setattr(index_db, "DB_FILE", database)
+    with sqlite3.connect(str(database)) as con:
+        con.execute(
+            "UPDATE meta SET value=? WHERE key='source_dev'",
+            (str(source.stat().st_dev + 2),),
+        )
+        con.commit()
+
+    assert index_db.is_ready() is True
+
+
 def test_current_reconcile_uses_one_source_scan_and_one_database_snapshot(
     tmp_path,
     monkeypatch,

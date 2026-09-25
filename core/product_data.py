@@ -349,6 +349,15 @@ class ProductIndexIntegrity:
             value.st_ctime_ns,
         )
 
+    @staticmethod
+    def _revision_signature(value: Sequence[int]) -> Tuple[int, int, int, int]:
+        """Drop st_dev from a _signature tuple for identities persisted across boots.
+
+        APFS may renumber st_dev for the Data volume after a reboot while the
+        inode, size and timestamps of an unchanged file stay identical.
+        """
+        return tuple(value[1:])  # type: ignore[return-value]
+
     def _connect(self) -> sqlite3.Connection:
         uri = self.database_path.resolve().as_uri() + "?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True, timeout=3)
@@ -381,9 +390,11 @@ class ProductIndexIntegrity:
         return {
             "validation_version": INDEX_VERIFICATION_VERSION,
             "schema_version": INDEX_SCHEMA_VERSION,
-            "source_signature": list(self._signature(source_stat)),
+            "source_signature": list(
+                self._revision_signature(self._signature(source_stat))
+            ),
             "database_signature": [
-                list(value) if value is not None else None
+                list(self._revision_signature(value)) if value is not None else None
                 for value in database_signature
             ],
             "metadata_generation": hashlib.sha256(metadata).hexdigest(),
@@ -471,14 +482,14 @@ class ProductIndexIntegrity:
             or not locator_schema_is_current(connection)
         ):
             raise ValueError("index metadata is not trusted")
+        # source_dev is recorded but not compared (see _revision_signature).
         expected = (
-            int(rows["source_dev"]),
             int(rows["source_ino"]),
             int(rows["last_size"]),
             int(rows["source_mtime_ns"]),
             int(rows["source_ctime_ns"]),
         )
-        if self._signature(source_stat) != expected:
+        if self._revision_signature(self._signature(source_stat)) != expected:
             raise ValueError("source generation differs from SQLite metadata")
         if int(rows["indexed_id_count"]) < 0:
             raise ValueError("indexed ID count is invalid")
