@@ -348,3 +348,22 @@ def test_large_export_generation_hashes_without_retaining_file_body(tmp_path):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_default_exports_dir_may_be_a_symlink_to_another_disk(tmp_path):
+    """2026-09-22 起本机 ~/.immortal/exports 是指向外置盘的软链。
+    逐级 O_NOFOLLOW 读导出目录时撞上这个软链报 NotADirectoryError，
+    每日便携备份从那天起全部失败。用户自己建的导出根软链应当被接受。"""
+    vault = tmp_path / "source"
+    vault.mkdir()
+    (vault / "index.jsonl").write_bytes(b"")
+    _ = export_restore.run_v11_migration(vault)
+    elsewhere = tmp_path / "external" / "exports"
+    elsewhere.mkdir(parents=True)
+    (vault / export_restore.EXPORTS_DIRNAME).symlink_to(elsewhere)
+
+    manifest = export_restore.create_export(vault)
+
+    export_dir = Path(manifest["export_dir"])
+    assert export_dir.parent == elsewhere.resolve()
+    assert export_restore.restore_check(manifest["export_dir"], strict=True)["ok"] is True

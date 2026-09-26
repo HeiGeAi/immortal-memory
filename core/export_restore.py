@@ -313,6 +313,10 @@ def create_export(
     """Create a portable export directory and return its manifest payload."""
     vault = vault_path(vault_dir)
     base_output = Path(output_dir).expanduser() if output_dir else vault / EXPORTS_DIRNAME
+    # 导出根是用户选定的落点，常见做法是把 vault/exports 软链到外置盘。
+    # 后面读导出内容一律逐级 O_NOFOLLOW，撞上这个软链会 NotADirectoryError，
+    # 所以只在这里把根解析一次；根以下的每一级仍然不跟随软链。
+    base_output = base_output.resolve()
     export_dir = new_export_dir(base_output)
     warnings: list[str] = []
 
