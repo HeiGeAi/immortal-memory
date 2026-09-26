@@ -59,7 +59,9 @@ class CollectionLimitTest(unittest.TestCase):
             }
         }
 
-        with mock.patch.object(feishu_collect, "run_lark", return_value=(True, payload, "")):
+        with mock.patch.object(feishu_collect, "log_event"), mock.patch.object(
+            feishu_collect, "run_lark", return_value=(True, payload, "")
+        ):
             collector.collect_messages()
 
         self.assertTrue(collector.errors)
