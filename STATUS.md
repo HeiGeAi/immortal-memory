@@ -1,5 +1,15 @@
 # Immortal Memory 当前状态
 
+## 2026-09-26 定位变更：本仓库降级为采集后端
+
+产品主体改为 v2（`~/immortal-memory`）。本仓库（v1）继续负责：多来源采集、`~/.immortal/index.jsonl`、SQLite FTS、每日调度和备份，并作为 v2 的 L0 底料。
+
+冻结，不再开发新功能（代码保留）：Living Self、claims、judgment、outcome、product UI / 七模块控制台、`agent-context`。原因：上线至今 claims 确认数 0、judgment 0、outcome 0，`agent-context` 返回空分区；判断层由 v2 的卡片闸门和人手写的决策文件承担。
+
+仍然维护：采集器、索引完整性、备份与恢复、安全修复。决策记录见 `~/.claude/DECISIONS.md` 2026-09-26 条目。
+
+---
+
 更新时间：2026-09-11，Asia/Shanghai
 当前仓库待发布版本：1.4.0a1
 本机生产安装：1.4.0a1（安装副本与仓库核心同源，本轮完成「单一真相源」收拢）
