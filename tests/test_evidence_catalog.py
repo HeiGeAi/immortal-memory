@@ -675,6 +675,43 @@ def test_database_meta_must_match_current_jsonl_revision(tmp_path):
     )
 
 
+def test_dev_only_source_change_across_reboot_keeps_database_trusted(tmp_path):
+    # APFS may renumber st_dev for the Data volume across reboots while
+    # inode, size, mtime_ns and ctime_ns of an unchanged file stay identical.
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "事实")])
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute(
+            "UPDATE meta SET value=? WHERE key='source_dev'",
+            (str(index.stat().st_dev + 2),),
+        )
+        connection.commit()
+
+    catalog = EvidenceCatalog(index, database_path=database)
+    assert catalog.preflight()["mode"] == "verified_sqlite"
+    assert catalog.resolve("raw-1")["status"] == "available"
+
+
+def test_source_inode_change_still_marks_database_stale(tmp_path):
+    index = tmp_path / "index.jsonl"
+    database = tmp_path / "search_index.db"
+    write_records(index, [record("raw-1", "事实")])
+    reconcile_index(index, database)
+    with sqlite3.connect(str(database)) as connection:
+        connection.execute(
+            "UPDATE meta SET value=? WHERE key='source_ino'",
+            (str(index.stat().st_ino + 1),),
+        )
+        connection.commit()
+
+    assert_error(
+        "database_stale",
+        lambda: EvidenceCatalog(index, database_path=database),
+    )
+
+
 def test_source_change_after_database_build_fails_closed(tmp_path):
     index = tmp_path / "index.jsonl"
     database = tmp_path / "search_index.db"

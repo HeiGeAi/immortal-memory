@@ -24,6 +24,7 @@ from config import feishu_daily_sources, feishu_guard_args
 from process_utils import run_process
 from runtime_telemetry import RuntimeTelemetry
 from state_store import read_state as read_shared_state, update_state_atomic
+from redact_common import redact
 
 IMMORTAL_DIR = Path.home() / ".immortal"
 LOG_FILE = IMMORTAL_DIR / "backup.log"
@@ -41,7 +42,10 @@ _STAGE_ERROR_COUNT = 0
 
 REQUIRED_FAILURES = {
     "collect failed",
+    "collect stale: no new records for over 48 hours",
     "external source collect failed",
+    "feishu collect failed",
+    "feishu auth failed",
     "search index sync failed",
     "claims migration failed",
     "context compile failed",
@@ -49,6 +53,16 @@ REQUIRED_FAILURES = {
     "portable export failed",
     "portable restore-check failed",
 }
+
+# All proposed freeze candidates currently have readers in core (including
+# Obsidian, Agent Entry, feedback, profile and restore paths). Keep the default
+# empty until those consumers are retired. Operators may opt in explicitly.
+DEFAULT_FROZEN_STAGES = frozenset()
+_FROZEN_LOGGED: set[str] = set()
+FREEZABLE_STAGES = frozenset({
+    "summary", "distill", "cards_build", "people", "relationships", "quality",
+    "feishu_clean", "feishu_distill", "feishu_auto_review", "feishu_attribution",
+})
 REQUIRED_FAILURE_PREFIXES = (
     "required core script missing",
     "index integrity failed",
@@ -107,7 +121,9 @@ FEISHU_MIRROR_DOWNLOAD_ACTIONS = "fetch_doc,export_markdown,export_docx,export_x
 FEISHU_MIRROR_DOWNLOAD_MAX_JOBS = 40
 FEISHU_DAILY_BASE_ARGS = [
     "--days", "3",
-    "--max-messages", "1000",
+    # 正常一天几百条。上限只防失控，不该在积压时截断：
+    # 2026-09-26 停摆十天后补采，1000 条上限截掉了 2525 条群消息。
+    "--max-messages", "20000",
     "--max-members", "1000",
     "--chat-page-limit", "20",
     "--message-page-limit", "8",
@@ -170,9 +186,42 @@ def raise_if_control_job_canceled() -> None:
 def log(msg: str):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{now}] {msg}"
-    print(line)
+    if sys.stdout.isatty():
+        print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def frozen_stages() -> frozenset[str]:
+    """Read the local opt-in freeze list, ignoring protected pipeline stages."""
+    try:
+        config = json.loads((IMMORTAL_DIR / "config.json").read_text(encoding="utf-8"))
+        requested = config.get("pipeline", {}).get("frozen_stages", [])
+        if not isinstance(requested, list):
+            return DEFAULT_FROZEN_STAGES
+        frozen = {item for item in requested if isinstance(item, str) and item in FREEZABLE_STAGES}
+        if "feishu_clean" in frozen:
+            frozen.update({"feishu_distill", "feishu_auto_review", "feishu_attribution"})
+        if "feishu_distill" in frozen:
+            frozen.update({"feishu_auto_review", "feishu_attribution"})
+        if "feishu_auto_review" in frozen:
+            frozen.add("feishu_attribution")
+        if "people" in frozen:
+            frozen.update({"relationships", "quality"})
+        if "relationships" in frozen:
+            frozen.add("quality")
+        return frozenset(frozen)
+    except (OSError, ValueError, AttributeError):
+        return DEFAULT_FROZEN_STAGES
+
+
+def stage_enabled(name: str, frozen: frozenset[str]) -> bool:
+    if name in frozen:
+        if name not in _FROZEN_LOGGED:
+            log(f"{name}: skipped (frozen)")
+            _FROZEN_LOGGED.add(name)
+        return False
+    return True
 
 
 def telemetry_stage(stage_id: str, label: str, errors: list) -> None:
@@ -245,6 +294,9 @@ def run_script(name: str, *args, timeout: int = 600, want_stdout: bool = False) 
     try:
         result = run_process(cmd, capture_output=True, text=True, timeout=timeout, env=child_env())
         out = result.stdout if want_stdout else (result.stdout + result.stderr)
+        if want_stdout and result.returncode != 0 and result.stderr:
+            tail = "\n".join(result.stderr.splitlines()[-20:])
+            log(f"{name} stderr (last 20 lines):\n{redact(tail)}")
         return (result.returncode == 0, out)
     except subprocess.TimeoutExpired:
         return (False, f"Timeout after {timeout}s")
@@ -399,6 +451,23 @@ def collect():
         return False, {"total_new": 0, "by_source": {}}
 
 
+def record_collect_outcome(state: dict, ok: bool, info: dict, now_iso: str, errors: list[str]) -> None:
+    """A zero count is normal until the last nonempty collection becomes stale."""
+    if not ok:
+        errors.append("collect failed")
+        return
+    last_nonempty = state.get("last_nonempty_collect") or state.get("last_collect") or now_iso
+    state["last_nonempty_collect"] = last_nonempty
+    if info.get("total_new", 0) > 0:
+        state["last_nonempty_collect"] = now_iso
+        state["last_collect"] = now_iso
+    elif hours_since(last_nonempty) > 48:
+        errors.append("collect stale: no new records for over 48 hours")
+        log("采集异常: 连续无新增且距上次有新增采集超过 48 小时")
+    else:
+        state["last_collect"] = now_iso
+
+
 def web_collect():
     log("=== 阶段 1W: 网页访问元信息扫描 ===")
     ok, out = run_script("web_capture.py", "collect", "--json", timeout=300)
@@ -449,10 +518,11 @@ def collect_feishu():
         status = "partial" if rc == 2 else "ok"
         log(f"飞书采集{'部分成功' if status == 'partial' else '完成'}: 新增 {new_records} 条")
         if "Issues:" in out:
-            log(f"飞书采集源级错误: {out.split('Issues:', 1)[1].strip()[:300]}")
+            log(f"飞书采集源级错误: {redact(out.split('Issues:', 1)[1].strip()[:300])}")
         return status, {"total_new": new_records}
-    log(f"飞书采集失败: {out.strip()[:500]}")
-    return "failed", {"total_new": 0}
+    log(f"飞书采集失败: {redact(out.strip()[:500])}")
+    status = "auth_failed" if "AUTH_FAILURE" in out else "failed"
+    return status, {"total_new": 0}
 
 
 def feishu_clean():
@@ -793,7 +863,7 @@ def product_brief():
 def portable_export():
     log("=== 阶段 5G: 生成便携恢复备份 ===")
     # want_stdout=True：stderr 的任何警告混进输出都会毁掉 JSON 解析（Obsidian 九天假失败同族坑）
-    ok, out = run_script("export_restore.py", "create-export", timeout=2400, want_stdout=True)
+    ok, out = run_script("export_restore.py", "create-export", "--redact-secrets", timeout=2400, want_stdout=True)
     if ok:
         try:
             data = json.loads(out)
@@ -808,7 +878,7 @@ def portable_export():
             f"{int(totals.get('bytes') or 0)} bytes"
         )
         return True, data
-    log(f"便携备份失败: {out.strip()[:500]}")
+    log(f"便携备份失败: {redact(out.strip()[:500]) or '详见上方 stderr'}")
     return False, {}
 
 
@@ -830,7 +900,7 @@ def restore_check_export(export_dir: str):
             f"{int(data.get('expected_files') or 0)} files"
         )
         return True, data
-    log(f"备份校验失败: {out.strip()[:700]}")
+    log(f"备份校验失败: {redact(out.strip()[:700]) or '详见上方 stderr'}")
     return False, {"export_dir": export_dir}
 
 
@@ -1099,11 +1169,15 @@ def run_main():
         }
 
     state = load_state()
+    frozen = frozen_stages()
+    _FROZEN_LOGGED.clear()
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
     errors = []
 
     log(f"========= 编排器启动 (UTC {now.strftime('%Y-%m-%d %H:%M')}) =========")
+    for stage_name in sorted(frozen):
+        stage_enabled(stage_name, frozen)
     log(f"上次采集: {state.get('last_collect') or '从未'}")
     log(f"上次飞书采集: {state.get('last_feishu_collect') or '从未'}")
     log(f"上次网页收录: {state.get('last_web_collect') or '从未'}")
@@ -1112,10 +1186,7 @@ def run_main():
     # 阶段 1: 采集
     telemetry_stage("collect", "本地增量采集", errors)
     collect_ok, collect_info = collect()
-    if collect_ok:
-        state["last_collect"] = now_iso
-    else:
-        errors.append("collect failed")
+    record_collect_outcome(state, collect_ok, collect_info, now_iso, errors)
 
     telemetry_stage("external", "外部来源同步", errors)
     external_ok, external_info = external_source_collect()
@@ -1140,7 +1211,7 @@ def run_main():
         log(f"距上次网页收录 {web_due_hours:.1f} 小时 < {WEB_CAPTURE_INTERVAL_HOURS} 小时，跳过")
 
     # 阶段 2-3: 摘要 + 时间线（只有采集成功才做）
-    if collect_ok:
+    if collect_ok and stage_enabled("summary", frozen):
         if summarize():
             state["last_summary"] = now_iso
         else:
@@ -1153,23 +1224,36 @@ def run_main():
     if feishu_due_hours >= FEISHU_INTERVAL_HOURS:
         log(f"距上次飞书采集 {feishu_due_hours:.1f} 小时，触发飞书增量")
         feishu_status, feishu_info = collect_feishu()
+        # partial 照样算跑过：总有几篇文档没权限，每轮都会 partial。
+        # 把它当失败会让采集时间永远不更新、每轮都重跑飞书，清洗阶段则永远不跑。
+        # 截断造成的漏采由 feishu_collect 自己不推进时间窗口来兜住。
         feishu_ok = feishu_status in ("ok", "partial")
         feishu_new = feishu_info.get("total_new", 0)
         state["last_feishu_status"] = feishu_status
         if feishu_status == "partial":
             errors.append("feishu partial: 部分源采集失败，详见 feishu/state.json last_errors")
+        elif feishu_status == "auth_failed":
+            errors.append("feishu auth failed")
         if feishu_ok:
             state["last_feishu_collect"] = now_iso
-            if feishu_clean():
+            if not stage_enabled("feishu_clean", frozen):
+                pass
+            elif feishu_clean():
                 state["last_feishu_clean"] = now_iso
             else:
                 errors.append("feishu clean failed")
-            if feishu_distill():
+            if not stage_enabled("feishu_distill", frozen):
+                pass
+            elif feishu_distill():
                 state["last_feishu_distill"] = now_iso
-                if profile_auto_review():
+                if not stage_enabled("feishu_auto_review", frozen):
+                    pass
+                elif profile_auto_review():
                     state["last_profile_auto_review"] = now_iso
                     state["last_profile_merge"] = now_iso
-                    if profile_attribution_audit():
+                    if not stage_enabled("feishu_attribution", frozen):
+                        pass
+                    elif profile_attribution_audit():
                         state["last_profile_attribution_audit"] = now_iso
                     else:
                         errors.append("profile attribution audit failed")
@@ -1177,13 +1261,13 @@ def run_main():
                     errors.append("profile auto review failed")
             else:
                 errors.append("feishu distill failed")
-        else:
+        elif feishu_status == "failed":
             errors.append("feishu collect failed")
     else:
         log(f"距上次飞书采集 {feishu_due_hours:.1f} 小时 < {FEISHU_INTERVAL_HOURS} 小时，跳过")
 
     attribution_audit_due_hours = hours_since(state.get("last_profile_attribution_audit"))
-    if attribution_audit_due_hours >= PROFILE_ATTRIBUTION_AUDIT_INTERVAL_HOURS:
+    if stage_enabled("feishu_attribution", frozen) and attribution_audit_due_hours >= PROFILE_ATTRIBUTION_AUDIT_INTERVAL_HOURS:
         log(f"距上次画像归因审计 {attribution_audit_due_hours:.1f} 小时，触发污染剥离")
         if profile_attribution_audit():
             state["last_profile_attribution_audit"] = now_iso
@@ -1224,12 +1308,14 @@ def run_main():
     telemetry_stage("distill", "记忆清洗与蒸馏", errors)
     # 阶段 5: 数字人格蒸馏默认关闭。飞书先进入 review layer，避免噪声直接污染 digital-soul.md。
     days_since_distill = days_since(state.get("last_distill"))
-    if AUTO_DIGITAL_SOUL_DISTILL and days_since_distill >= DISTILL_INTERVAL_DAYS:
+    if stage_enabled("distill", frozen) and AUTO_DIGITAL_SOUL_DISTILL and days_since_distill >= DISTILL_INTERVAL_DAYS:
         log(f"距上次蒸馏 {days_since_distill:.1f} 天，触发数字人格蒸馏")
         if distill():
             state["last_distill"] = now_iso
         else:
             errors.append("distill failed")
+    elif "distill" in frozen:
+        pass
     elif AUTO_DIGITAL_SOUL_DISTILL:
         log(f"距上次蒸馏 {days_since_distill:.1f} 天 < {DISTILL_INTERVAL_DAYS} 天，跳过")
     else:
@@ -1255,30 +1341,30 @@ def run_main():
         # separate Preflight Task B and is intentionally not claimed here.
         errors.append("search index sync failed")
 
-    people_index_ok = people_index()
+    people_index_ok = people_index() if stage_enabled("people", frozen) else False
     if people_index_ok:
         state["last_people_index"] = now_iso
-    else:
+    elif "people" not in frozen:
         errors.append("people index failed")
 
     relationship_index_ok = False
-    if people_index_ok:
+    if stage_enabled("relationships", frozen) and people_index_ok:
         relationship_index_ok = relationship_index()
         if relationship_index_ok:
             state["last_relationship_index"] = now_iso
         else:
             errors.append("relationship index failed")
-    else:
+    elif "relationships" not in frozen and "people" not in frozen:
         log("人物索引未成功，跳过关联证据网络")
 
     quality_ok = False
-    if relationship_index_ok:
+    if stage_enabled("quality", frozen) and relationship_index_ok:
         quality_ok = quality_report()
         if quality_ok:
             state["last_quality"] = now_iso
         else:
             errors.append("quality report failed")
-    else:
+    elif "quality" not in frozen and "relationships" not in frozen and "people" not in frozen:
         log("关联证据网络未成功，跳过记忆质量报告")
 
     telemetry_stage("backup", "备份与恢复校验", errors)
@@ -1309,7 +1395,9 @@ def run_main():
     # product brief（goal.md）已停用（2026-06-14 Owner 决策：meta 自述，无消费者）
 
     # 阶段 5H: 构建判断力卡片盒（纠正即记忆），供 agent-context 消费
-    if cards_build():
+    if not stage_enabled("cards_build", frozen):
+        pass
+    elif cards_build():
         state["last_cards_build"] = now_iso
     else:
         errors.append("cards build failed")
@@ -1398,14 +1486,14 @@ def run_main():
             "web_new_records": web_new,
             "feishu_new_records": feishu_new,
             "total_records": state["total_records"],
-            "outputs_updated": [
+            "outputs_updated": [name for name in [
                 "index",
                 "profile",
                 "people",
                 "relationships",
                 "quality",
                 "agent_entry",
-            ],
+            ] if name not in frozen],
         },
     }
 

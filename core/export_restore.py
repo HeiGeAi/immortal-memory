@@ -225,11 +225,11 @@ def copy_file(source: Path, destination: Path) -> None:
 
 def new_export_dir(base_output: Path) -> Path:
     base = base_output / f"{EXPORT_PREFIX}{now_stamp()}"
-    if not base.exists():
+    if not base.exists() and not Path(f"{base}.partial").exists():
         return base
     for index in range(1, 1000):
         candidate = Path(f"{base}-{index:03d}")
-        if not candidate.exists():
+        if not candidate.exists() and not Path(f"{candidate}.partial").exists():
             return candidate
     raise FileExistsError(f"unable to allocate unique export directory under {base_output}")
 
@@ -310,10 +310,39 @@ def create_export(
     fail_on_secrets: bool = False,
     redact_secrets: bool = False,
 ) -> dict[str, Any]:
-    """Create a portable export directory and return its manifest payload."""
+    """Publish a complete export atomically; only this run's partial is cleaned."""
     vault = vault_path(vault_dir)
     base_output = Path(output_dir).expanduser() if output_dir else vault / EXPORTS_DIRNAME
-    export_dir = new_export_dir(base_output)
+    # 导出根是用户选定的落点，常见做法是把 vault/exports 软链到外置盘。
+    # 后面读导出内容一律逐级 O_NOFOLLOW，撞上这个软链会 NotADirectoryError，
+    # 所以只在这里把根解析一次；根以下的每一级仍然不跟随软链。
+    base_output = base_output.resolve()
+    final_dir = new_export_dir(base_output)
+    partial_dir = Path(f"{final_dir}.partial")
+    partial_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        manifest = _create_export_contents(
+            vault, base_output, partial_dir, final_dir,
+            include_raw, fail_on_secrets, redact_secrets,
+        )
+        if final_dir.exists():
+            raise FileExistsError(f"export destination already exists: {final_dir}")
+        partial_dir.rename(final_dir)
+        return manifest
+    except Exception:
+        shutil.rmtree(partial_dir)
+        raise
+
+
+def _create_export_contents(
+    vault: Path,
+    base_output: Path,
+    export_dir: Path,
+    final_dir: Path,
+    include_raw: bool,
+    fail_on_secrets: bool,
+    redact_secrets: bool,
+) -> dict[str, Any]:
     warnings: list[str] = []
 
     location = classify_storage_location(base_output, vault)
@@ -330,39 +359,33 @@ def create_export(
         warnings.append(f"vault_missing: {vault}")
 
     files = collect_source_files(vault, include_raw, warnings) if vault.exists() else []
-    export_dir.mkdir(parents=True, exist_ok=False)
-
     items: list[dict[str, Any]] = []
     total_bytes = 0
     secret_redaction: dict[str, Any] = {}
-    try:
-        for source in files:
-            relative = relpath(source, vault)
-            target = export_dir / relative
-            if relative == "index.jsonl" and redact_secrets:
-                import secret_scan
+    for source in files:
+        relative = relpath(source, vault)
+        target = export_dir / relative
+        if relative == "index.jsonl" and redact_secrets:
+            import secret_scan
 
-                secret_redaction = secret_scan.redact_jsonl_copy(source, target)
-            else:
-                copy_file(source, target)
-            item = file_item(target, export_dir)
-            items.append(item)
-            total_bytes += item["size"]
-        if redact_secrets and secret_redaction:
-            receipt_path = export_dir / SECRET_REDACTION_RECEIPT
-            write_json_atomic(
-                receipt_path,
-                {
-                    "generated_at": iso_utc(),
-                    **secret_redaction,
-                },
-            )
-            receipt_item = file_item(receipt_path, export_dir)
-            items.append(receipt_item)
-            total_bytes += receipt_item["size"]
-    except Exception:
-        shutil.rmtree(export_dir, ignore_errors=True)
-        raise
+            secret_redaction = secret_scan.redact_jsonl_copy(source, target)
+        else:
+            copy_file(source, target)
+        item = file_item(target, export_dir)
+        items.append(item)
+        total_bytes += item["size"]
+    if redact_secrets and secret_redaction:
+        receipt_path = export_dir / SECRET_REDACTION_RECEIPT
+        write_json_atomic(
+            receipt_path,
+            {
+                "generated_at": iso_utc(),
+                **secret_redaction,
+            },
+        )
+        receipt_item = file_item(receipt_path, export_dir)
+        items.append(receipt_item)
+        total_bytes += receipt_item["size"]
 
     # 出口敏感形态扫描（hash-only，绝不写入原文）。index 清洗完成前默认只告警不阻断，
     # 避免自动导出断流；清洗后调用方应传 fail_on_secrets=True 转为硬门禁。
@@ -385,14 +408,12 @@ def create_export(
                 "secret_scan_incomplete: index.jsonl 含无效 JSON、无效 UTF-8 或超大行"
             )
             if fail_on_secrets:
-                shutil.rmtree(export_dir, ignore_errors=True)
                 raise SecretShapesFound("export aborted: index.jsonl secret scan is incomplete")
         if report["unique_candidates"] > 0:
             warnings.append(
                 f"secret_shapes_present: index.jsonl 含 {report['unique_candidates']} 个未脱敏凭证形态候选"
             )
             if fail_on_secrets:
-                shutil.rmtree(export_dir, ignore_errors=True)
                 raise SecretShapesFound(
                     f"export aborted: {report['unique_candidates']} unique secret-shape candidates in index.jsonl"
                 )
@@ -406,7 +427,7 @@ def create_export(
     manifest = {
         "generated_at": iso_utc(),
         "vault_dir": str(vault),
-        "export_dir": str(export_dir),
+        "export_dir": str(final_dir),
         "storage_location": location,
         "secret_scan": secret_summary,
         "secret_redaction": {
@@ -441,7 +462,8 @@ def find_latest_export(vault_dir: str | Path | None = None) -> dict[str, Any]:
         candidates = [
             path
             for path in exports_dir.iterdir()
-            if path.is_dir() and path.name.startswith(EXPORT_PREFIX) and (path / MANIFEST_NAME).exists()
+            if path.is_dir() and path.name.startswith(EXPORT_PREFIX)
+            and not path.name.endswith(".partial") and (path / MANIFEST_NAME).exists()
         ]
     candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     latest = candidates[0] if candidates else None
@@ -1620,8 +1642,8 @@ def v11_production_switch_gate(
         blockers.append("published_source_unsafe")
     else:
         source_stat = os.lstat(vault / "index.jsonl")
+        # Receipt signatures omit st_dev (ProductIndexIntegrity._revision_signature).
         source_signature = [
-            source_stat.st_dev,
             source_stat.st_ino,
             source_stat.st_size,
             source_stat.st_mtime_ns,
@@ -1644,7 +1666,6 @@ def v11_production_switch_gate(
         else:
             metadata = os.lstat(database_path)
             database_signature = [
-                metadata.st_dev,
                 metadata.st_ino,
                 metadata.st_size,
                 metadata.st_mtime_ns,

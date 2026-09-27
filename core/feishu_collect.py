@@ -509,6 +509,16 @@ def is_expected_access_boundary(source: str, message: str) -> bool:
     return any(marker in lowered for marker in EXPECTED_ACCESS_BOUNDARY_MARKERS)
 
 
+def is_auth_failure(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in (
+        "99991663", "99991668", "99991661", "invalid access token",
+        "access token expired", "token has expired", "authorization expired",
+        "authentication failed", "not logged in", "login required",
+        "unauthorized", "auth status", "wrong feishu account",
+    ))
+
+
 class Collector:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -523,6 +533,11 @@ class Collector:
         self.self_user: dict[str, Any] | None = None
 
     def error(self, source: str, message: str) -> None:
+        if is_auth_failure(message):
+            self.incomplete_window = True
+            self.errors.append({"source": source, "message": message[:1000], "kind": "auth"})
+            log_event("error", "collector_error", source=source, message=message[:1000])
+            return
         if is_expected_access_boundary(source, message):
             item = {"source": source, "reason": "access_boundary", "message": message[:1000]}
             self.skips.append(item)
@@ -530,6 +545,16 @@ class Collector:
             return
         self.errors.append({"source": source, "message": message[:1000]})
         log_event("error", "collector_error", source=source, message=message[:1000])
+
+    # 按时间窗口采的来源：截断了就不能推进游标，否则没扫到的那段永久跳过。
+    # 群列表、群成员是快照，和窗口无关，截断只记错误，不拦游标 ——
+    # 拦了的话，成员上限这类常规截断会让游标永远停住。
+    WINDOWED_SOURCES = frozenset({"feishu-im", "feishu-im-search"})
+
+    def truncated(self, source: str, limit: str) -> None:
+        if source in self.WINDOWED_SOURCES:
+            self.incomplete_window = True
+        self.error(source, f"{limit} reached; remaining items/pages were not scanned")
 
     def add_records(self, records: list[dict[str, Any]]) -> None:
         write_records(records)
@@ -539,29 +564,29 @@ class Collector:
     def start_run(self) -> None:
         ok, body, err = current_auth_status()
         if not ok:
-            raise RuntimeError(f"cannot verify lark-cli auth status: {err}")
+            raise RuntimeError(f"AUTH_FAILURE: cannot verify lark-cli auth status: {err}")
         user_name, user_open_id = auth_user_identity(body)
         expected_name = self.args.expected_user_name
         expected_open_id = self.args.expected_user_open_id
         if not expected_name and not expected_open_id and not self.args.allow_current_account:
             raise RuntimeError(
                 f"lark-cli is authenticated as {user_name} ({user_open_id}), but no expected account was provided. "
-                "Pass --expected-user-name or --expected-user-open-id to prevent wrong-account collection."
+                "AUTH_FAILURE: Pass --expected-user-name or --expected-user-open-id to prevent wrong-account collection."
             )
         if expected_name and expected_name not in user_name:
             raise RuntimeError(
                 f"lark-cli is authenticated as {user_name}, expected name containing {expected_name}. "
-                "Refusing to collect from the wrong Feishu account."
+                "AUTH_FAILURE: Refusing to collect from the wrong Feishu account."
             )
         if expected_open_id and expected_open_id != user_open_id:
             raise RuntimeError(
                 f"lark-cli is authenticated as {user_open_id}, expected {expected_open_id}. "
-                "Refusing to collect from the wrong Feishu account."
+                "AUTH_FAILURE: Refusing to collect from the wrong Feishu account."
             )
         if self.args.reject_user_name and self.args.reject_user_name in user_name:
             raise RuntimeError(
                 f"lark-cli is authenticated as rejected account {user_name}. "
-                "Refusing to collect from the wrong Feishu account."
+                "AUTH_FAILURE: Refusing to collect from the wrong Feishu account."
             )
         ensure_sources_config()
         self.conn.execute(
@@ -597,12 +622,13 @@ class Collector:
                 "last_run_id": self.run_id,
                 "last_run_at": iso_now(),
                 "last_window_start": iso_local(self.start),
-                "last_window_end": iso_local(self.end),
                 "last_stats": stats,
                 "last_errors": self.errors[-20:],
                 "last_skips": self.skips[-50:],
             }
         )
+        if not getattr(self, "incomplete_window", False):
+            state["last_window_end"] = iso_local(self.end)
         write_json(STATE_FILE, state)
         update_sources_backup(stats, failed_sources={e.get("source") for e in self.errors})
         log_event("info", "run_finished", run_id=self.run_id, stats=stats, errors=len(self.errors), skips=len(self.skips))
@@ -699,11 +725,13 @@ class Collector:
                 if self.args.max_chats and len(self.chats) >= self.args.max_chats:
                     self.add_records(records)
                     self.conn.commit()
+                    self.truncated("feishu-chat", "max_chats limit")
                     return
             page_token = next_page_token(data)
             if not page_token:
                 break
             if self.args.chat_page_limit and page >= self.args.chat_page_limit:
+                self.truncated("feishu-chat", "chat_page_limit")
                 break
             time.sleep(self.args.page_delay)
         self.add_records(records)
@@ -762,11 +790,13 @@ class Collector:
                     if self.args.max_members and len(records) >= self.args.max_members:
                         self.add_records(records)
                         self.conn.commit()
+                        self.truncated("feishu-chat-member", "max_members limit")
                         return
                 page_token = next_page_token(data)
                 if not page_token:
                     break
                 if self.args.member_page_limit and page >= self.args.member_page_limit:
+                    self.truncated("feishu-chat-member", "member_page_limit")
                     break
                 time.sleep(self.args.page_delay)
             if len(records) >= self.args.flush_size:
@@ -858,10 +888,7 @@ class Collector:
                     if self.args.max_messages and total >= self.args.max_messages:
                         self.add_records(records)
                         self.conn.commit()
-                        self.error(
-                            "feishu-im",
-                            f"max_messages limit reached at {total}; remaining chats/pages were not scanned",
-                        )
+                        self.truncated("feishu-im", f"max_messages limit at {total}")
                         return
                 if len(records) >= self.args.flush_size:
                     self.add_records(records)
@@ -871,6 +898,7 @@ class Collector:
                 if not page_token:
                     break
                 if self.args.message_page_limit and page >= self.args.message_page_limit:
+                    self.truncated("feishu-im", "message_page_limit")
                     break
                 time.sleep(self.args.page_delay)
             self.add_records(records)
@@ -954,10 +982,7 @@ class Collector:
                 if self.args.max_messages and total >= self.args.max_messages:
                     self.add_records(records)
                     self.conn.commit()
-                    self.error(
-                        "feishu-im-search",
-                        f"max_messages limit reached at {total}; remaining pages were not scanned",
-                    )
+                    self.truncated("feishu-im-search", f"max_messages limit at {total}")
                     return
             if len(records) >= self.args.flush_size:
                 self.add_records(records)
@@ -967,6 +992,7 @@ class Collector:
             if not page_token:
                 break
             if self.args.message_page_limit and page >= self.args.message_page_limit:
+                self.truncated("feishu-im-search", "message_page_limit")
                 break
             time.sleep(self.args.page_delay)
         self.add_records(records)
@@ -1223,19 +1249,20 @@ class Collector:
                 if not page_token:
                     break
                 if self.args.vc_page_limit and page >= self.args.vc_page_limit:
+                    self.truncated("feishu-vc", "vc_page_limit")
                     break
                 time.sleep(self.args.page_delay)
         self.add_records(records)
         self.conn.commit()
-        scoped_meeting_ids = self.limit_items(meeting_ids, self.args.meeting_artifact_limit)
+        scoped_meeting_ids = self.limit_items(meeting_ids, self.args.meeting_artifact_limit, "feishu-vc")
         self.collect_vc_notes(scoped_meeting_ids)
         minute_tokens = self.collect_vc_recordings(scoped_meeting_ids)
         if minute_tokens:
             self.collect_minutes_notes(minute_tokens, origin="vc-recording")
 
-    @staticmethod
-    def limit_items(items: list[str], limit: int) -> list[str]:
+    def limit_items(self, items: list[str], limit: int, source: str) -> list[str]:
         if limit and len(items) > limit:
+            self.truncated(source, f"artifact limit {limit}")
             return items[:limit]
         return items
 
@@ -1318,7 +1345,7 @@ class Collector:
         self.collect_vc_note_doc_contents(sorted(set(doc_tokens)))
 
     def collect_vc_note_doc_contents(self, doc_tokens: list[str]) -> None:
-        doc_tokens = self.limit_items(doc_tokens, self.args.meeting_note_doc_content_limit)
+        doc_tokens = self.limit_items(doc_tokens, self.args.meeting_note_doc_content_limit, "feishu-vc-note-content")
         if not doc_tokens:
             return
         records: list[dict[str, Any]] = []
@@ -1489,11 +1516,12 @@ class Collector:
                     if not page_token:
                         break
                     if self.args.minutes_page_limit and page >= self.args.minutes_page_limit:
+                        self.truncated("feishu-minutes", "minutes_page_limit")
                         break
                     time.sleep(self.args.page_delay)
         self.add_records(records)
         self.conn.commit()
-        self.collect_minutes_notes(self.limit_items(tokens, self.args.minutes_artifact_limit), origin="minutes-search")
+        self.collect_minutes_notes(self.limit_items(tokens, self.args.minutes_artifact_limit, "feishu-minutes-note"), origin="minutes-search")
 
     @staticmethod
     def minutes_start_iso(item: dict[str, Any]) -> str:
@@ -1687,6 +1715,7 @@ class Collector:
             if not page_token:
                 break
             if self.args.docs_page_limit and page >= self.args.docs_page_limit:
+                self.truncated("feishu-doc", "docs_page_limit")
                 break
             time.sleep(self.args.page_delay)
         self.add_records(records)
@@ -1717,6 +1746,7 @@ class Collector:
                     seen_tokens.add(token)
                     docs.append({"token": token, "document": document})
                     if self.args.doc_content_limit and len(docs) >= self.args.doc_content_limit:
+                        self.truncated("feishu-doc-content", "doc_content_limit")
                         break
         except FileNotFoundError:
             return
@@ -1922,11 +1952,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {item['source']}: {item['message'][:180]}")
         if len(collector.errors) > 10:
             print(f"  ... {len(collector.errors) - 10} more")
+        if run_exit_code(collector.errors) == 1:
+            print("AUTH_FAILURE: Feishu authorization failed")
     return run_exit_code(collector.errors)
 
 
 def run_exit_code(errors: list) -> int:
     """统一退出码：0=success，2=partial（有源级错误但主流程完成）。"""
+    if any(item.get("kind") == "auth" or is_auth_failure(item.get("message", "")) for item in errors):
+        return 1
     return 2 if errors else 0
 
 

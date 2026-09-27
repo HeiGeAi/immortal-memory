@@ -252,10 +252,11 @@ def _is_ready_unlocked(*, ignore_notes_rebuild_marker: bool = False) -> bool:
     )
     if before_signature != after_signature:
         return False
+    # source_dev is recorded but not compared: APFS may renumber st_dev for
+    # the Data volume across reboots while the file itself is unchanged.
     try:
         return (
             int(rows["last_size"]) == source_after.st_size
-            and int(rows["source_dev"]) == source_after.st_dev
             and int(rows["source_ino"]) == source_after.st_ino
             and int(rows["source_mtime_ns"]) == source_after.st_mtime_ns
             and int(rows["source_ctime_ns"]) == source_after.st_ctime_ns
