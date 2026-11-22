@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from config import feishu_daily_sources, feishu_guard_args
+from config import feishu_daily_sources, feishu_guard_args, feishu_message_catchup_enabled
 from process_utils import run_process
 from runtime_telemetry import RuntimeTelemetry
 from state_store import read_state as read_shared_state, update_state_atomic
@@ -90,6 +90,7 @@ REQUIRED_CORE_SCRIPTS = (
 OPTIONAL_CONNECTOR_SCRIPTS = (
     "web_capture.py",
     "feishu_collect.py",
+    "feishu_catchup.py",
     "feishu_clean.py",
     "feishu_distill.py",
     "profile_auto_review.py",
@@ -520,9 +521,31 @@ def collect_feishu():
         if "Issues:" in out:
             log(f"飞书采集源级错误: {redact(out.split('Issues:', 1)[1].strip()[:300])}")
         return status, {"total_new": new_records}
+    if rc == 3 and "FEISHU_BUSY:" in out:
+        log("飞书增量等待共享采集锁，下轮再试")
+        return "busy", {"total_new": 0}
+    if "AUTH_CHECK_UNAVAILABLE:" in out:
+        log("飞书账号暂无法验证，下轮重试")
+        return "auth_unavailable", {"total_new": 0}
     log(f"飞书采集失败: {redact(out.strip()[:500])}")
     status = "auth_failed" if "AUTH_FAILURE" in out else "failed"
     return status, {"total_new": 0}
+
+
+def collect_feishu_catchup() -> bool:
+    log("=== 飞书消息独立补采（仅可访问会话）===")
+    from feishu_catchup import TIMEOUT_SECONDS
+
+    rc, out = run_script_rc("feishu_catchup.py", timeout=TIMEOUT_SECONDS)
+    try:
+        receipt = json.loads(out)
+        status = receipt["status"]
+    except (TypeError, ValueError, KeyError):
+        log("飞书消息补采未返回有效状态")
+        return False
+    log(f"飞书消息补采: status={status} windows={receipt.get('windows_completed', 0)} "
+        f"new={receipt.get('records_written', 0)} remaining_days={receipt.get('remaining_days', 'unknown')}")
+    return rc == 0 and status in {"ok", "busy", "budget_limited", "not_initialized", "disabled"}
 
 
 def feishu_clean():
@@ -1183,6 +1206,11 @@ def run_main():
     log(f"上次网页收录: {state.get('last_web_collect') or '从未'}")
     log(f"上次蒸馏: {state.get('last_distill') or '从未'}")
 
+    # Bounded catchup runs before slower independent scans.
+    if feishu_message_catchup_enabled():
+        telemetry_stage("collect", "飞书消息补采", errors)
+        if not collect_feishu_catchup():
+            errors.append("feishu message catchup needs attention")
     # 阶段 1: 采集
     telemetry_stage("collect", "本地增量采集", errors)
     collect_ok, collect_info = collect()
@@ -1234,6 +1262,8 @@ def run_main():
             errors.append("feishu partial: 部分源采集失败，详见 feishu/state.json last_errors")
         elif feishu_status == "auth_failed":
             errors.append("feishu auth failed")
+        elif feishu_status == "auth_unavailable":
+            errors.append("feishu identity verification unavailable; retry next run")
         if feishu_ok:
             state["last_feishu_collect"] = now_iso
             if not stage_enabled("feishu_clean", frozen):

@@ -30,6 +30,7 @@ from config import (
     daily_launch_agent_label,
     daily_schedule,
     feishu_guard_args,
+    feishu_message_catchup_enabled,
     load_config,
     owner_aliases,
     owner_display_name,
@@ -682,6 +683,11 @@ def command_health(args) -> int:
 
     add_state("采集状态", "last_collect")
     add_state("飞书采集", "last_feishu_collect")
+    if feishu_message_catchup_enabled():
+        from feishu_catchup import health as catchup_health
+
+        status, detail = catchup_health(IMMORTAL_DIR / "feishu" / "catchup-messages-status.json")
+        checks.append(("飞书消息独立补采", status != "fail", f"{status.upper()} · {detail}"))
     add_state("飞书清洗", "last_feishu_clean")
     add_state("飞书蒸馏", "last_feishu_distill")
     add_state("长期画像", "last_profile")

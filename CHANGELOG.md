@@ -2,6 +2,12 @@
 
 ## 1.4.0a1 (Unreleased)
 
+### Feishu reliability
+
+- Added opt-in, time-bounded Feishu message catchup ahead of the regular local scan. It uses a separate cursor and only reads chats accessible to the configured, verified account.
+- Concurrent collectors leave the running collector's receipt intact. Incomplete windows do not advance the catchup cursor, and health distinguishes active work or remaining backlog from a stale, invalid or failed run.
+- A temporary identity-check failure no longer masquerades as expired authorization. Collection still stops unless the expected account can be verified.
+
 ### Fixed
 
 - Strict restore checks now only fail closed on integrity-class warnings; positional hints and missing optional paths no longer block disaster-recovery restores.

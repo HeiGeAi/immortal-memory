@@ -25,6 +25,7 @@
     "daily_sources": "contacts,chats,members,messages,message-search,tasks,calendar,vc,minutes,docs,doc-contents",
     "expected_user_name": "Your Feishu Name",
     "expected_user_open_id": "",
+    "message_catchup_enabled": false,
     "reject_user_names": []
   },
   "obsidian": {

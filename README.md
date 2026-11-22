@@ -262,6 +262,16 @@ immortal-memory migration-preflight \
 
 旧版 `immortal project` 是绑定个人 Obsidian 目录、旧索引接口和旧卡片格式的本地工作流，不属于 v1.1 七模块公共产品。需要这项能力时，应把审查后的扩展保存在 Git 外，通过独立的 `immortal-project` 命令运行。公开 wheel 不会从私有 vault 动态加载 Python。显式调用两个旧命令会返回稳定迁移提示，不会读取 HOME 或创建文件。
 
+### 飞书消息积压补采
+
+默认关闭。已完成首次飞书采集后，可在本机配置中把 `feishu.message_catchup_enabled` 设为
+`true`，保留 `daily_sources` 中的 `messages` 和已配置的预期飞书账号。不要分享本机配置、账号标识或采集目录。
+
+启用后，现有定时任务在扫描本地前先补采飞书消息，每轮最多 3 个窗口，内部预算 20 分钟。
+它保存独立游标，不覆盖普通飞书采集的进度；未完成的窗口不会被跳过。运行
+`immortal-memory health` 可区分正在补采、还有积压和任务异常。它只覆盖当前账号
+可访问的会话消息，不代表文档、妙记或受限会话已采集。
+
 ### 生产健康与全新安装验收
 
 ```bash

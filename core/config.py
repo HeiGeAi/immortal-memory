@@ -31,6 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "expected_user_name": "",
         "expected_user_open_id": "",
         "reject_user_names": [],
+        "message_catchup_enabled": False,
         "daily_sources": "contacts,chats,members,messages,message-search,tasks,calendar,vc,minutes,docs,doc-contents",
     },
     "role_defaults": {
@@ -209,6 +210,16 @@ def feishu_daily_sources(config: dict[str, Any] | None = None) -> str:
     loaded = config or load_config()
     feishu = loaded.get("feishu") if isinstance(loaded.get("feishu"), dict) else {}
     return str(feishu.get("daily_sources") or DEFAULT_CONFIG["feishu"]["daily_sources"])
+
+
+def feishu_message_catchup_enabled(config: dict[str, Any] | None = None) -> bool:
+    loaded = config or load_config()
+    feishu = loaded.get("feishu")
+    return (
+        isinstance(feishu, dict)
+        and feishu.get("message_catchup_enabled") is True
+        and "messages" in {source.strip() for source in feishu_daily_sources(loaded).split(",")}
+    )
 
 
 def daily_launch_agent_label(config: dict[str, Any] | None = None) -> str:

@@ -520,14 +520,17 @@ def is_auth_failure(message: str) -> bool:
 
 
 class Collector:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, *, state_file: Path | None = None):
+        self.catchup = state_file is not None
+        self.state_file = state_file or STATE_FILE
+        self.incomplete_window = False
         self.args = args
         self.conn = db()
         self.run_id = str(uuid.uuid4())
         self.stats: dict[str, int] = defaultdict(int)
         self.errors: list[dict[str, str]] = []
         self.skips: list[dict[str, str]] = []
-        prev_state = read_json(STATE_FILE, {})
+        prev_state = read_json(self.state_file, {})
         self.start, self.end = window_from_args(args, prev_state.get("last_window_end"))
         self.chats: list[dict[str, Any]] = []
         self.self_user: dict[str, Any] | None = None
@@ -564,7 +567,9 @@ class Collector:
     def start_run(self) -> None:
         ok, body, err = current_auth_status()
         if not ok:
-            raise RuntimeError(f"AUTH_FAILURE: cannot verify lark-cli auth status: {err}")
+            if _retryable_lark_failure(body, err):
+                raise RuntimeError("AUTH_CHECK_UNAVAILABLE: Feishu identity could not be verified after retry")
+            raise RuntimeError("AUTH_FAILURE: cannot verify lark-cli account identity")
         user_name, user_open_id = auth_user_identity(body)
         expected_name = self.args.expected_user_name
         expected_open_id = self.args.expected_user_open_id
@@ -615,7 +620,9 @@ class Collector:
             ),
         )
         self.conn.commit()
-        state = read_json(STATE_FILE, {})
+        state_file = getattr(self, "state_file", STATE_FILE)
+        catchup = getattr(self, "catchup", False)
+        state = read_json(state_file, {})
         state.update(
             {
                 "version": SKILL_VERSION,
@@ -627,10 +634,11 @@ class Collector:
                 "last_skips": self.skips[-50:],
             }
         )
-        if not getattr(self, "incomplete_window", False):
+        if not getattr(self, "incomplete_window", False) and not (catchup and self.errors):
             state["last_window_end"] = iso_local(self.end)
-        write_json(STATE_FILE, state)
-        update_sources_backup(stats, failed_sources={e.get("source") for e in self.errors})
+        write_json(state_file, state)
+        if not catchup:
+            update_sources_backup(stats, failed_sources={e.get("source") for e in self.errors})
         log_event("info", "run_finished", run_id=self.run_id, stats=stats, errors=len(self.errors), skips=len(self.skips))
 
     def collect_contact_self(self) -> None:
@@ -1875,9 +1883,16 @@ class Collector:
                 self.collect_doc_contents()
             if "mail" in requested:
                 self.collect_mail_probe()
+        except BaseException:
+            self.incomplete_window = True
+            # Do not commit seen IDs for a pending buffer never written to disk.
+            self.conn.rollback()
+            raise
         finally:
-            self.finish_run()
-            self.conn.close()
+            try:
+                self.finish_run()
+            finally:
+                self.conn.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1965,4 +1980,10 @@ def run_exit_code(errors: list) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from feishu_lock import collector_lock
+
+    with collector_lock(FEISHU_DIR) as acquired:
+        if not acquired:
+            print("FEISHU_BUSY: another collector holds the shared lock")
+            raise SystemExit(3)
+        raise SystemExit(main())
