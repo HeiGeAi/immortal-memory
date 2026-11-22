@@ -10,6 +10,8 @@
 
 ### Fixed
 
+- Keep the Python 3.9 CI job on a compatible Ubuntu runner without reducing the compatibility matrix.
+
 - Strict restore checks now only fail closed on integrity-class warnings; positional hints and missing optional paths no longer block disaster-recovery restores.
 - Isolated-vault profile merges no longer read or write the primary vault; the merge subprocess receives explicit vault paths and the primary profile rebuild is skipped for non-primary vaults.
 - A trailing line without a newline no longer stalls notes migration forever or fails index rebuilds outright; EOF-terminated final lines are treated as complete records.
